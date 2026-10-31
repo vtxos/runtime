@@ -8,7 +8,7 @@
 #
 #   host                                        QEMU enclave
 #   ────                                        ────────────
-#   MinIO :9000 ◀── gvproxy ──192.168.127.254──  anchors, receipts, the guest
+#   MinIO :9000 ◀── gvproxy ──192.168.127.254──  anchors, the catalog, the guest
 #   nbd-stub.py vsock:10809 ◀── NBD over vsock ── the ZFS pool, on dm-crypt
 #   gvproxy --listen vsock://:1024 ────────────▶ gvforwarder → tap0 .2
 #           expose :8443 → 192.168.127.2:443 ──▶ rustls :443
@@ -413,13 +413,11 @@ echo "a data-only wake reached the enrolled device: category=task-done ref=e2e-j
 # ---------------------------------------------------------------------------
 # 7/8 — the boot machine, across a restart.
 # ---------------------------------------------------------------------------
-# The first boot found an empty store and created a filesystem. That used to be
-# what happened for *any* store that answered "nothing", including one whose
-# contents had been hidden. The second boot has to recognise the state as its
-# own and resume — which is only possible if the receipt the first boot wrote
-# verifies against the state now present — and, running the same guest, find
-# its pair record and write nothing.
-say "7/8  a second boot resumes rather than starting over"
+# The first boot was this release's first: it minted the release's key. The
+# second has to open that key rather than mint another, and attach the tenant
+# it kept for background work (leg 6 scheduled a task) without anyone signing
+# in.
+say "7/8  a second boot opens its release's key and re-attaches what it kept"
 
 # `docker logs -f` fills the console file asynchronously, so a single grep can
 # run before the line it is looking for has been written — the assertions above
@@ -427,10 +425,10 @@ say "7/8  a second boot resumes rather than starting over"
 # with a bound, the way the readiness check above already does.
 genesis=""
 for _ in $(seq "$TIMEOUT"); do
-    grep -q 'mode=Genesis' <(plain) && { genesis=1; break; }
+    grep -q 'mode=VersionGenesis' <(plain) && { genesis=1; break; }
     sleep 1
 done
-[[ -n "$genesis" ]] || fail "the first boot should have been a genesis"
+[[ -n "$genesis" ]] || fail "the first boot should have been this release's first"
 GENESIS_CONSOLE="$CONSOLE"
 
 docker rm -f "$PREFIX-qemu" >/dev/null 2>&1 || true
@@ -445,25 +443,27 @@ enclave_trust_root
 
 resumed=""
 for _ in $(seq "$TIMEOUT"); do
-    grep -q "state origin established" <(plain) && { resumed=1; break; }
+    grep -q "version established" <(plain) && { resumed=1; break; }
     grep -qE "Kernel panic|failed to start the guest" <(plain) && break
     sleep 1
 done
-[[ -n "$resumed" ]] || fail "the second boot never established a state origin"
+[[ -n "$resumed" ]] || fail "the second boot never established its version"
 
-plain | grep -E "state origin established" | tail -1
-grep -q "mode=Resume" <(plain) \
-    || fail "the second boot did not resume — it should not have created anything"
+plain | grep -E "version established" | tail -1
+grep -q "mode=VersionResume" <(plain) \
+    || fail "the second boot did not open its release's key — it minted another"
 grep -q "pcr16=$EXPECTED_PCR16" <(plain) \
     || fail "the second boot did not measure the same guest"
+grep -q "resumed=1" <(plain) \
+    || fail "the second boot did not re-attach the tenant it kept for background work"
 
-# Same filesystem, same identity: the receipt names this state and no other.
-first_root="$(plain_of "$GENESIS_CONSOLE" | grep -oE 'state_root=[0-9a-f]+' | head -1)"
-second_root="$(plain | grep -oE 'state_root=[0-9a-f]+' | head -1)"
-echo "genesis $first_root"
-echo "resume  $second_root"
-[[ "$first_root" == "$second_root" ]] \
-    || fail "the state_root changed across a restart"
+# Same release, same id.
+first_version="$(plain_of "$GENESIS_CONSOLE" | grep -oE 'version=[0-9a-f]+' | head -1)"
+second_version="$(plain | grep -oE 'version=[0-9a-f]+' | head -1)"
+echo "first   $first_version"
+echo "restart $second_version"
+[[ "$first_version" == "$second_version" ]] \
+    || fail "the release id changed across a restart"
 
 # ---------------------------------------------------------------------------
 # 8/8 — a substituted guest.
@@ -471,16 +471,17 @@ echo "resume  $second_root"
 # The parent controls the store the guest is fetched from, so it can replace the
 # object. What it cannot do is make the replacement look like the approved
 # guest: the enclave measures whatever arrives into PCR16 before anything asks
-# for a key. That is shown here from both sides — the enclave records a runtime
-# and guest this state has not held before, and a client pinning the approved
-# guest refuses to talk to it.
+# for a key. That is shown here from both sides — the enclave boots as a new
+# release, with none of the old release's tenants attached, and a client
+# pinning the approved guest refuses to talk to it, and so never sends it a
+# tenant key.
 #
 # What this cannot show is KMS refusing it, which is the half that keeps the
 # data out of reach. The emulator image uses the static key source, because KMS
 # will not accept an unsigned document, so this enclave boots and serves. On
 # hardware, under a policy pinning the approved PCR16, the same substitution
 # gets no key and reads nothing.
-say "8/8  a substituted guest is measured, recorded, and refused by a pinned client"
+say "8/8  a substituted guest is a new release, opens no tenant, and is refused by a pinned client"
 docker rm -f "$PREFIX-qemu-resume" >/dev/null 2>&1 || true
 upload_guest substitute.wasm
 sleep 2
@@ -492,8 +493,10 @@ enclave_trust_root
 
 grep -q "pcr16=$SUBSTITUTE_PCR16" <(plain) \
     || fail "the enclave did not measure the object it fetched into PCR16"
-grep -q "mode=Upgrade" <(plain) \
-    || fail "a guest this state had never held was not recorded as an upgrade"
+grep -q "mode=VersionGenesis" <(plain) \
+    || fail "a guest never booted here before was not a new release"
+grep -q "resumed=0" <(plain) \
+    || fail "a new release attached a tenant whose owner never sent it a key"
 wait_for_https || fail "the enclave running the substitute never answered HTTPS"
 
 if "$ATTEST" --url "https://127.0.0.1:$HTTPS_PORT/auth/" --trust-root "$TRUST_ROOT" \
@@ -536,9 +539,9 @@ cat <<EOF
     second assertion signed
   that finished task woke an enrolled device with a data-only message that
     carried no title, no body and nothing a person would read
-  genesis wrote an attested state origin, and a restart resumed it
-  a substituted guest was measured and recorded as an upgrade, and a client
-    pinning the approved guest refused it
+  a release minted its key once, and a restart opened it and re-attached its tenant
+  a substituted guest was measured, booted as a new release with no tenant
+    attached, and a client pinning the approved guest refused it
 
 Guest logging is proven only as far as the console, in leg 5c. The enclave can
 also ship guest output to CloudWatch, and nothing here exercises that: this

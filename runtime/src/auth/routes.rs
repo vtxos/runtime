@@ -5,10 +5,11 @@
 //! convenience. A guest able to answer under `/auth/` could hand out its own
 //! challenges and verify its own assertions, which is the same as having none.
 //!
-//! Nothing here performs a cosigner action or touches an *existing* tenant's
-//! directory. The most any of it does is create a new tenant, which anyone may
-//! do: registration is open, and what it grants is an empty tenant and nothing
-//! else.
+//! Nothing here performs a cosigner action. Registration creates a new tenant,
+//! which anyone may do: it is open, and what it grants is an empty tenant and
+//! nothing else. Verifying an assertion is also where a tenant's pool is
+//! attached, with the tenant key the app sends beside the assertion — the only
+//! way a release ever opens a tenant's data.
 //!
 //! ## Why registration is two calls
 //!
@@ -27,7 +28,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
 
-use super::credential::{tenant_of, FilesystemCredentials, StoredCredential, RECORD_VERSION};
+use super::credential::{tenant_of, CatalogCredentials};
 use super::gate::Gate;
 use super::token::InteractionScope;
 
@@ -98,8 +99,31 @@ struct RequestOptionsRequest {
 struct RequestVerifyRequest {
     challenge_id: String,
     /// Base64url of the `PublicKeyCredential` JSON `navigator.credentials.get()`
-    /// produced.
+    /// produced, **with its PRF results removed**.
     assertion: String,
+    /// Base64url of the tenant key, 32 bytes ([`super::tenant_key`]): what
+    /// opens this tenant's pool. Required: a release opens a tenant's data
+    /// only with the key its owner sends it.
+    tenant_key: String,
+}
+
+/// Whether an assertion carries the output of a PRF — the WebAuthn `prf`
+/// extension, or the CTAP `hmac-secret` it is built on.
+///
+/// The one thing a client must never send. The tenant key is derived from
+/// that output, and so is the wallet's DKG polynomial: with it and the share
+/// the cosigner dealt, an enclave would hold the whole of a 2-of-2 key.
+/// `webauthn-rs` ignores fields it does not know, so this is checked on the
+/// raw JSON, before it is parsed.
+fn carries_prf(assertion: &serde_json::Value) -> bool {
+    ["extensions", "clientExtensionResults"]
+        .iter()
+        .filter_map(|k| assertion.get(k))
+        .any(|ext| {
+            ["prf", "hmac_get_secret", "hmacGetSecret"]
+                .iter()
+                .any(|name| ext.get(name).is_some_and(|v| !v.is_null()))
+        })
 }
 
 /// The token, and how long it has to be spent.
@@ -135,7 +159,7 @@ impl std::fmt::Debug for AuthEndpoints {
 
 pub struct AuthEndpoints {
     gate: Arc<Gate>,
-    credentials: Arc<FilesystemCredentials>,
+    credentials: Arc<CatalogCredentials>,
     entropy: Arc<dyn nitro_nsm::Nsm>,
     zfs: Arc<crate::zfs::Zfs>,
     registrations: Mutex<HashMap<[u8; 16], PendingRegistration>>,
@@ -144,7 +168,7 @@ pub struct AuthEndpoints {
 impl AuthEndpoints {
     pub fn new(
         gate: Arc<Gate>,
-        credentials: Arc<FilesystemCredentials>,
+        credentials: Arc<CatalogCredentials>,
         zfs: Arc<crate::zfs::Zfs>,
         entropy: Arc<dyn nitro_nsm::Nsm>,
     ) -> Self {
@@ -300,28 +324,13 @@ impl AuthEndpoints {
             }
         };
 
-        // Derived, so a credential id already registered lands on its own
-        // existing directory and is then refused below, rather than leaving an
-        // empty one behind.
         let credential_id = request.credential.raw_id.as_ref().to_vec();
         let tenant_id = tenant_of(&credential_id);
 
-        // The directory first, so the tenant's first request finds one rather
-        // than paying for it while a user waits — and so the credential's
-        // anchor below covers both.
-        if let Err(e) = self.zfs.tenant_dir(tenant_id).await {
-            tracing::error!(error = format!("{e:#}"), "creating a tenant directory");
-            return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
-        }
-
-        let record = StoredCredential {
-            version: RECORD_VERSION,
-            passkey,
-            active: true,
-            created_ms: 0,
-            counter: 0,
-        };
-        if let Err(e) = self.credentials.register(&credential_id, record).await {
+        // A record and a place for the tenant's pool, durable before this
+        // returns. The pool itself waits for the tenant's key, which comes
+        // with its first assertion.
+        if let Err(e) = self.credentials.register(passkey).await {
             tracing::error!(error = format!("{e:#}"), "storing a credential");
             return problem(hyper::StatusCode::CONFLICT, "could not register");
         }
@@ -361,10 +370,25 @@ impl AuthEndpoints {
         let Some(challenge_id) = decode_id(&request.challenge_id) else {
             return problem(hyper::StatusCode::BAD_REQUEST, "malformed challenge id");
         };
+        let Some(tenant_key) = decode(&request.tenant_key)
+            .and_then(|k| <[u8; 32]>::try_from(k).ok())
+            .map(crate::store::crypto::TenantKey::from_bytes)
+        else {
+            return problem(hyper::StatusCode::BAD_REQUEST, "malformed tenant key");
+        };
         let Some(assertion_json) = decode(&request.assertion) else {
             return problem(hyper::StatusCode::BAD_REQUEST, "malformed assertion");
         };
-        let Ok(assertion) = serde_json::from_slice::<PublicKeyCredential>(&assertion_json) else {
+        let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&assertion_json) else {
+            return problem(hyper::StatusCode::BAD_REQUEST, "malformed assertion");
+        };
+        if carries_prf(&raw) {
+            return problem(
+                hyper::StatusCode::BAD_REQUEST,
+                "the assertion carries a PRF result; send the tenant key, never the PRF output",
+            );
+        }
+        let Ok(assertion) = serde_json::from_value::<PublicKeyCredential>(raw) else {
             return problem(hyper::StatusCode::BAD_REQUEST, "malformed assertion");
         };
 
@@ -377,6 +401,13 @@ impl AuthEndpoints {
                 return problem(denied.status(), denied.public_message());
             }
         };
+
+        // The tenant's pool, opened with its key — or the key checked against
+        // the one it is already open with. A key that does not open it is
+        // refused like a bad assertion, and earns no token.
+        if let Err((status, message)) = self.attach(who.tenant_id, &tenant_key).await {
+            return problem(status, message);
+        }
 
         // Minted here, from the enclave's entropy, and held in exactly two
         // places: this response, and a hash in the store.
@@ -461,6 +492,50 @@ impl AuthEndpoints {
         }
     }
 
+    /// Attach a verified tenant's pool with the key it sent.
+    async fn attach(
+        &self,
+        tenant: [u8; 16],
+        key: &crate::store::crypto::TenantKey,
+    ) -> Result<(), (hyper::StatusCode, &'static str)> {
+        let place = match self.zfs.catalog().tenant(tenant).await {
+            Ok(Some(record)) => record.place,
+            Ok(None) => {
+                tracing::error!(tenant = %hex::encode(tenant), "a verified tenant has no record");
+                return Err((hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable"));
+            }
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "reading a tenant record");
+                return Err((hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable"));
+            }
+        };
+        match self.zfs.attach(tenant, place, key).await {
+            Ok(crate::tenant::Arrival::New) => {
+                tracing::info!(tenant = %hex::encode(tenant), "created a tenant's pool");
+                Ok(())
+            }
+            Ok(crate::tenant::Arrival::Returning) => Ok(()),
+            Err(crate::zfs::AttachError::WrongKey) => {
+                tracing::warn!(
+                    tenant = %hex::encode(tenant),
+                    "a verified assertion came with a tenant key that does not open its pool"
+                );
+                Err((hyper::StatusCode::UNAUTHORIZED, "not approved"))
+            }
+            Err(e @ crate::zfs::AttachError::Superseded(_)) => {
+                tracing::error!(tenant = %hex::encode(tenant), error = %e, "refusing a tenant");
+                Err((
+                    hyper::StatusCode::CONFLICT,
+                    "this tenant was last served by a newer release",
+                ))
+            }
+            Err(e) => {
+                tracing::error!(tenant = %hex::encode(tenant), error = %e, "attaching a tenant");
+                Err((hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable"))
+            }
+        }
+    }
+
     async fn credentials_lookup(
         &self,
         credential_id: &[u8],
@@ -525,12 +600,12 @@ mod tests {
     struct Fixture {
         endpoints: AuthEndpoints,
         fs: Arc<Zfs>,
-        credentials: Arc<FilesystemCredentials>,
+        credentials: Arc<CatalogCredentials>,
     }
 
     async fn fixture() -> Fixture {
         let fs = Zfs::scratch().await;
-        let credentials = Arc::new(FilesystemCredentials::new(fs.clone()));
+        let credentials = Arc::new(CatalogCredentials::new(fs.catalog().clone()));
         let gate = Arc::new(Gate::new(
             Relying::new().webauthn,
             ChallengeStore::new(DEFAULT_TTL, DEFAULT_CAPACITY),
@@ -627,10 +702,138 @@ mod tests {
             .expect("the credential was stored");
         assert_eq!(hex::encode(record.tenant_id), tenant_hex);
 
-        // And the tenant's directory exists, so their first request is cheap.
+        // A place for its pool, but no pool: that needs the tenant's key,
+        // which comes with its first assertion.
         let mut tenant = [0u8; 16];
         hex::decode_to_slice(tenant_hex, &mut tenant).unwrap();
-        assert!(f.fs.tenant_path(tenant).is_dir());
+        assert!(f
+            .credentials
+            .place(auth.credential_id())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(!f.fs.is_attached(tenant));
+        assert!(!f.fs.tenant_path(tenant).is_dir());
+    }
+
+    /// One interaction's approval: options, an assertion, and verify with
+    /// `tenant_key` (left out when `None`). `tamper` edits the assertion first.
+    async fn verify(
+        f: &Fixture,
+        auth: &SoftwareAuthenticator,
+        tenant_key: Option<String>,
+        tamper: impl FnOnce(&mut serde_json::Value),
+    ) -> (u16, serde_json::Value) {
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let (status, options) = post(
+            f,
+            "/auth/request/options",
+            serde_json::json!({
+                "credential_id": b64.encode(auth.credential_id()),
+                "method": "GET",
+                "path": "/counter",
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "{options}");
+        let challenge = options["options"]["publicKey"]["challenge"]
+            .as_str()
+            .unwrap();
+        let mut assertion = auth.assert(challenge, ORIGIN);
+        tamper(&mut assertion);
+        let mut body = serde_json::json!({
+            "challenge_id": options["challenge_id"],
+            "assertion": b64.encode(assertion.to_string()),
+        });
+        if let Some(key) = tenant_key {
+            body["tenant_key"] = key.into();
+        }
+        post(f, "/auth/request/verify", body).await
+    }
+
+    fn key_of(auth: &SoftwareAuthenticator) -> Option<String> {
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        Some(b64.encode(auth.tenant_key().expose_secret()))
+    }
+
+    /// The first approval creates the tenant's pool with the key it carries;
+    /// later ones find it open.
+    #[tokio::test]
+    async fn the_first_approval_creates_the_pool_with_its_key() {
+        let f = fixture().await;
+        let auth = SoftwareAuthenticator::new(RP_ID);
+        assert_eq!(register(&f, &auth).await.0, 200);
+        let tenant = tenant_of(auth.credential_id());
+
+        let (status, body) = verify(&f, &auth, key_of(&auth), |_| {}).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body["token"].is_string());
+        assert!(f.fs.is_attached(tenant));
+        assert!(f.fs.attached_dir(tenant).unwrap().is_dir());
+
+        let (again, body) = verify(&f, &auth, key_of(&auth), |_| {}).await;
+        assert_eq!(again, 200, "{body}");
+    }
+
+    /// A key that does not open the pool earns no token, though the assertion
+    /// was good.
+    #[tokio::test]
+    async fn a_wrong_tenant_key_earns_no_token() {
+        let f = fixture().await;
+        let auth = SoftwareAuthenticator::new(RP_ID);
+        assert_eq!(register(&f, &auth).await.0, 200);
+        assert_eq!(verify(&f, &auth, key_of(&auth), |_| {}).await.0, 200);
+
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let wrong = Some(b64.encode([0x42; 32]));
+        let (status, body) = verify(&f, &auth, wrong, |_| {}).await;
+        assert_eq!(status, 401, "{body}");
+        assert!(body.get("token").is_none());
+    }
+
+    /// No key, or one that is not 32 bytes, is a malformed request.
+    #[tokio::test]
+    async fn a_missing_or_short_tenant_key_is_malformed() {
+        let f = fixture().await;
+        let auth = SoftwareAuthenticator::new(RP_ID);
+        assert_eq!(register(&f, &auth).await.0, 200);
+        assert_eq!(verify(&f, &auth, None, |_| {}).await.0, 400);
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        assert_eq!(
+            verify(&f, &auth, Some(b64.encode([1; 16])), |_| {}).await.0,
+            400
+        );
+        assert!(!f.fs.is_attached(tenant_of(auth.credential_id())));
+    }
+
+    /// The PRF output itself is refused wherever an assertion carries it, so a
+    /// careless client cannot hand over the root of the wallet's key.
+    #[tokio::test]
+    async fn an_assertion_carrying_a_prf_result_is_refused() {
+        let f = fixture().await;
+        let auth = SoftwareAuthenticator::new(RP_ID);
+        assert_eq!(register(&f, &auth).await.0, 200);
+        for (field, ext) in [
+            (
+                "clientExtensionResults",
+                serde_json::json!({ "prf": { "results": { "first": "AAAA" } } }),
+            ),
+            (
+                "extensions",
+                serde_json::json!({ "prf": { "results": { "first": "AAAA" } } }),
+            ),
+            (
+                "extensions",
+                serde_json::json!({ "hmac_get_secret": { "output1": "AAAA" } }),
+            ),
+        ] {
+            let (status, body) = verify(&f, &auth, key_of(&auth), |a| {
+                a[field] = ext.clone();
+            })
+            .await;
+            assert_eq!(status, 400, "{field}: {body}");
+        }
+        assert!(!f.fs.is_attached(tenant_of(auth.credential_id())));
     }
 
     /// Registration is open, and each one stands alone: a second, unrelated

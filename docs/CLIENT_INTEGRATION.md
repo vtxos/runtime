@@ -80,6 +80,9 @@ POST /auth/register/verify    {"registration_id": "...", "credential": <Register
 `options` is what you hand to `navigator.credentials.create()` — or to your
 platform authenticator. Keep `credential_id`; every later request names it.
 
+Registering creates the tenant's record and a place for its data, but no data:
+that is opened with the tenant key, which comes with the first approval.
+
 ### One request
 
 Four steps, because the approval is bound to the request rather than to a
@@ -93,8 +96,11 @@ session.
 
 2.  verify that document (next section) before doing anything with it
 
-3.  sign the challenge → POST /auth/request/verify
-    {"challenge_id": "...", "assertion": "<base64url of the PublicKeyCredential JSON>"}
+3.  sign the challenge, evaluating the passkey's PRF in the same get() →
+    POST /auth/request/verify
+    {"challenge_id": "...",
+     "assertion": "<base64url of the PublicKeyCredential JSON, PRF results removed>",
+     "tenant_key": "<base64url of the 32-byte tenant key>"}
       → 200 {"token": "...", "expires_in_secs": 60}
 
 4.  the real request, with  Authorization: Bearer <token>
@@ -110,10 +116,41 @@ Notes that matter:
 - `deny_unknown_fields` is set on both request bodies. An extra field is a 400,
   deliberately — this route used to take a `body_sha256` and a client still
   sending one must be told it means nothing now rather than have it ignored.
-- The assertion is one header holding the credential JSON verbatim, not five
-  holding its parts.
+- The assertion is the credential JSON verbatim, as one field — except for its
+  PRF results, which must be removed. An assertion that still carries
+  `prf` or `hmac_get_secret` results is a 400.
 - Auth headers are stripped before the guest sees the request. A guest can
   neither read a client's token nor forge one.
+
+### The tenant key
+
+The tenant key opens the tenant's data. Every release of the enclave opens it
+with the key the app sends it, and has no other way to, so **sending the key is
+how the app approves a release**:
+
+```
+K_t = HKDF-SHA256(ikm  = the passkey's PRF output,
+                  salt = "aegira/tenant-key/v1",
+                  info = tenant_id)            // the 16 bytes register/verify returned
+```
+
+Test vector: PRF output `11` × 32 and tenant id `22` × 16 give
+`57c4b615bf5da47923a682fed599cc34355bf19467ea46c482f244d13bebde6c`.
+
+- **Send `K_t` only after step 2 has passed on this same connection**, with PCR0
+  and PCR16 matching a release the app approves. A release the app does not
+  approve — a substituted guest, a runtime nobody built — is never sent the key
+  and opens none of the tenant's data.
+- **Never send the PRF output itself.** The wallet's DKG polynomial is seeded
+  from the same output; with it and the share the cosigner dealt, the enclave
+  would hold the whole key.
+- Don't store `K_t`. Derive it from each assertion's PRF output.
+- The first approval creates the tenant's data under `K_t`, and the data opens
+  under that key forever after. A different key earns a 401 and no token.
+- After a new release, the tenant's background work, the cosigner's VTXO
+  renewal included, waits until the owner's next approval sends the release
+  the key. A release keeps the key for background work only while it remains
+  that release.
 
 ### Step 2, in full
 

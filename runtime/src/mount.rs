@@ -1,9 +1,9 @@
 //! Turning configuration into a connection to the roots bucket.
 //!
 //! The bucket holds what must outlive any disk and that no host may rewrite:
-//! the pool's anchor chain, the state-origin receipt and pair records, the
-//! sealed master key's pointer, the guest, and the sealed ACME cache. The
-//! state itself is on the pool — see [`crate::zfs`].
+//! each pool's anchor chain, the tenant catalog, each release's sealed key
+//! and caches, and the guest. The state itself is on the pools — see
+//! [`crate::zfs`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,8 +11,8 @@ use std::time::Duration;
 use crate::store::backend::{AwsS3Backend, AwsS3BackendConfig, Backend};
 use anyhow::{Context, Result};
 
-/// How long each anchor and boot record is locked by default: ten years, per
-/// the deployment contract.
+/// How long each anchor and catalog record is locked by default: ten years,
+/// per the deployment contract.
 pub const DEFAULT_ROOT_RETENTION: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
 /// Everything needed to reach the store.
@@ -29,8 +29,6 @@ pub struct MountConfig {
     pub bucket_prefix: String,
     /// Filesystem identifier, the key-derivation salt.
     pub fs_id: [u8; 16],
-    /// Refuse a store whose newest anchor is older than this.
-    pub min_root_seq: Option<u64>,
     /// Skip the `HeadBucket` startup probe.
     pub skip_bucket_probe: bool,
     pub request_timeout: Duration,
@@ -117,7 +115,6 @@ mod tests {
             force_path_style: false,
             bucket_prefix: String::new(),
             fs_id: [0u8; 16],
-            min_root_seq: None,
             skip_bucket_probe: true,
             request_timeout: Duration::from_secs(30),
             root_retention: Duration::from_secs(86_400),

@@ -1,11 +1,14 @@
 //! Which devices a tenant can be woken on.
 //!
 //! A registration token is a capability: whoever holds one can wake that device
-//! from anywhere, through the Firebase project it was issued for. So tokens live at
-//! `/runtime/devices/<tenant>/` on the pool, outside every tenant's directory
-//! and unreachable from any guest — the same placement, and the same reason, as
-//! [`crate::auth::credential`]. A guest enrols one and asks for a count; it
-//! never reads one back.
+//! from anywhere, through the Firebase project it was issued for. So tokens live
+//! in `runtime/devices/` on the tenant's own pool, beside its tasks and streams
+//! and outside the `data` dataset that is the guest's only preopen. A guest
+//! enrols one and asks for a count; it never reads one back.
+//!
+//! On the tenant's pool, a tenant's devices are loaded when its pool is
+//! attached and not before — so a release cannot wake a tenant it has not yet
+//! been given the key to, and a host that reads the disk reads no tokens.
 //!
 //! ## Why the filename is a hash
 //!
@@ -23,7 +26,7 @@
 //! deliberate opposite of [`crate::auth::credential`], where a revoked passkey
 //! is kept for ever so it can never be silently reinstated.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -31,14 +34,14 @@ use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::zfs::Zfs;
+use crate::zfs::{TenantLoader, Zfs};
 
-/// Where every tenant's devices live, one directory each.
+/// Where a tenant's devices live on its pool.
 pub const DEVICES_DIR: &str = "devices";
 
 /// Devices one tenant may have enrolled at once.
 pub const MAX_DEVICES_PER_TENANT: usize = 8;
-/// Devices across every tenant, bounding what a recovery scan will load.
+/// Devices across every attached tenant, bounding what is held in memory.
 pub const MAX_DEVICES: usize = 4096;
 /// An FCM registration token is ~160 characters today; these bound the shape
 /// without pretending to know the format.
@@ -78,15 +81,27 @@ impl Default for DeviceLimits {
     }
 }
 
-/// Every tenant's devices, held in memory and backed by the filesystem.
+/// Every attached tenant's devices, held in memory and backed by its pool.
 ///
 /// Held in memory because the forwarder needs a tenant's tokens on every wake,
 /// and a `read_dir` per wake would be disk I/O over vsock in the path of a
 /// signal whose only value is being prompt.
 pub struct DeviceRegistry {
-    dir: PathBuf,
+    zfs: Arc<Zfs>,
     limits: DeviceLimits,
-    devices: Mutex<BTreeMap<[u8; 16], Vec<StoredDevice>>>,
+    devices: Mutex<Devices>,
+}
+
+#[derive(Default)]
+struct Devices {
+    by_tenant: BTreeMap<[u8; 16], Vec<StoredDevice>>,
+    loaded: BTreeSet<[u8; 16]>,
+}
+
+impl Devices {
+    fn total(&self) -> usize {
+        self.by_tenant.values().map(Vec::len).sum()
+    }
 }
 
 impl std::fmt::Debug for DeviceRegistry {
@@ -108,13 +123,6 @@ fn record_name(token: &str) -> String {
     hex::encode(nitro_attestation::sha256(token.as_bytes()))
 }
 
-fn is_hex(name: &str, len: usize) -> bool {
-    name.len() == len
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-}
-
 impl DeviceRegistry {
     pub async fn open(zfs: Arc<Zfs>) -> Result<Arc<Self>> {
         Self::open_with_limits(zfs, DeviceLimits::default()).await
@@ -125,104 +133,52 @@ impl DeviceRegistry {
             limits.max_devices > 0 && limits.per_tenant > 0,
             "device limits must be positive"
         );
-        let dir = zfs.runtime_dir(DEVICES_DIR).await?;
         let registry = Arc::new(DeviceRegistry {
-            dir,
+            zfs: zfs.clone(),
             limits,
-            devices: Mutex::new(BTreeMap::new()),
+            devices: Mutex::new(Devices::default()),
         });
-        let loaded = registry.scan().await?;
-        *registry.devices.lock().await = loaded;
+        let loader: Arc<dyn TenantLoader> = registry.clone();
+        zfs.register_loader(Arc::downgrade(&loader)).await?;
         Ok(registry)
     }
 
-    /// Read every published record back, refusing anything that does not
+    async fn dir(&self, tenant: [u8; 16]) -> Result<PathBuf> {
+        self.zfs.tenant_runtime_dir(tenant, DEVICES_DIR).await
+    }
+
+    /// Read a tenant's published records back, refusing anything that does not
     /// account for itself.
-    async fn scan(&self) -> Result<BTreeMap<[u8; 16], Vec<StoredDevice>>> {
-        let mut devices: BTreeMap<[u8; 16], Vec<StoredDevice>> = BTreeMap::new();
-        let mut total = 0usize;
-
-        let mut tenants = tokio::fs::read_dir(&self.dir).await?;
-        while let Some(tenant_entry) = tenants.next_entry().await? {
-            let tenant_name = tenant_entry.file_name().into_string().unwrap_or_default();
+    async fn scan(&self, tenant: [u8; 16]) -> Result<Vec<StoredDevice>> {
+        let dir = self.dir(tenant).await?;
+        let mut list = Vec::new();
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().into_string().unwrap_or_default();
+            // A write interrupted before its rename. Nothing published it,
+            // so nothing may read it.
+            if name.ends_with(".tmp") {
+                tokio::fs::remove_file(entry.path()).await?;
+                continue;
+            }
+            let path = entry.path();
+            let bytes = tokio::fs::read(&path).await?;
+            ensure!(bytes.len() <= MAX_RECORD, "oversized device record");
+            let device: StoredDevice =
+                serde_json::from_slice(&bytes).context("decoding a device record")?;
             ensure!(
-                tenant_entry.file_type().await?.is_dir() && is_hex(&tenant_name, 32),
-                "unexpected entry {:?} under {}",
-                tenant_entry.file_name(),
-                self.dir.display()
+                device.version == RECORD_VERSION
+                    && device.tenant == tenant
+                    && valid_token(&device.token)
+                    && record_name(&device.token) == name,
+                "invalid device record at {}",
+                path.display()
             );
-            let mut tenant = [0u8; 16];
-            hex::decode_to_slice(&tenant_name, &mut tenant)
-                .context("decoding a tenant directory name")?;
-
-            let mut entries = tokio::fs::read_dir(tenant_entry.path()).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                let name = entry.file_name().into_string().unwrap_or_default();
-                // A write interrupted before its rename. Nothing published it,
-                // so nothing may read it.
-                if name.ends_with(".tmp") {
-                    tokio::fs::remove_file(entry.path()).await?;
-                    continue;
-                }
-                total += 1;
-
-                let path = entry.path();
-                let bytes = tokio::fs::read(&path).await?;
-                ensure!(bytes.len() <= MAX_RECORD, "oversized device record");
-
-                let device: StoredDevice =
-                    serde_json::from_slice(&bytes).context("decoding a device record")?;
-                ensure!(
-                    device.version == RECORD_VERSION
-                        && device.tenant == tenant
-                        && valid_token(&device.token)
-                        && record_name(&device.token) == name,
-                    "invalid device record at {}",
-                    path.display()
-                );
-                devices.entry(tenant).or_default().push(device);
-            }
+            list.push(device);
         }
-
         // Oldest first, so eviction and reporting have one order to rely on.
-        for list in devices.values_mut() {
-            list.sort_by_key(|d| (d.created_ms, d.token.clone()));
-        }
-
-        // Over the cap, drop the oldest rather than refuse to start.
-        //
-        // A device record is a cache of where somebody can be reached, not work
-        // that must not be lost — so unlike a task record, the right answer to
-        // too many is to keep the newest and serve. Refusing would turn an
-        // over-full store into one that can never be booted to fix, and a store
-        // can be over-full legitimately: a lowered cap in a new image, or
-        // records written before the cap was enforced on the way in.
-        if total > self.limits.max_devices {
-            let mut all: Vec<([u8; 16], u64, String)> = devices
-                .iter()
-                .flat_map(|(tenant, list)| {
-                    list.iter()
-                        .map(move |d| (*tenant, d.created_ms, d.token.clone()))
-                })
-                .collect();
-            all.sort_by(|a, b| (a.1, &a.2).cmp(&(b.1, &b.2)));
-            let excess = total - self.limits.max_devices;
-            tracing::warn!(
-                total,
-                cap = self.limits.max_devices,
-                dropping = excess,
-                "the device store is over its cap; dropping the oldest records"
-            );
-            for (tenant, _, token) in all.into_iter().take(excess) {
-                self.remove(tenant, &token).await?;
-                if let Some(list) = devices.get_mut(&tenant) {
-                    list.retain(|d| d.token != token);
-                }
-            }
-            devices.retain(|_, list| !list.is_empty());
-        }
-
-        Ok(devices)
+        list.sort_by_key(|d| (d.created_ms, d.token.clone()));
+        Ok(list)
     }
 
     /// Publish a record: temp file, then renamed into place.
@@ -233,23 +189,58 @@ impl DeviceRegistry {
         let bytes = serde_json::to_vec(device)?;
         ensure!(bytes.len() <= MAX_RECORD, "device record exceeds its limit");
 
-        let tenant_dir = self.dir.join(hex::encode(device.tenant));
-        tokio::fs::create_dir_all(&tenant_dir).await?;
+        let dir = self.dir(device.tenant).await?;
         let name = record_name(&device.token);
         // Truncates an unpublished write left by a cancelled host call.
-        let temp = tenant_dir.join(format!("{name}.tmp"));
+        let temp = dir.join(format!("{name}.tmp"));
         tokio::fs::write(&temp, &bytes).await?;
-        tokio::fs::rename(&temp, tenant_dir.join(name)).await?;
+        tokio::fs::rename(&temp, dir.join(name)).await?;
         Ok(())
     }
 
     async fn remove(&self, tenant: [u8; 16], token: &str) -> Result<()> {
-        let path = self.dir.join(hex::encode(tenant)).join(record_name(token));
+        let path = self.dir(tenant).await?.join(record_name(token));
         match tokio::fs::remove_file(path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e).context("removing a device record"),
         }
+    }
+
+    /// Load a tenant's devices, trimmed to what the caps allow.
+    ///
+    /// Over a cap, drop the oldest rather than refuse. A device record is a
+    /// cache of where somebody can be reached, not work that must not be lost
+    /// — so unlike a task record, the right answer to too many is to keep the
+    /// newest and serve. A store can be over-full legitimately: a lowered cap
+    /// in a new image, or records written before the cap was enforced.
+    async fn load(&self, devices: &mut Devices, tenant: [u8; 16]) -> Result<()> {
+        if devices.loaded.contains(&tenant) {
+            return Ok(());
+        }
+        let mut list = self.scan(tenant).await?;
+        let room = self
+            .limits
+            .max_devices
+            .saturating_sub(devices.total())
+            .min(self.limits.per_tenant);
+        if list.len() > room {
+            let excess = list.len() - room;
+            tracing::warn!(
+                tenant = %hex::encode(tenant),
+                held = list.len(),
+                dropping = excess,
+                "a tenant's devices are over a cap; dropping the oldest"
+            );
+            for evicted in list.drain(..excess) {
+                self.remove(tenant, &evicted.token).await?;
+            }
+        }
+        if !list.is_empty() {
+            devices.by_tenant.insert(tenant, list);
+        }
+        devices.loaded.insert(tenant);
+        Ok(())
     }
 
     /// Enrol a token for this tenant.
@@ -265,7 +256,9 @@ impl DeviceRegistry {
              letters, digits, '-', '_', ':' or '.'"
         );
         let mut devices = self.devices.lock().await;
+        self.load(&mut devices, tenant).await?;
         if devices
+            .by_tenant
             .get(&tenant)
             .is_some_and(|list| list.iter().any(|d| d.token == token))
         {
@@ -273,11 +266,9 @@ impl DeviceRegistry {
         }
 
         // The global cap, enforced where the write happens — the same place
-        // `tasks::enqueue` enforces `max_records`. Without it, enrolments this
-        // call accepted could put the store past what a restart will load.
-        let total: usize = devices.values().map(Vec::len).sum();
+        // `tasks::enqueue` enforces `max_records`.
         ensure!(
-            total < self.limits.max_devices,
+            devices.total() < self.limits.max_devices,
             "the device store is full ({} records); devices must be forgotten \
              before another can enrol",
             self.limits.max_devices
@@ -291,7 +282,7 @@ impl DeviceRegistry {
         };
         self.write(&device).await?;
 
-        let list = devices.entry(tenant).or_default();
+        let list = devices.by_tenant.entry(tenant).or_default();
         list.push(device);
         list.sort_by_key(|d| (d.created_ms, d.token.clone()));
         // Published first, evicted second: a crash between the two leaves one
@@ -309,8 +300,9 @@ impl DeviceRegistry {
     /// A client that was pruned while it was offline is not wrong to ask.
     pub async fn forget(&self, tenant: [u8; 16], token: &str) -> Result<()> {
         let mut devices = self.devices.lock().await;
+        self.load(&mut devices, tenant).await?;
         self.remove(tenant, token).await?;
-        if let Some(list) = devices.get_mut(&tenant) {
+        if let Some(list) = devices.by_tenant.get_mut(&tenant) {
             list.retain(|d| d.token != token);
         }
         Ok(())
@@ -328,7 +320,7 @@ impl DeviceRegistry {
         created_ms: u64,
     ) -> Result<bool> {
         let mut devices = self.devices.lock().await;
-        let Some(list) = devices.get_mut(&tenant) else {
+        let Some(list) = devices.by_tenant.get_mut(&tenant) else {
             return Ok(false);
         };
         if !list
@@ -342,11 +334,13 @@ impl DeviceRegistry {
         Ok(true)
     }
 
-    /// What this tenant can be woken on, oldest first.
+    /// What this tenant can be woken on, oldest first. Nothing, for a tenant
+    /// whose pool is not attached.
     pub async fn devices(&self, tenant: [u8; 16]) -> Vec<StoredDevice> {
         self.devices
             .lock()
             .await
+            .by_tenant
             .get(&tenant)
             .cloned()
             .unwrap_or_default()
@@ -357,9 +351,21 @@ impl DeviceRegistry {
         self.devices
             .lock()
             .await
+            .by_tenant
             .get(&tenant)
             .map(|l| l.len() as u32)
             .unwrap_or(0)
+    }
+}
+
+#[async_trait::async_trait]
+impl TenantLoader for DeviceRegistry {
+    /// Devices are not background work: a tenant with only devices enrolled
+    /// is not re-attached at boot for them.
+    async fn load_tenant(&self, tenant: [u8; 16]) -> Result<bool> {
+        let mut devices = self.devices.lock().await;
+        self.load(&mut devices, tenant).await?;
+        Ok(false)
     }
 }
 
@@ -367,7 +373,7 @@ impl DeviceRegistry {
 mod tests {
     use super::*;
     use crate::store::backend::memory::MemoryBackend;
-    use crate::store::crypto::{KeyMaterial, MasterSecret};
+    use crate::store::backend::Backend;
     use crate::zfs::{Disk, Zfs};
 
     const ALICE: [u8; 16] = [1; 16];
@@ -377,19 +383,17 @@ mod tests {
         format!("{seed}{}", "x".repeat(MIN_TOKEN_LEN))
     }
 
+    /// Storage with Alice and Bob attached, as their sign-ins would leave it.
     async fn memory() -> Arc<Zfs> {
-        Zfs::scratch().await
+        let fs = Zfs::scratch().await;
+        fs.tenant_dir(ALICE).await.unwrap();
+        fs.tenant_dir(BOB).await.unwrap();
+        fs
     }
 
     /// Alice's directory of device records.
     async fn alice_dir(fs: &Zfs) -> PathBuf {
-        let dir = fs
-            .runtime_dir(DEVICES_DIR)
-            .await
-            .unwrap()
-            .join(hex::encode(ALICE));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        fs.tenant_runtime_dir(ALICE, DEVICES_DIR).await.unwrap()
     }
 
     async fn registry() -> Arc<DeviceRegistry> {
@@ -565,46 +569,28 @@ mod tests {
         assert_eq!(r.count(ALICE).await, 0);
     }
 
+    /// Records are on the tenants' pools: a restart finds them once each
+    /// tenant is attached again, and not before.
     #[tokio::test]
-    async fn a_published_device_record_survives_reopening_the_pool() {
-        let backend = Arc::new(MemoryBackend::new());
-        let master = MasterSecret::from_bytes([7u8; 32]);
-        let keys = Arc::new(KeyMaterial::derive(&master, [8u8; 16]).unwrap());
+    async fn a_published_device_record_survives_a_restart_once_its_tenant_is_back() {
         let disk = Disk::scratch().unwrap();
-        let day = std::time::Duration::from_secs(86_400);
-        let fs = Zfs::create(
-            &disk,
-            backend.clone(),
-            keys.clone(),
-            &master,
-            "",
-            day,
-            Arc::new(crate::clock::HostClock),
-        )
-        .await
-        .unwrap();
+        let roots: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let fs = Zfs::scratch_on(&disk, roots.clone()).await;
+        fs.tenant_dir(ALICE).await.unwrap();
+        fs.tenant_dir(BOB).await.unwrap();
         let r = DeviceRegistry::open(fs.clone()).await.unwrap();
         r.register(ALICE, &token("a"), 1000).await.unwrap();
         r.register(BOB, &token("b"), 2000).await.unwrap();
         drop(r);
         drop(fs);
 
-        let fs = Zfs::open(
-            &disk,
-            backend,
-            keys,
-            &master,
-            "",
-            day,
-            None,
-            Arc::new(crate::clock::HostClock),
-        )
-        .await
-        .unwrap();
-        let reopened = DeviceRegistry::open(fs).await.unwrap();
+        let fs = Zfs::scratch_on(&disk, roots).await;
+        let reopened = DeviceRegistry::open(fs.clone()).await.unwrap();
+        assert_eq!(reopened.count(ALICE).await, 0, "not attached, not loaded");
+        fs.tenant_dir(ALICE).await.unwrap();
         assert_eq!(reopened.count(ALICE).await, 1);
-        assert_eq!(reopened.count(BOB).await, 1);
         assert_eq!(reopened.devices(ALICE).await[0].token, token("a"));
+        assert_eq!(reopened.count(BOB).await, 0);
     }
 
     #[tokio::test]
@@ -691,8 +677,8 @@ mod tests {
         assert!(DeviceRegistry::open(fs).await.is_err());
     }
 
-    /// The registry sits outside every tenant's directory, so no guest
-    /// preopen reaches it.
+    /// The records sit beside the tenant's data, not in it, so no guest
+    /// preopen reaches them.
     #[tokio::test]
     async fn device_records_live_outside_every_tenant_directory() {
         let fs = memory().await;

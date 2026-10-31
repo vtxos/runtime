@@ -41,7 +41,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::serve::tls::TlsIdentity;
 use crate::store::backend::{Backend, PutBlobInput};
-use crate::store::crypto::KeyMaterial;
+use crate::store::crypto::VersionKeys;
 use crate::store::StoreError;
 use anyhow::{Context, Result};
 
@@ -121,11 +121,12 @@ fn cache_key(prefix: &str, kind: &str, scope: &[String], directory_url: &str) ->
     )
 }
 
-/// rustls-acme cache backed by the object store, sealed under the master key.
+/// rustls-acme cache backed by the object store, sealed under this release's
+/// key and kept under its prefix: each release has its own certificate.
 pub struct SealedAcmeCache {
     backend: Arc<dyn Backend>,
     prefix: String,
-    keys: Arc<KeyMaterial>,
+    keys: Arc<VersionKeys>,
     /// Updated whenever a certificate is loaded or stored.
     certificate: CertificateSlot,
 }
@@ -142,7 +143,7 @@ impl SealedAcmeCache {
     pub fn new(
         backend: Arc<dyn Backend>,
         prefix: String,
-        keys: Arc<KeyMaterial>,
+        keys: Arc<VersionKeys>,
         certificate: CertificateSlot,
     ) -> Self {
         SealedAcmeCache {
@@ -248,57 +249,21 @@ pub fn leaf_from_pem(pem: &[u8]) -> Result<Vec<u8>> {
 /// AES-256-GCM with the object key as associated data.
 ///
 /// Binding the key means a sealed account blob cannot be moved over a
-/// certificate blob, or one filesystem's cache swapped for another's, by
-/// anyone who can write to the bucket.
-fn seal(keys: &KeyMaterial, object_key: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
-    use aws_lc_rs::aead::{Aad, Nonce, NONCE_LEN};
-    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    SystemRandom::new()
-        .fill(&mut nonce_bytes)
-        .map_err(|_| anyhow::anyhow!("generating a nonce"))?;
-
-    let mut buffer = plaintext.to_vec();
-    keys.runtime_seal_key()
-        .seal_in_place_append_tag(
-            Nonce::assume_unique_for_key(nonce_bytes),
-            Aad::from(object_key.as_bytes()),
-            &mut buffer,
-        )
-        .map_err(|_| anyhow::anyhow!("sealing the ACME cache entry"))?;
-
-    let mut out = Vec::with_capacity(NONCE_LEN + buffer.len());
-    out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&buffer);
-    Ok(out)
+/// certificate blob, or one release's cache swapped for another's, by anyone
+/// who can write to the bucket.
+fn seal(keys: &VersionKeys, object_key: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+    crate::store::crypto::seal::seal(keys.runtime_seal_key(), object_key.as_bytes(), plaintext)
+        .map_err(|e| anyhow::anyhow!("sealing the ACME cache entry: {e}"))
 }
 
-fn unseal(keys: &KeyMaterial, object_key: &str, sealed: &[u8]) -> Result<Vec<u8>> {
-    use aws_lc_rs::aead::{Aad, Nonce, NONCE_LEN};
-
-    if sealed.len() <= NONCE_LEN {
-        anyhow::bail!("sealed ACME entry is too short to contain a nonce");
-    }
-    let (nonce_bytes, body) = sealed.split_at(NONCE_LEN);
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(nonce_bytes);
-
-    let mut buffer = body.to_vec();
-    let plaintext = keys
-        .runtime_seal_key()
-        .open_in_place(
-            Nonce::assume_unique_for_key(nonce),
-            Aad::from(object_key.as_bytes()),
-            &mut buffer,
-        )
+fn unseal(keys: &VersionKeys, object_key: &str, sealed: &[u8]) -> Result<Vec<u8>> {
+    crate::store::crypto::seal::unseal(keys.runtime_seal_key(), object_key.as_bytes(), sealed)
         .map_err(|_| {
             anyhow::anyhow!(
                 "the sealed ACME entry did not authenticate — it was written under a \
-                 different master key, or it has been tampered with"
+                 different release's key, or it has been tampered with"
             )
-        })?;
-    Ok(plaintext.to_vec())
+        })
 }
 
 #[async_trait::async_trait]
@@ -419,7 +384,7 @@ impl std::fmt::Debug for Acme {
 pub fn start(
     config: &AcmeConfig,
     backend: Arc<dyn Backend>,
-    keys: Arc<KeyMaterial>,
+    keys: Arc<VersionKeys>,
 ) -> Result<Acme> {
     anyhow::ensure!(
         !config.domains.is_empty(),
@@ -520,8 +485,8 @@ mod tests {
     use super::*;
     use crate::store::crypto::MasterSecret;
 
-    fn keys() -> Arc<KeyMaterial> {
-        Arc::new(KeyMaterial::derive(&MasterSecret::from_bytes([3u8; 32]), [1u8; 16]).unwrap())
+    fn keys() -> Arc<VersionKeys> {
+        Arc::new(VersionKeys::derive(&MasterSecret::from_bytes([3u8; 32]), &[1u8; 16]).unwrap())
     }
 
     #[test]
@@ -545,8 +510,9 @@ mod tests {
     #[test]
     fn another_master_key_cannot_open_it() {
         let sealed = seal(&keys(), "acme/cert-abc", b"secret").unwrap();
-        let other =
-            Arc::new(KeyMaterial::derive(&MasterSecret::from_bytes([4u8; 32]), [1u8; 16]).unwrap());
+        let other = Arc::new(
+            VersionKeys::derive(&MasterSecret::from_bytes([4u8; 32]), &[1u8; 16]).unwrap(),
+        );
         let err = unseal(&other, "acme/cert-abc", &sealed).unwrap_err();
         assert!(format!("{err:#}").contains("authenticate"), "{err:#}");
     }

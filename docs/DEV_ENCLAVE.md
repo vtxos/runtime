@@ -226,10 +226,11 @@ measurement will refuse the new enclave, which is the behaviour you want to see.
 
 With `--keep-store` the store survives. MinIO's data lives in
 `target/qemu-nitro/<name>-store/minio` instead of inside its container, so the
-next start with the same name finds the receipt and the store together and
-**resumes**: every tenant, passkey and file a guest wrote is still there. A new
-component is an **upgrade** of that store — the boot machine records the new
-pair — not a new one. Two things still change every boot, and clients have to
+next start with the same name **resumes**: every tenant, passkey and file a
+guest wrote is still there. A new component is a new **release** on the same
+store: it mints its own key, and opens each tenant's data as that tenant's
+owner next signs in — so a client signs in once before it sees its files, and
+background work for a tenant waits for that. Two things still change every boot, and clients have to
 re-read them: the trust root, minted fresh by design, and PCR16 whenever the
 component did.
 

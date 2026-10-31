@@ -153,8 +153,8 @@ impl Enclave {
 
     async fn start(builder: EnclaveBuilder) -> Result<Enclave> {
         use crate::{
-            AuthEndpoints, ChallengeStore, FilesystemCredentials, Gate, GuestEnvironment,
-            HostClock, PoolLimits, ServeConfig, Tenancy, TlsIdentity,
+            AuthEndpoints, CatalogCredentials, ChallengeStore, Gate, GuestEnvironment, HostClock,
+            PoolLimits, ServeConfig, Tenancy, TlsIdentity,
         };
 
         // A directory standing in for the pool: the harness runs without root
@@ -167,7 +167,7 @@ impl Enclave {
         crate::measure_guest(nsm.as_ref(), &builder.guest).context("measuring the guest")?;
         let entropy: Arc<dyn nitro_nsm::Nsm> = nsm.clone();
 
-        let credentials = Arc::new(FilesystemCredentials::new(fs.clone()));
+        let credentials = Arc::new(CatalogCredentials::new(fs.catalog().clone()));
         let gate = Arc::new(Gate::new(
             crate::build_relying_party(RP_ID, ORIGIN, &[])?,
             ChallengeStore::new(std::time::Duration::from_secs(60), 256),
@@ -359,6 +359,9 @@ impl Enclave {
                 serde_json::json!({
                     "challenge_id": options["challenge_id"],
                     "assertion": b64.encode(assertion.to_string().as_bytes()),
+                    "tenant_key": b64.encode(
+                        credential.authenticator.tenant_key().expose_secret()
+                    ),
                 }),
             )
             .await?;

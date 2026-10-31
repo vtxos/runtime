@@ -564,6 +564,15 @@ mod tests {
         format!("{seed}{}", "y".repeat(40))
     }
 
+    /// Storage with Alice and Bob attached, as their sign-ins leave it: a
+    /// tenant's devices are on its pool.
+    async fn signed_in() -> Arc<Zfs> {
+        let fs = Zfs::scratch().await;
+        fs.tenant_dir(ALICE).await.unwrap();
+        fs.tenant_dir(BOB).await.unwrap();
+        fs
+    }
+
     async fn fixture(
         replies: Vec<(u16, &str)>,
     ) -> (
@@ -572,8 +581,7 @@ mod tests {
         Arc<DeviceRegistry>,
         Arc<Recorder>,
     ) {
-        let fs = Zfs::scratch().await;
-        let registry = DeviceRegistry::open(fs).await.unwrap();
+        let registry = DeviceRegistry::open(signed_in().await).await.unwrap();
         let clock = Arc::new(WallClockAdapter::new(Arc::new(HostClock)).unwrap());
         let recorder = Recorder::with(replies);
         let client = PinpointClient::new(
@@ -599,10 +607,9 @@ mod tests {
     /// assertion about what is in flight becomes a race with that task. Holding
     /// the receiver and never reading it makes the queue stand still.
     async fn detached() -> (Arc<Notifier>, mpsc::Receiver<Wake>) {
-        let fs = Zfs::scratch().await;
         let (tx, rx) = mpsc::channel::<Wake>(QUEUE_CAPACITY);
         let notifier = Arc::new(Notifier {
-            registry: DeviceRegistry::open(fs).await.unwrap(),
+            registry: DeviceRegistry::open(signed_in().await).await.unwrap(),
             clock: Arc::new(WallClockAdapter::new(Arc::new(HostClock)).unwrap()),
             tx,
             inflight: Mutex::new(HashSet::new()),

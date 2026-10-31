@@ -59,7 +59,7 @@
 //! failure or a runtime restart needs no guest and no timer: the record is on
 //! the filesystem, and the supervisor reads it at boot.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,7 +70,7 @@ use tokio::sync::{Mutex, Notify};
 
 use crate::serve::attest::{ResponseAttestor, ATTESTATION_HEADER};
 use crate::serve::egress::Origin;
-use crate::zfs::Zfs;
+use crate::zfs::{TenantLoader, Zfs};
 
 /// Under `/runtime`.
 const DIR: &str = "streams";
@@ -196,6 +196,8 @@ struct Live {
 pub struct StreamRegistry {
     zfs: Arc<Zfs>,
     records: Mutex<BTreeMap<([u8; 16], String), StreamRecord>>,
+    /// Tenants whose records have been read from their pools.
+    loaded: Mutex<BTreeSet<[u8; 16]>>,
     live: Mutex<BTreeMap<([u8; 16], String), Live>>,
     /// Woken when a record appears or goes. `notify_one`, never `notify_waiters`: there is exactly
     /// one consumer — the supervisor loop — and it is not registered as a waiter while it is
@@ -224,11 +226,19 @@ pub struct StreamContext {
     pub interactive: bool,
 }
 
+#[async_trait::async_trait]
+impl TenantLoader for StreamRegistry {
+    async fn load_tenant(&self, tenant: [u8; 16]) -> Result<bool> {
+        self.load(tenant).await
+    }
+}
+
 impl StreamRegistry {
     pub async fn open_registry(zfs: Arc<Zfs>) -> Result<Arc<Self>> {
         let registry = Arc::new(Self {
-            zfs,
+            zfs: zfs.clone(),
             records: Mutex::new(BTreeMap::new()),
+            loaded: Mutex::new(BTreeSet::new()),
             live: Mutex::new(BTreeMap::new()),
             changed: Notify::new(),
             attestor: Mutex::new(None),
@@ -236,40 +246,56 @@ impl StreamRegistry {
             generations: AtomicU64::new(1),
         });
 
-        // Everything standing, read back before anything is served. A record on
-        // disk is the whole of a connection's existence, so this is also the
-        // answer to "what reconnects after a restart": this loop. Each tenant's
-        // records are on its own pool; scan only the pools the catalog flags.
-        let mut records = registry.records.lock().await;
-        for tenant in registry.zfs.background_tenants().await? {
-            let dir = registry.zfs.tenant_runtime_dir(tenant, DIR).await?;
-            let mut entries = tokio::fs::read_dir(&dir).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                let name = entry
-                    .file_name()
-                    .into_string()
-                    .ok()
-                    .context("non-UTF-8 stream record name")?;
-                if name.ends_with(".tmp") {
-                    tokio::fs::remove_file(entry.path()).await?;
-                    continue;
-                }
-                let bytes = tokio::fs::read(entry.path()).await?;
-                ensure!(bytes.len() <= MAX_RECORD, "oversized stream record");
-                let record: StreamRecord =
-                    serde_json::from_slice(&bytes).context("decoding a stream record")?;
-                ensure!(
-                    record.version == 1
-                        && valid_id(&record.id)
-                        && record.tenant == tenant
-                        && record.key() == name,
-                    "malformed stream record {name}"
-                );
-                records.insert((record.tenant, record.id.clone()), record);
+        // A record on a tenant's pool is the whole of a connection's
+        // existence, so this is also the answer to "what reconnects after a
+        // restart": each tenant's records, read when its pool is attached —
+        // now for the tenants this release kept, later as owners sign in.
+        let loader: Arc<dyn TenantLoader> = registry.clone();
+        zfs.register_loader(Arc::downgrade(&loader)).await?;
+        Ok(registry)
+    }
+
+    /// Read one tenant's records back from its pool. Idempotent.
+    async fn load(&self, tenant: [u8; 16]) -> Result<bool> {
+        if !self.loaded.lock().await.insert(tenant) {
+            return Ok(self.records.lock().await.keys().any(|(t, _)| *t == tenant));
+        }
+        let dir = self.zfs.tenant_runtime_dir(tenant, DIR).await?;
+        let mut found = Vec::new();
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry
+                .file_name()
+                .into_string()
+                .ok()
+                .context("non-UTF-8 stream record name")?;
+            if name.ends_with(".tmp") {
+                tokio::fs::remove_file(entry.path()).await?;
+                continue;
             }
+            let bytes = tokio::fs::read(entry.path()).await?;
+            ensure!(bytes.len() <= MAX_RECORD, "oversized stream record");
+            let record: StreamRecord =
+                serde_json::from_slice(&bytes).context("decoding a stream record")?;
+            ensure!(
+                record.version == 1
+                    && valid_id(&record.id)
+                    && record.tenant == tenant
+                    && record.key() == name,
+                "malformed stream record {name}"
+            );
+            found.push(record);
+        }
+        let any = !found.is_empty();
+        let mut records = self.records.lock().await;
+        for record in found {
+            records.insert((record.tenant, record.id.clone()), record);
         }
         drop(records);
-        Ok(registry)
+        if any {
+            self.changed.notify_one();
+        }
+        Ok(any)
     }
 
     /// What proves each request to the far side comes from this enclave. Set
@@ -282,8 +308,8 @@ impl StreamRegistry {
     pub async fn open(&self, tenant: [u8; 16], id: String, origin: String) -> Result<()> {
         ensure!(valid_id(&id), "a stream id is 1..=64 of [A-Za-z0-9_-]");
         Origin::parse(&origin).context("that is not an origin")?;
-        // The tenant's pool must be scanned on the next boot; flag it (durable
-        // on the control pool) before its first record is written.
+        // The tenant's pool must be re-attached on the next boot; keep its key
+        // before its first record is written.
         self.zfs.mark_background(tenant).await?;
 
         let mut records = self.records.lock().await;

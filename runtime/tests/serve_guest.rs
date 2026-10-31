@@ -80,6 +80,15 @@ async fn handle_for_with(env: &[(String, String)]) -> ServeHandle {
     handle_over_with(fs, env).await
 }
 
+/// Attach a tenant's pool, as its owner's sign-in would.
+async fn signed_in(handle: &ServeHandle, tenant: &[u8; 16]) {
+    handle
+        .zfs()
+        .tenant_dir(*tenant)
+        .await
+        .expect("attaching the tenant");
+}
+
 async fn get_as(handle: &ServeHandle, path: &str, tenant: Option<&[u8; 16]>) -> (u16, String) {
     request_as(handle, "GET", path, &[], tenant).await
 }
@@ -91,6 +100,11 @@ async fn request_as(
     body_bytes: &[u8],
     tenant: Option<&[u8; 16]>,
 ) -> (u16, String) {
+    // What the gate's approval does before it grants a token: attach the
+    // tenant's pool with its key.
+    if let Some(tenant) = tenant {
+        signed_in(handle, tenant).await;
+    }
     let req = hyper::Request::builder()
         .method(method)
         .uri(format!("http://enclave.test{path}"))
@@ -360,6 +374,9 @@ async fn whoami(handle: &ServeHandle, tenant: Option<&[u8; 16]>, forged: Option<
             .header("x-enclave-client", value)
             .header("x-enclave-client", value)
             .header("x-enclave-client", value);
+    }
+    if let Some(tenant) = tenant {
+        signed_in(handle, tenant).await;
     }
     let req = builder.body(body(b"")).expect("well-formed request");
     let resp = handle
@@ -637,6 +654,7 @@ async fn a_trap_is_contained_to_one_client() {
 
     let alice = identity("alice");
     let bob = identity("bob");
+    signed_in(&handle, &alice).await;
 
     // Alice wedges her call.
     let req = hyper::Request::builder()
@@ -718,6 +736,7 @@ async fn one_client_does_not_wait_for_another() {
     // Bob once first, so his dataset exists and the assertion below measures
     // contention rather than its creation.
     assert_eq!(get_as(&handle, "/counter", Some(&bob)).await.0, 200);
+    signed_in(&handle, &alice).await;
 
     let hung = {
         let handle = handle.clone();

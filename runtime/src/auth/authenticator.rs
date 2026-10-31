@@ -104,6 +104,24 @@ impl SoftwareAuthenticator {
         &self.key_pkcs8
     }
 
+    /// What the WebAuthn `prf` extension returns for `salt`: a secret fixed by
+    /// the credential and the salt, as a platform's `hmac-secret` is. Here an
+    /// HMAC under the private key, so a restored passkey answers as it did.
+    pub fn prf(&self, salt: &[u8]) -> [u8; 32] {
+        let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, &self.key_pkcs8);
+        let tag = aws_lc_rs::hmac::sign(&key, &[b"WebAuthn PRF\0".as_slice(), salt].concat());
+        tag.as_ref().try_into().expect("32 bytes")
+    }
+
+    /// This passkey's tenant key ([`crate::auth::tenant_key`]): what its app
+    /// sends with each assertion.
+    pub fn tenant_key(&self) -> crate::store::crypto::TenantKey {
+        crate::auth::tenant_key::derive(
+            &self.prf(b"aegira"),
+            &crate::auth::tenant_of(&self.credential_id),
+        )
+    }
+
     /// The credential public key, as the COSE_Key an authenticator reports.
     ///
     /// `{1: 2 (EC2), 3: -7 (ES256), -1: 1 (P-256), -2: x, -3: y}`, which is

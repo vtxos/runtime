@@ -342,14 +342,18 @@
           # against a certificate a browser does not trust.
           ENCLAVE_TLS_DOMAINS = lib.concatStringsSep "," deployment.tlsDomains;
 
-          # The master secret is minted by KMS inside the enclave and released
-          # only against an attestation whose PCR0 and PCR16 match the key
-          # policy. A wrong image or a wrong guest does not get a refused
-          # mount — it gets no key at all. The key and the parameter come from
-          # the deployment, since they name resources this repository does not
-          # own.
-          ENCLAVE_KMS_KEY_ID = deployment.kmsKeyId;
+          # Each release's master secret is minted by KMS inside the enclave
+          # and released only against an attestation whose PCR0 and PCR16
+          # match its key's policy. A release finds its key under this alias
+          # prefix, as `<prefix>/<sha256(pcr0 ‖ pcr16)>`, and its ciphertext
+          # under the parameter base the same way. They come from the
+          # deployment, since they name resources this repository does not own.
+          ENCLAVE_KMS_KEY_ALIAS = deployment.kmsKeyAlias;
           ENCLAVE_MASTER_KEY_PARAMETER = deployment.masterKeyParameter;
+
+          # This runtime release's number, written into every anchor. Bump it
+          # with every release, and never reuse one.
+          ENCLAVE_RELEASE = toString deployment.release;
 
           # How long root records are locked — the rollback guarantee's horizon,
           # and how long the roots bucket outlives the deployment.
@@ -434,7 +438,7 @@
         # The key settings go: this image keeps the static key below, and the
         # runtime refuses one alongside KMS settings rather than pick between them.
         env = builtins.removeAttrs runtimeImage.env [
-          "ENCLAVE_KMS_KEY_ID"
+          "ENCLAVE_KMS_KEY_ALIAS"
           "ENCLAVE_MASTER_KEY_PARAMETER"
         ] // {
           ENCLAVE_CLOCK_SOURCE = "host";
@@ -458,13 +462,6 @@
           # such flag, so no deployment can sign its own attestations.
           ENCLAVE_COSIGN_ATTESTATIONS = "1";
 
-          # And receipts stay content-checked, because that chain is minted
-          # fresh at every boot. A receipt signed at genesis names a root the
-          # next boot no longer has, so requiring a signature here would turn
-          # every restart into a refusal to resume. Contents are still
-          # verified — PCR0, PCR16 and the state_root — which is the whole
-          # boot machine minus the one part that needs real hardware.
-          ENCLAVE_RECEIPT_TRUST = "unsigned-emulator";
           # And it cannot use KMS at all, for the same reason: KMS verifies
           # the attestation document carrying the enclave's recipient public
           # key, and will not accept one that is unsigned. So the emulator

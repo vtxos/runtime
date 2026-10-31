@@ -31,8 +31,7 @@ use clap::Parser;
 use enclave_runtime::{
     open_clock, open_entropy, parse_bool_flag, serve_component, AcmeConfig, ClockSource,
     GuestEnvironment, GuestSource, MasterKeySourceKind, MountConfig, NetworkConfig, NetworkMode,
-    RandomSource, ReceiptTrust, ServeConfig, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE,
-    EXIT_RUNTIME_FAILURE,
+    RandomSource, ServeConfig, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
 
 /// Where the guest is, in the roots bucket.
@@ -157,9 +156,10 @@ async fn start_telemetry(
     long_about = None
 )]
 struct Cli {
-    /// The Object-Locked bucket: the pool's anchor chain, the boot's origin
-    /// records, the guest, and the sealed ACME cache. COMPLIANCE retention on
-    /// it is the entire rollback guarantee. The state itself is on the pool.
+    /// The Object-Locked bucket: each pool's anchor chain, the tenant catalog,
+    /// each release's sealed key and caches, and the guest. COMPLIANCE
+    /// retention on it is the entire rollback guarantee. The state itself is
+    /// on the pools.
     #[arg(long, env = "ENCLAVE_ROOTS_BUCKET")]
     roots_bucket: String,
 
@@ -180,13 +180,20 @@ struct Cli {
     )]
     fs_id: String,
 
-    /// Refuse a store whose newest anchor is older than this sequence number.
-    ///
-    /// The only defence against a store that hides newer anchors at a cold
-    /// boot. Everything else about rollback is closed cryptographically; this
-    /// one needs a number from outside the store.
-    #[arg(long, env = "ENCLAVE_MIN_ROOT_SEQ")]
-    min_root_seq: Option<u64>,
+    /// This runtime release's number, written into every anchor it publishes.
+    /// A pool last written by a higher number is refused, so an operator
+    /// cannot boot an older approved image onto state a newer one has moved
+    /// on. Bump it with every release and never reuse one; it is measured into
+    /// PCR0 with the rest of the image's configuration.
+    #[cfg_attr(
+        not(any(test, feature = "testing")),
+        arg(long, env = "ENCLAVE_RELEASE")
+    )]
+    #[cfg_attr(
+        any(test, feature = "testing"),
+        arg(long, env = "ENCLAVE_RELEASE", default_value_t = 1)
+    )]
+    release: u64,
 
     /// How long each anchor and boot record is locked against deletion, in seconds.
     ///
@@ -203,13 +210,16 @@ struct Cli {
     #[arg(long, env = "AWS_REGION", default_value = "us-east-1")]
     region: String,
 
-    /// The customer master key that releases this filesystem's secret. Its
-    /// policy — `kms:RecipientAttestation:PCR0` and `:PCR16`, on both
-    /// `GenerateDataKey` and `Decrypt` — is the security control.
-    #[arg(long, env = "ENCLAVE_KMS_KEY_ID")]
-    kms_key_id: Option<String>,
+    /// The alias prefix each release's KMS key is found under, as
+    /// `<prefix>/<sha256(pcr0 ‖ pcr16)>`. Each key's policy —
+    /// `kms:RecipientAttestation:PCR0` and `:PCR16`, on both `GenerateDataKey`
+    /// and `Decrypt` — is the security control; a guest-only release needs a
+    /// new key under this prefix, and no new image.
+    #[arg(long, env = "ENCLAVE_KMS_KEY_ALIAS")]
+    kms_key_alias: Option<String>,
 
-    /// SSM parameter holding the KMS ciphertext, and nothing else.
+    /// The base of the SSM parameters holding each release's KMS ciphertext,
+    /// as `<base>/<sha256(pcr0 ‖ pcr16)>`.
     #[arg(long, env = "ENCLAVE_MASTER_KEY_PARAMETER")]
     master_key_parameter: Option<String>,
 
@@ -313,12 +323,6 @@ struct Testing {
     #[arg(long, env = "ENCLAVE_MASTER_KEY")]
     master_key: Option<String>,
 
-    /// `unsigned-emulator` reads a state-origin receipt without checking a
-    /// signature, because the emulator's NSM does not sign.
-    #[arg(long, env = "ENCLAVE_RECEIPT_TRUST", default_value = "required",
-          value_parser = ReceiptTrust::parse)]
-    receipt_trust: ReceiptTrust,
-
     /// Where the guest's wall-clock time comes from. The emulator has no PTP
     /// clock; `host` uses the system's.
     #[arg(long, env = "ENCLAVE_CLOCK_SOURCE", default_value = "ptp",
@@ -419,7 +423,6 @@ impl Testing {
         Testing {
             master_key_source: MasterKeySourceKind::Kms,
             master_key: None,
-            receipt_trust: ReceiptTrust::Required,
             clock_source: ClockSource::Ptp,
             ptp_device: PathBuf::from(DEFAULT_PTP_DEVICE),
             random_source: RandomSource::Nsm,
@@ -491,7 +494,6 @@ impl Cli {
             force_path_style: self.testing.force_path_style,
             bucket_prefix: self.bucket_prefix.clone(),
             fs_id: enclave_runtime::parse_fs_id(&self.fs_id)?,
-            min_root_seq: self.min_root_seq,
             skip_bucket_probe: false,
             request_timeout: S3_TIMEOUT,
             root_retention: Duration::from_secs(self.root_retention_secs),
@@ -502,7 +504,7 @@ impl Cli {
         Ok(enclave_runtime::MasterKeyConfig {
             kind: self.testing.master_key_source,
             master_key: self.testing.master_key.clone(),
-            kms_key_id: self.kms_key_id.clone(),
+            kms_key_alias: self.kms_key_alias.clone(),
             parameter: self.master_key_parameter.clone(),
             environment: KMS_ENVIRONMENT.to_string(),
             fs_id: enclave_runtime::parse_fs_id(&self.fs_id)?,
@@ -513,6 +515,21 @@ impl Cli {
             secret_access_key: self.testing.secret_access_key.clone(),
             session_token: self.testing.session_token.clone(),
         })
+    }
+}
+
+/// The guest file's setting naming its release: written into every anchor
+/// beside the runtime's, and refused when a pool names a higher one. A guest
+/// that names none is release 0, and gets no protection from an older guest.
+const GUEST_RELEASE_SETTING: &str = "AEGIRA_RELEASE";
+
+fn guest_release(env: &[(String, String)]) -> Result<u64> {
+    match env.iter().find(|(n, _)| n == GUEST_RELEASE_SETTING) {
+        Some((_, v)) => v
+            .trim()
+            .parse()
+            .with_context(|| format!("{GUEST_RELEASE_SETTING}={v:?} is not a release number")),
+        None => Ok(0),
     }
 }
 
@@ -625,14 +642,22 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         "guest measured into PCR16 and locked"
     );
 
-    // Decide whether this enclave is entitled to the state it is about to
-    // load, before it loads any of it.
+    // The guest's environment is the settings its file carries, measured into PCR16 with its
+    // code, and nothing else — see `env::from_guest`. Names only: a value can be a credential.
+    let env = enclave_runtime::env::from_guest(&component)?;
+    let release = enclave_runtime::Release {
+        runtime: cli.release,
+        guest: guest_release(&env)?,
+    };
+
+    // This release's key, and the tenants it kept. Every other tenant's pool
+    // waits for its owner's key.
     let booted = enclave_runtime::boot(
         &roots,
         &mount_config,
         &enclave_runtime::BootConfig {
-            trust: cli.testing.receipt_trust,
             disk: enclave_runtime::Disk::Parent,
+            release,
         },
         &entropy,
         &keys,
@@ -642,17 +667,16 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
 
     tracing::info!(
         mode = ?booted.mode,
+        version = %hex::encode(booted.vid),
         pcr0 = %hex::encode(booted.pair.pcr0),
         pcr16 = %hex::encode(booted.pair.pcr16),
-        state_root = %hex::encode(booted.state_root),
-        "state origin established"
+        %release,
+        resumed = booted.resumed,
+        "version established"
     );
 
     let zfs = booted.zfs.clone();
 
-    // The guest's environment is the settings its file carries, measured into PCR16 with its
-    // code, and nothing else — see `env::from_guest`. Names only: a value can be a credential.
-    let env = enclave_runtime::env::from_guest(&component)?;
     tracing::info!(
         names = %env.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "),
         "guest environment: the settings the guest file carries"
@@ -713,10 +737,15 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
             contacts: cli.testing.acme_contacts.clone(),
             directory: cli.testing.acme_directory.clone(),
             directory_ca,
-            prefix: mount_config.bucket_prefix.clone(),
+            // This release's own certificate, sealed under its own key.
+            prefix: format!(
+                "{}versions/{}/",
+                mount_config.bucket_prefix,
+                hex::encode(booted.vid)
+            ),
         },
         roots.clone(),
-        booted.keys.clone(),
+        booted.version_keys.clone(),
     )?);
     tracing::info!(listen = %HTTP_LISTEN, "serving guest");
 
@@ -757,8 +786,9 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
             // What a page on the relying party's own domain claims. Native apps
             // claim theirs, from `--webauthn-allowed-origin`.
             let origin = format!("https://{rp_id}");
-            let credentials =
-                std::sync::Arc::new(enclave_runtime::FilesystemCredentials::new(zfs.clone()));
+            let credentials = std::sync::Arc::new(enclave_runtime::CatalogCredentials::new(
+                zfs.catalog().clone(),
+            ));
             let gate = std::sync::Arc::new(enclave_runtime::Gate::new(
                 enclave_runtime::build_relying_party(&rp_id, &origin, &allowed_origins)?,
                 enclave_runtime::ChallengeStore::new(
@@ -1153,7 +1183,6 @@ mod tests {
         let production = Testing::production();
         assert_eq!(production.master_key_source, MasterKeySourceKind::Kms);
         assert!(production.master_key.is_none());
-        assert_eq!(production.receipt_trust, ReceiptTrust::Required);
         assert_eq!(production.clock_source, ClockSource::Ptp);
         assert_eq!(production.random_source, RandomSource::Nsm);
         assert!(production.endpoint.is_none() && production.access_key_id.is_none());
@@ -1165,7 +1194,6 @@ mod tests {
         // from production only where its image says so.
         let defaults = cli_from(&[]).testing;
         assert_eq!(defaults.master_key_source, production.master_key_source);
-        assert_eq!(defaults.receipt_trust, production.receipt_trust);
         assert_eq!(defaults.clock_source, production.clock_source);
         assert_eq!(defaults.random_source, production.random_source);
     }
@@ -1283,8 +1311,8 @@ mod tests {
     #[test]
     fn a_plaintext_key_is_refused_under_kms() {
         let err = source_error(&[
-            "--kms-key-id",
-            "arn:aws:kms:eu-west-2:1:key/a",
+            "--kms-key-alias",
+            "alias/aegira",
             "--master-key-parameter",
             "/p",
             "--master-key",
@@ -1302,8 +1330,8 @@ mod tests {
             "static",
             "--master-key",
             &"ab".repeat(32),
-            "--kms-key-id",
-            "arn:aws:kms:eu-west-2:1:key/a",
+            "--kms-key-alias",
+            "alias/aegira",
         ]);
         assert!(err.contains("alongside KMS settings"), "unexpected: {err}");
     }
@@ -1311,10 +1339,9 @@ mod tests {
     #[test]
     fn each_source_names_the_setting_it_is_missing() {
         assert!(source_error(&["--master-key-source", "static"]).contains("--master-key"));
-        assert!(source_error(&[]).contains("--kms-key-id"));
+        assert!(source_error(&[]).contains("--kms-key-alias"));
         assert!(
-            source_error(&["--kms-key-id", "arn:aws:kms:eu-west-2:1:key/a"])
-                .contains("--master-key-parameter")
+            source_error(&["--kms-key-alias", "alias/aegira"]).contains("--master-key-parameter")
         );
     }
 
@@ -1331,6 +1358,19 @@ mod tests {
         assert_eq!(config.fs_id, [0xcd; 16]);
     }
 
+    /// A testing build defaults to release 1; what the image says reaches
+    /// the boot; and a guest names its own in its settings.
+    #[test]
+    fn releases_come_from_the_image_and_the_guest_file() {
+        assert_eq!(cli_from(&[]).release, 1);
+        assert_eq!(cli_from(&["--release", "7"]).release, 7);
+        assert_eq!(guest_release(&[]).unwrap(), 0);
+        let named = vec![("AEGIRA_RELEASE".to_string(), " 12 ".to_string())];
+        assert_eq!(guest_release(&named).unwrap(), 12);
+        let garbage = vec![("AEGIRA_RELEASE".to_string(), "twelve".to_string())];
+        assert!(guest_release(&garbage).is_err());
+    }
+
     #[test]
     fn guest_arguments_come_after_a_separator() {
         let cli = cli_from(&["--", "arg1", "--not-our-flag"]);
@@ -1344,17 +1384,10 @@ mod tests {
 
     #[test]
     fn mount_config_carries_the_settings_through() {
-        let cli = cli_from(&[
-            "--bucket-prefix",
-            "tenant",
-            "--min-root-seq",
-            "42",
-            "--force-path-style",
-        ]);
+        let cli = cli_from(&["--bucket-prefix", "tenant", "--force-path-style"]);
         let cfg = cli.mount_config().unwrap();
         assert_eq!(cfg.roots_bucket, "b");
         assert_eq!(cfg.bucket_prefix, "tenant");
-        assert_eq!(cfg.min_root_seq, Some(42));
         assert!(cfg.force_path_style);
         assert_eq!(cfg.request_timeout, S3_TIMEOUT);
     }

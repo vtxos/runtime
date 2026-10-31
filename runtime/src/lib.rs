@@ -23,6 +23,7 @@
 
 pub mod auth;
 pub mod boot;
+pub mod catalog;
 pub mod clock;
 pub mod env;
 pub mod flag;
@@ -50,10 +51,11 @@ pub mod testing;
 #[cfg(any(test, feature = "testing"))]
 pub use auth::SoftwareAuthenticator;
 pub use auth::{
-    build_relying_party, AuthEndpoints, ChallengeStore, FilesystemCredentials, Gate,
-    InteractionScope, TokenStore, AUTH_PREFIX, DEFAULT_CAPACITY, DEFAULT_TOKEN_CAPACITY,
+    build_relying_party, AuthEndpoints, CatalogCredentials, ChallengeStore, Gate, InteractionScope,
+    TokenStore, AUTH_PREFIX, DEFAULT_CAPACITY, DEFAULT_TOKEN_CAPACITY,
 };
-pub use boot::{boot, BootConfig, BootMode, Booted, Pair, ReceiptTrust};
+pub use boot::{boot, BootConfig, BootMode, Booted, Pair};
+pub use catalog::{Catalog, Place};
 pub use clock::{open_clock, ClockSource, HostClock, PtpClock, TrustedClock, DEFAULT_PTP_DEVICE};
 pub use flag::parse_bool_flag;
 pub use guest::{fetch_guest, measure_guest, GuestSource, MAX_GUEST_BYTES};
@@ -89,4 +91,4 @@ pub use serve::{
 };
 pub use state::State;
 pub use tenant::Arrival;
-pub use zfs::{Disk, Zfs};
+pub use zfs::{AttachError, Disk, Release, Zfs};

@@ -21,7 +21,7 @@ cargo test --workspace --lib
 cargo test -p enclave-runtime --bin enclave-runtime
 
 # Integration suites run only where they are named, and this one ran nowhere
-# before. It is the boot machine — genesis, resume, upgrades and the refusals —
+# before. It is the boot machine — a release's key, its restarts, a new release —
 # over the in-memory backend, so it needs no guest built.
 say "boot machine"
-cargo test -p enclave-runtime --test boot_origin
+cargo test -p enclave-runtime --test boot_version

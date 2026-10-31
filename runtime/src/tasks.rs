@@ -16,7 +16,7 @@ use wasmtime_wasi::HostWallClock;
 
 use crate::clock::WallClockAdapter;
 use crate::state::State;
-use crate::zfs::Zfs;
+use crate::zfs::{TenantLoader, Zfs};
 
 const MAX_PAYLOAD: usize = 64 * 1024;
 const MAX_RECORD: usize = 1024 * 1024;
@@ -109,6 +109,8 @@ struct Records {
     due: BTreeSet<(u64, String)>,
     active: BTreeSet<String>,
     last_tenant: Option<[u8; 16]>,
+    /// Tenants whose records have been read from their pools.
+    loaded: BTreeSet<[u8; 16]>,
 }
 pub struct TaskQueue {
     zfs: Arc<Zfs>,
@@ -117,6 +119,13 @@ pub struct TaskQueue {
     records: Mutex<Records>,
     changed: Notify,
 }
+#[async_trait::async_trait]
+impl TenantLoader for TaskQueue {
+    async fn load_tenant(&self, tenant: [u8; 16]) -> Result<bool> {
+        self.load(tenant).await
+    }
+}
+
 impl TaskQueue {
     pub async fn open(
         zfs: Arc<Zfs>,
@@ -131,72 +140,82 @@ impl TaskQueue {
             "task limits must be positive"
         );
         let queue = Arc::new(Self {
-            zfs,
+            zfs: zfs.clone(),
             clock,
             limits,
             records: Mutex::new(Records::default()),
             changed: Notify::new(),
         });
-        // Each tenant's tasks are on its own pool. Scan only the tenants the
-        // catalog flags as having background work, so a restart need not import
-        // every pool to find the tasks due.
-        let mut records = queue.records.lock().await;
-        for tenant in queue.zfs.background_tenants().await? {
-            let dir = queue.zfs.tenant_runtime_dir(tenant, DIR).await?;
-            let mut entries = tokio::fs::read_dir(&dir).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                let name = entry
-                    .file_name()
-                    .into_string()
-                    .ok()
-                    .context("non-UTF-8 task record name")?;
-                if name.ends_with(".tmp") {
-                    tokio::fs::remove_file(entry.path()).await?;
-                    continue;
-                }
-                ensure!(
-                    records.tasks.len() < queue.limits.max_records,
-                    "task store exceeds configured quota"
-                );
-                let bytes = tokio::fs::read(entry.path()).await?;
-                ensure!(bytes.len() <= MAX_RECORD, "oversized task record");
-                let mut task: Task =
-                    serde_json::from_slice(&bytes).context("decoding task record")?;
-                ensure!(
-                    task.version == 1
-                        && valid_id(&task.id)
-                        && task.tenant == tenant
-                        && task.key() == name
-                        && task.payload.len() <= MAX_PAYLOAD
-                        && task.result.len() <= MAX_PAYLOAD
-                        && task.interval_ms.is_none_or(|i| i >= 1000),
-                    "invalid task record"
-                );
-                // Retry interrupted attempts with their original occurrence ID.
-                if task.status == Status::Running {
-                    task.status = if task.attempts >= MAX_ATTEMPTS {
-                        Status::Failed
-                    } else {
-                        Status::Pending
-                    };
-                    task.error = Some("enclave stopped during execution".into());
-                    queue.write(&task).await?;
-                    tracing::warn!(tenant = %hex::encode(task.tenant), task = %task.id,
-                        status = ?task.status, attempts = task.attempts,
-                        "background task attempt interrupted by a restart");
-                }
-                if task.status == Status::Pending {
-                    // Recovery jitter stops a fleet of overdue tasks firing together.
-                    let due = task
-                        .run_at
-                        .max(queue.now().saturating_add(offset(&task.key(), 1000)));
-                    records.due.insert((due, task.key()));
-                }
-                records.tasks.insert(task.key(), task);
+        // Each tenant's tasks are on its own pool, and are read when that pool
+        // is attached: now, for the tenants this release kept, and as each
+        // other tenant's owner signs in.
+        let loader: Arc<dyn TenantLoader> = queue.clone();
+        zfs.register_loader(Arc::downgrade(&loader)).await?;
+        Ok(queue)
+    }
+
+    /// Read one tenant's task records back from its pool. Idempotent.
+    async fn load(&self, tenant: [u8; 16]) -> Result<bool> {
+        let mut records = self.records.lock().await;
+        if !records.loaded.insert(tenant) {
+            return Ok(records.tasks.values().any(|t| t.tenant == tenant));
+        }
+        let dir = self.zfs.tenant_runtime_dir(tenant, DIR).await?;
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        let mut any = false;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry
+                .file_name()
+                .into_string()
+                .ok()
+                .context("non-UTF-8 task record name")?;
+            if name.ends_with(".tmp") {
+                tokio::fs::remove_file(entry.path()).await?;
+                continue;
             }
+            ensure!(
+                records.tasks.len() < self.limits.max_records,
+                "task store exceeds configured quota"
+            );
+            let bytes = tokio::fs::read(entry.path()).await?;
+            ensure!(bytes.len() <= MAX_RECORD, "oversized task record");
+            let mut task: Task = serde_json::from_slice(&bytes).context("decoding task record")?;
+            ensure!(
+                task.version == 1
+                    && valid_id(&task.id)
+                    && task.tenant == tenant
+                    && task.key() == name
+                    && task.payload.len() <= MAX_PAYLOAD
+                    && task.result.len() <= MAX_PAYLOAD
+                    && task.interval_ms.is_none_or(|i| i >= 1000),
+                "invalid task record"
+            );
+            // Retry interrupted attempts with their original occurrence ID.
+            if task.status == Status::Running {
+                task.status = if task.attempts >= MAX_ATTEMPTS {
+                    Status::Failed
+                } else {
+                    Status::Pending
+                };
+                task.error = Some("enclave stopped during execution".into());
+                self.write(&task).await?;
+                tracing::warn!(tenant = %hex::encode(task.tenant), task = %task.id,
+                    status = ?task.status, attempts = task.attempts,
+                    "background task attempt interrupted by a restart");
+            }
+            if task.status == Status::Pending {
+                // Recovery jitter stops a fleet of overdue tasks firing together.
+                let due = task
+                    .run_at
+                    .max(self.now().saturating_add(offset(&task.key(), 1000)));
+                records.due.insert((due, task.key()));
+            }
+            records.tasks.insert(task.key(), task);
+            any = true;
         }
         drop(records);
-        Ok(queue)
+        self.changed.notify_one();
+        Ok(any)
     }
     pub fn now(&self) -> u64 {
         self.clock.now().as_millis().min(u64::MAX as u128) as u64
@@ -225,10 +244,10 @@ impl TaskQueue {
             interval_ms.is_none_or(|i| i >= 1000),
             "interval must be at least 1000 ms"
         );
-        self.zfs.existing_tenant_dir(tenant).await?;
-        // The tenant's pool must be scanned on the next boot, so flag it before
-        // its first record is written: durable (on the control pool) ahead of
-        // the record, so a crash never leaves a task the scan would miss.
+        self.zfs.attached_dir(tenant)?;
+        // The tenant's pool must be re-attached on the next boot, so keep its
+        // key before its first record is written: durable ahead of the record,
+        // so a crash never leaves a task the boot would miss.
         self.zfs.mark_background(tenant).await?;
         let mut r = self.records.lock().await;
         let k = key(tenant, &id);
@@ -551,7 +570,6 @@ mod tests {
     use super::*;
     use crate::clock::{HostClock, TrustedClock};
     use crate::store::backend::memory::MemoryBackend;
-    use crate::store::crypto::{KeyMaterial, MasterSecret};
     use crate::zfs::{Disk, Zfs};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -947,22 +965,9 @@ mod tests {
     }
     #[tokio::test]
     async fn published_task_survives_reopening_the_pool() {
-        let backend = Arc::new(MemoryBackend::new());
-        let master = MasterSecret::from_bytes([7; 32]);
-        let keys = Arc::new(KeyMaterial::derive(&master, [8; 16]).unwrap());
+        let backend: Arc<dyn crate::store::backend::Backend> = Arc::new(MemoryBackend::new());
         let disk = Disk::scratch().unwrap();
-        let day = Duration::from_secs(86_400);
-        let fs = Zfs::create(
-            &disk,
-            backend.clone(),
-            keys.clone(),
-            &master,
-            "",
-            day,
-            Arc::new(HostClock),
-        )
-        .await
-        .unwrap();
+        let fs = Zfs::scratch_on(&disk, backend.clone()).await;
         fs.tenant_dir([1; 16]).await.unwrap();
         let clock = Arc::new(WallClockAdapter::new(Arc::new(HostClock)).unwrap());
         let q = TaskQueue::open(fs.clone(), clock.clone(), Default::default())
@@ -972,18 +977,9 @@ mod tests {
         let run_id = q.status([1; 16], "durable").await.unwrap().run_id();
         drop(q);
         drop(fs);
-        let fs = Zfs::open(
-            &disk,
-            backend,
-            keys,
-            &master,
-            "",
-            day,
-            None,
-            Arc::new(HostClock),
-        )
-        .await
-        .unwrap();
+        // The same release, restarted: it re-attaches the tenant it kept.
+        let fs = Zfs::scratch_on(&disk, backend).await;
+        assert_eq!(fs.resume_from_cache().await.unwrap(), 1);
         let reopened = TaskQueue::open(fs, clock, Default::default())
             .await
             .unwrap();

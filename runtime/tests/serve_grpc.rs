@@ -448,6 +448,15 @@ async fn a_guest_cannot_outrun_a_client_that_is_not_reading() {
 }
 
 /// A tenanted handle, so two clients can be told apart.
+/// Attach a tenant's pool, as its owner's sign-in does before any request.
+async fn signed_in(handle: &ServeHandle, tenant: &[u8; 16]) {
+    handle
+        .zfs()
+        .tenant_dir(*tenant)
+        .await
+        .expect("attaching the tenant");
+}
+
 async fn tenanted() -> ServeHandle {
     let handle = grpc_handle().await;
     let tenancy = enclave_runtime::Tenancy::new(enclave_runtime::PoolLimits::default());
@@ -468,7 +477,9 @@ async fn tenanted() -> ServeHandle {
 async fn an_open_stream_holds_its_own_tenant_and_no_other() {
     let handle = Arc::new(tenanted().await);
     let alice = [0xaa; 16];
+    signed_in(&handle, &alice).await;
     let bob = [0xbb; 16];
+    signed_in(&handle, &bob).await;
 
     let (req, tx) = open_request(SIGN);
     let response = handle
@@ -499,7 +510,7 @@ async fn an_open_stream_holds_its_own_tenant_and_no_other() {
     let alice_again = handle.clone();
     let waiting = tokio::spawn(async move {
         alice_again
-            .handle(Scheme::Http, blocked, Some(&[0xaa; 16]))
+            .handle(Scheme::Http, blocked, Some(&alice))
             .await
             .map(|_| ())
     });
@@ -543,6 +554,7 @@ async fn an_open_stream_holds_its_own_tenant_and_no_other() {
 async fn an_abandoned_stream_frees_its_tenant() {
     let handle = tenanted().await;
     let carol = [0xcc; 16];
+    signed_in(&handle, &carol).await;
 
     {
         let (req, tx) = open_request(SIGN);
@@ -693,6 +705,7 @@ async fn a_silent_stream_is_ended_at_its_deadline_and_frees_its_tenant() {
         .await
         .with_max_interaction(Duration::from_millis(400));
     let quiet = [0xd0; 16];
+    signed_in(&handle, &quiet).await;
 
     let (req, tx) = open_request(SIGN);
     let response = handle

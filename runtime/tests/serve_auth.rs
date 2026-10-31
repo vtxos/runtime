@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use enclave_runtime::{
-    AuthEndpoints, ChallengeStore, FilesystemCredentials, Gate, GuestEnvironment, HostClock,
+    AuthEndpoints, CatalogCredentials, ChallengeStore, Gate, GuestEnvironment, HostClock,
     PoolLimits, ServeConfig, SoftwareAuthenticator, Tenancy, TlsIdentity,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -154,7 +154,7 @@ async fn start_with_background(background: bool) -> Harness {
     // produces carry PCR16 because the guest it serves was measured into it.
     enclave_runtime::measure_guest(nsm.as_ref(), &bytes).expect("measuring the guest");
     let entropy: Arc<dyn nitro_nsm::Nsm> = nsm.clone();
-    let credentials = Arc::new(FilesystemCredentials::new(fs.clone()));
+    let credentials = Arc::new(CatalogCredentials::new(fs.catalog().clone()));
     let gate = Arc::new(Gate::new(
         enclave_runtime::build_relying_party(RP_ID, ORIGIN, &[]).expect("relying party"),
         ChallengeStore::new(std::time::Duration::from_secs(60), 256),
@@ -490,6 +490,7 @@ async fn token_for(
         serde_json::json!({
             "challenge_id": options["challenge_id"].as_str().expect("a challenge id"),
             "assertion": b64.encode(assertion.to_string()),
+            "tenant_key": b64.encode(auth.tenant_key().expose_secret()),
         }),
     )
     .await;

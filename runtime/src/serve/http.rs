@@ -237,6 +237,11 @@ impl Tenancy {
 }
 
 impl ServeHandle {
+    /// The storage the guest's tenants live on.
+    pub fn zfs(&self) -> &Arc<crate::zfs::Zfs> {
+        self.guest.zfs()
+    }
+
     /// An `Engine` configured for the watchdog, plus the ticker that drives it.
     ///
     /// Epoch interruption is what makes a spinning guest interruptible at all:
@@ -638,13 +643,9 @@ impl ServeHandle {
         // Owned, so it can move into the task below and outlive this function.
         let guard = checkout.slot().lock().clone().lock_owned().await;
 
-        // Under the lock, so two simultaneous first requests from one client
-        // resolve to one directory, the second waiting here rather than racing
-        // the first into a second `zfs create`.
-        let (dir, arrival) = self.guest.zfs().tenant_dir(tenant_id).await?;
-        if arrival == crate::tenant::Arrival::New {
-            tracing::info!(tenant = %hex::encode(tenant_id), "tenant directory created");
-        }
+        // Attached when the token was granted, with the key its owner sent:
+        // a release reaches no tenant's data any other way.
+        let dir = self.guest.zfs().attached_dir(tenant_id)?;
 
         let mut instance = self.instantiate(&dir).await?;
         instance.store.data_mut().streams =
@@ -736,7 +737,7 @@ impl ServeHandle {
     /// A background or message run's state: the tenant's dataset as `/`. One
     /// that has gone is not brought back by work running in its name.
     async fn tenant_state(&self, tenant: [u8; 16]) -> Result<State> {
-        let dir = self.guest.zfs().existing_tenant_dir(tenant).await?;
+        let dir = self.guest.zfs().attached_dir(tenant)?;
         self.guest.new_state(Some(&dir))
     }
 
@@ -814,9 +815,10 @@ impl ServeHandle {
         let head = req.method() == hyper::Method::HEAD;
         let anonymous = self.anonymous.clone().lock_owned().await;
 
-        // One shared directory, never the pool's root: that would hand an
-        // unauthenticated guest `/runtime` and every tenant.
-        let (dir, _) = self.guest.zfs().tenant_dir(ANONYMOUS).await?;
+        // One shared pool, keyed by this release, and only its `data`
+        // dataset: never anything that would hand an unauthenticated guest a
+        // tenant's records.
+        let dir = self.guest.zfs().anonymous_dir().await?;
         let mut store = Store::new(self.pre.engine(), self.guest.new_state(Some(&dir))?);
         store.data_mut().telemetry = Some(
             self.telemetry
@@ -1013,9 +1015,9 @@ fn resumed<S>(stream: &tokio_rustls::server::TlsStream<S>, peer: SocketAddr) -> 
     false
 }
 
-/// The directory callers without a gate share. Tenant ids are drawn from the
-/// NSM, so none is ever all zeroes.
-const ANONYMOUS: [u8; 16] = [0; 16];
+/// The tenant callers without a gate share. A tenant id is a hash of a
+/// credential id, so none is ever all zeroes.
+use crate::catalog::ANONYMOUS;
 
 /// Hold a response's end until what produced it is anchored, so no client can
 /// see it finish before the writes it may describe would survive the host.

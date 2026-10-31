@@ -155,6 +155,11 @@ struct Cli {
     #[arg(long)]
     unsigned_emulator: bool,
 
+    /// Send a tenant key that is not this passkey's, to show the enclave
+    /// refuses to open the tenant's pool with it.
+    #[arg(long)]
+    wrong_tenant_key: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -377,9 +382,17 @@ fn signed(
                 .as_str()
                 .context("no challenge id")?,
             "assertion": b64().encode(assertion.to_string()),
+            // What opens this tenant's pool. Sent only here, on a connection
+            // whose PCR0 and PCR16 were just checked, and never the PRF
+            // output it is derived from.
+            "tenant_key": b64().encode(if cli.wrong_tenant_key {
+                [0x42; 32]
+            } else {
+                *a.tenant_key().expose_secret()
+            }),
         }),
-        // Checked after the handshake and *before* the assertion is written, so
-        // a changed far end means the credential is never sent.
+        // Checked after the handshake and *before* the assertion and the key
+        // are written, so a changed far end is sent neither.
         Some(&opened_on.certificate),
     )?;
     let token = granted["token"]
