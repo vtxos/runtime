@@ -1,10 +1,16 @@
-//! Where the guest's random bytes come from.
+//! Where random bytes come from: the guest's, and the runtime's own.
 //!
 //! `wasi:random/random` is what a guest builds keys, nonces and session
 //! identifiers from. Inside an enclave those bytes should come from the Nitro
 //! Security Module — the same root of trust that signs attestation documents —
 //! rather than from a kernel pool that *is* NSM-seeded but says nothing about
 //! it and fails silently if it isn't.
+//!
+//! The runtime's own draws — the wallet key's nonces, sealing nonces, pool,
+//! task and trace ids — come from the same source, through [`fill`] and
+//! [`Rng`], once boot has [`install`]ed it. What libraries draw
+//! inside themselves takes no source to hand them, and stays on the kernel:
+//! aws-lc's key generation and TLS handshakes, and webauthn-rs's challenges.
 //!
 //! Bytes come **straight from the device on every call**. There is no DRBG in
 //! between, so the trust argument is "the NSM produced these" with nothing
@@ -24,8 +30,9 @@
 //! can ever detect it. Stopping is the only safe answer.
 
 use std::fmt;
+use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 
@@ -136,6 +143,71 @@ pub fn open_entropy(source: RandomSource, device: &Path) -> Result<Arc<dyn Nsm>>
     }
 }
 
+/// What the runtime's own random bytes come from, once boot installs it.
+static SOURCE: OnceLock<Arc<dyn Nsm>> = OnceLock::new();
+
+/// Make `source` what the runtime's own random bytes come from: once, at boot,
+/// before anything draws.
+pub fn install(source: Arc<dyn Nsm>) -> Result<()> {
+    SOURCE
+        .set(source)
+        .map_err(|_| anyhow::anyhow!("the runtime's entropy source is already installed"))
+}
+
+/// Random bytes for the runtime, straight from the installed source. An error
+/// means the source failed and `buf` holds nothing to use.
+pub fn try_fill(buf: &mut [u8]) -> Result<()> {
+    source().get_random(buf)
+}
+
+/// [`try_fill`], for bytes that must not be predictable: a failed source stops
+/// the process, for the reason the module docs give.
+pub fn fill(buf: &mut [u8]) {
+    try_fill(buf).expect("entropy source failed; refusing to use predictable bytes");
+}
+
+#[cfg(not(any(test, feature = "testing")))]
+fn source() -> &'static dyn Nsm {
+    SOURCE
+        .get()
+        .expect("random bytes drawn before boot installed the entropy source")
+        .as_ref()
+}
+
+/// Tests have no device: the kernel, unless a test installed a source first.
+#[cfg(any(test, feature = "testing"))]
+fn source() -> &'static dyn Nsm {
+    SOURCE.get_or_init(|| Arc::new(HostEntropy)).as_ref()
+}
+
+/// [`fill`] as a `rand_core` generator, for the libraries that take one.
+pub struct Rng;
+
+impl rand_core::RngCore for Rng {
+    fn next_u32(&mut self) -> u32 {
+        rand_core::impls::next_u32_via_fill(self)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        rand_core::impls::next_u64_via_fill(self)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        fill(dest)
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        try_fill(dest).map_err(|e| {
+            tracing::error!(error = format!("{e:#}"), "entropy source failed");
+            rand_core::Error::from(
+                NonZeroU32::new(rand_core::Error::CUSTOM_START).expect("CUSTOM_START is nonzero"),
+            )
+        })
+    }
+}
+
+impl rand_core::CryptoRng for Rng {}
+
 /// Serves `wasi:random/random` from an entropy source.
 pub struct GuestRandom {
     source: Arc<dyn Nsm>,
@@ -190,7 +262,7 @@ impl cap_rand::RngCore for GuestRandom {
             Err(e) => {
                 tracing::error!(error = format!("{e:#}"), "entropy source failed");
                 Err(cap_rand::Error::from(
-                    std::num::NonZeroU32::new(cap_rand::Error::CUSTOM_START)
+                    NonZeroU32::new(cap_rand::Error::CUSTOM_START)
                         .expect("CUSTOM_START is nonzero"),
                 ))
             }

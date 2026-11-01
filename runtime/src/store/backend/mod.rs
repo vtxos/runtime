@@ -2,7 +2,7 @@
 //!
 //! This trait abstracts over S3, S3-compatible (MinIO, R2), and an in-memory
 //! test fake. Methods correspond closely to S3 wire operations. What the
-//! runtime builds on them is the anchor chain ([`crate::zfs`]) and the boot
+//! runtime builds on them is the anchor chain ([`crate::store::zfs`]) and the boot
 //! records ([`crate::boot`]): conditional creates under Object Lock, and reads
 //! of the retained version beneath any delete marker.
 //!

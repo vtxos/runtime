@@ -1,10 +1,22 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/ark",
+    "crates/enclave-client",
     "crates/nitro-attestation",
     "crates/nitro-nsm",
+    "crates/threshold",
+    "guests/cosigner",
     "runtime",
 ]
+# The cosigner's component is a member, not a workspace of its own, so the
+# path dependencies it builds with (crates/ark, crates/threshold) sit inside
+# its workspace. Cargo hashes a path dependency inside the workspace by its
+# relative path and one outside it by its absolute path, and that hash names
+# every symbol: two checkouts in two directories would build two cosigner.wasm.
+# The fake host is its own workspace (guests/fake-host): wasmtime must never be
+# in what the wasm build resolves.
+exclude = ["guests/fake-host"]
 
 [workspace.package]
 version = "0.1.0"
@@ -43,4 +55,13 @@ wasmtime-wasi = "=44.0.0"
 
 [profile.release]
 lto = "thin"
+codegen-units = 1
+
+# The cosigner component, for size: what the enclave loads and PCR16 measures.
+# Built with `--profile wasm-release` so the runtime's own release profile is
+# left as it was.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = true
 codegen-units = 1

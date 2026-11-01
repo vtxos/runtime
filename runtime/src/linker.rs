@@ -2,7 +2,7 @@
 //! interfaces.
 //!
 //! `wasi:filesystem` is `wasmtime-wasi`'s, over the one directory a guest is
-//! preopened — its tenant's dataset on the pool, see [`crate::zfs`]. There used
+//! preopened — its tenant's dataset on the pool, see [`crate::store::zfs`]. There used
 //! to be a filesystem of our own here, and with it a hand-copied list of every
 //! other WASI interface that had to be diffed against upstream on each bump.
 //! Both are gone: the upstream entry point registers the whole set.
@@ -17,9 +17,9 @@ pub fn build_linker(engine: &wasmtime::Engine) -> Result<Linker<State>> {
     let mut linker: Linker<State> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     crate::tasks::add_to_linker(&mut linker)?;
-    crate::stream::add_to_linker(&mut linker)?;
     crate::notify::add_to_linker(&mut linker)?;
     crate::telemetry::add_to_linker(&mut linker)?;
+    crate::signer::add_to_linker(&mut linker)?;
     Ok(linker)
 }
 

@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use enclave_runtime::{
-    AuthEndpoints, CatalogCredentials, ChallengeStore, Gate, GuestEnvironment, HostClock,
-    PoolLimits, ServeConfig, SoftwareAuthenticator, Tenancy, TlsIdentity,
+    AuthEndpoints, ChallengeStore, Gate, GuestEnvironment, HostClock, PoolLimits,
+    RegistryCredentials, ServeConfig, SoftwareAuthenticator, Tenancy, TlsIdentity,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -154,7 +154,7 @@ async fn start_with_background(background: bool) -> Harness {
     // produces carry PCR16 because the guest it serves was measured into it.
     enclave_runtime::measure_guest(nsm.as_ref(), &bytes).expect("measuring the guest");
     let entropy: Arc<dyn nitro_nsm::Nsm> = nsm.clone();
-    let credentials = Arc::new(CatalogCredentials::new(fs.catalog().clone()));
+    let credentials = Arc::new(RegistryCredentials::new(fs.registry().clone()));
     let gate = Arc::new(Gate::new(
         enclave_runtime::build_relying_party(RP_ID, ORIGIN, &[]).expect("relying party"),
         ChallengeStore::new(std::time::Duration::from_secs(60), 256),
@@ -169,13 +169,15 @@ async fn start_with_background(background: bool) -> Harness {
         credentials,
         fs.clone(),
         entropy.clone(),
+        None,
     ));
 
     // Detached deliberately: the collector runs for as long as this
     // environment can send, which is what a test wants. Production drains it
     // explicitly instead.
-    let (logs, _collector) =
-        enclave_runtime::guest_io::start(std::sync::Arc::new(enclave_runtime::TracingLogSink));
+    let (logs, _collector) = enclave_runtime::telemetry::logs::start(std::sync::Arc::new(
+        enclave_runtime::TracingLogSink,
+    ));
     let guest = GuestEnvironment::new(fs, Arc::new(HostClock), entropy, &[], &[], logs)
         .expect("guest environment");
     let tls = TlsIdentity::self_signed(&[RP_ID.to_string()]).expect("tls identity");

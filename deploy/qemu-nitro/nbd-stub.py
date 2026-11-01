@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Serve a disk image to the enclave over vsock, as the parent's EBS volume.
 
-The ZFS storage spike (runtime/src/zfs.rs) keeps tenant data on a block device
+The ZFS storage spike (runtime/src/store/zfs.rs) keeps tenant data on a block device
 the parent serves with NBD. On Nitro that is `nbdkit --vsock` over an attached
 EBS volume. Here it is this script over a sparse file, for the same reason the
 heartbeat is a script: nbdkit is not on a developer's machine, and the store's

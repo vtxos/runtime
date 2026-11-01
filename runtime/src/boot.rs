@@ -4,12 +4,12 @@
 //! KMS key policy names. Each release has a master secret of its own, minted by
 //! its first boot and released by KMS to that pair alone, and with it keeps two
 //! things: its TLS certificate, and the keys of the tenants whose background
-//! work it runs ([`crate::catalog`]). Neither is any other release's business.
+//! work it runs ([`crate::store::registry`]). Neither is any other release's business.
 //!
 //! What every release shares is the tenants' data, and that is not keyed by any
 //! release. Each tenant's pool opens with the key its owner's app sends with an
 //! assertion — sent only to a release whose PCR0 and PCR16 the app approves —
-//! and is pinned to that key by its own anchor 0 ([`crate::zfs`]). So a new
+//! and is pinned to that key by its own anchor 0 ([`crate::store::zfs`]). So a new
 //! release reads every tenant's data exactly as the last one did, from the
 //! moment that tenant's owner signs in to it, and **nothing is migrated**.
 //!
@@ -36,9 +36,9 @@ use anyhow::{bail, Context, Result};
 use nitro_nsm::{Nsm, PCR_GUEST, PCR_ZERO};
 
 use crate::keys::{MasterKeySource, SealedKey};
-use crate::mount::MountConfig;
 use crate::store::crypto::VersionKeys;
-use crate::zfs::{Disk, Release, ReleaseContext, Zfs};
+use crate::store::mount::MountConfig;
+use crate::store::zfs::{Disk, Release, ReleaseContext, Zfs};
 
 /// Which boot of this release this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

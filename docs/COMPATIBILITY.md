@@ -49,7 +49,7 @@ Guest data does not carry across automatically: a tenant's v1 files lived in one
 The runtime's in-process suites run guests over a plain directory standing in for the pool (`zfs::Disk::Directory`):
 - tenant isolation, including a hostile guest's escape attempts;
 - restarts;
-- tasks, streams and devices;
+- tasks and devices;
 - streaming responses over HTTP/1.1, HTTP/2 and gRPC.
 
 ZFS itself (the anchor, crash recovery, rollback and fork refusal) is exercised in the QEMU emulator by [`run-zfs-spike.sh`](../deploy/qemu-nitro/run-zfs-spike.sh) and the end-to-end suite.

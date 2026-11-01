@@ -51,14 +51,6 @@
 //! sent, and treat a *missing* header as a failure. Without the last of those,
 //! an attacker who strips the header downgrades every client that does not
 //! check.
-//!
-//! # And the other way
-//!
-//! The same device also signs every request of a connection the runtime holds
-//! for a guest ([`crate::stream`]), under the same header and the same limit —
-//! bound to that request's bytes rather than to a connection, because there the
-//! enclave is the client. [`ResponseAttestor::stream_document`] makes those;
-//! `docs/STREAMING.md` says what a service checks.
 
 use std::sync::Arc;
 
@@ -245,21 +237,7 @@ impl ResponseAttestor {
             .await
     }
 
-    /// A document for one outbound stream request, binding `user_data` alone —
-    /// [`crate::stream::stream_user_data`] says what that is.
-    ///
-    /// No nonce, because nobody is there to choose one: the service first hears
-    /// of the request when it arrives, and asking it for a nonce would be a
-    /// round trip per message. Its freshness is the document's own timestamp,
-    /// which the service bounds. No certificate either — the enclave is the
-    /// client here, and the guest is PCR16's to name. Smaller than what
-    /// [`Self::verify_fits`] sized at boot, so that check covers this too.
-    pub async fn stream_document(&self, user_data: [u8; 32]) -> Result<HeaderValue, AttestError> {
-        self.sign(AttestationRequest::with_user_data(user_data.to_vec()))
-            .await
-    }
-
-    /// One signature from the device, under the limit both callers share.
+    /// One signature from the device, under the limit every caller shares.
     ///
     /// The permit is taken **before** the blocking call, not inside it: tokio's
     /// blocking pool queues without bound, so acquiring inside would convert a

@@ -2,7 +2,7 @@
 //!
 //! A registration token is a capability: whoever holds one can wake that device
 //! from anywhere, through the Firebase project it was issued for. So tokens live
-//! in `runtime/devices/` on the tenant's own pool, beside its tasks and streams
+//! in `runtime/devices/` on the tenant's own pool, beside its tasks
 //! and outside the `data` dataset that is the guest's only preopen. A guest
 //! enrols one and asks for a count; it never reads one back.
 //!
@@ -34,7 +34,7 @@ use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::zfs::{TenantLoader, Zfs};
+use crate::store::zfs::{TenantLoader, Zfs};
 
 /// Where a tenant's devices live on its pool.
 pub const DEVICES_DIR: &str = "devices";
@@ -374,7 +374,7 @@ mod tests {
     use super::*;
     use crate::store::backend::memory::MemoryBackend;
     use crate::store::backend::Backend;
-    use crate::zfs::{Disk, Zfs};
+    use crate::store::zfs::{Disk, Zfs};
 
     const ALICE: [u8; 16] = [1; 16];
     const BOB: [u8; 16] = [2; 16];

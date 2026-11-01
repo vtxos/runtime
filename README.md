@@ -4,9 +4,9 @@
 
 Write the guest with plain `std`. `SystemTime::now()` reads the Nitro PTP hardware clock, `getrandom` reads the Nitro Security Module, `std::fs` writes to a store that is encrypted before anything reaches S3, and requests arrive over TLS terminated inside the enclave. The guest never touches a device path, a key or a certificate.
 
-WASI has no way to reach a person or a service between requests, so the runtime adds [three WIT capabilities](#capabilities-beyond-wasi): **`enclave:notify`** wakes the owner's phone without revealing why, **`enclave:streams`** holds a connection a service can use to speak first and attests every request the runtime sends over it, and **`enclave:tasks`** runs durable work on the enclave's clock while no client is connected.
+WASI has no way to reach a person between requests, so the runtime adds [WIT capabilities](#capabilities-beyond-wasi): **`enclave:notify`** wakes the owner's phone without revealing why, and **`enclave:tasks`** runs durable work on the enclave's clock while no client is connected.
 
-Every party that relies on the enclave checks the same two measurements: PCR0 for the runtime image and its configuration, PCR16 for the guest. KMS checks them before releasing a release's own key, a native app before sending a passkey-approved request and the key that opens its tenant's data, and a service on every message the runtime sends it.
+Every party that relies on the enclave checks the same two measurements: PCR0 for the runtime image and its configuration, PCR16 for the guest. KMS checks them before releasing a release's own key, and a native app before sending a passkey-approved request and the key that opens its tenant's data.
 
 > **Pre-1.0, under active correctness review.** The runtime, its capabilities, the KMS recipient flow and the deployment tooling are implemented and tested, including end to end in an emulated enclave. Validation on real Nitro hardware and against live KMS and AWS End User Messaging Push is outstanding, as is storage garbage collection. This is not a production-readiness claim.
 
@@ -74,28 +74,28 @@ A read that fails mid-run returns the last good reading and logs a warning. A fe
 | Guest `wasi:random/random` | Every byte, straight from the device (256 bytes per NSM request) |
 | Guest `wasi:random/insecure-seed` | A fresh seed per instance, so no two instances share a hash seed |
 | Authentication | Registration and challenge IDs, and the 32-byte single-use tokens that admit a request |
+| The runtime's own | The wallet key's nonces, sealing nonces, WebAuthn user handles, pool, task and trace IDs |
 
-If the device fails, `wasi:random` stops the process rather than return predictable bytes. The clock can serve a stale reading because a stale timestamp is still a real one and a caller can notice. Predictable bytes look random to the guest, and a key built from them can never be detected downstream. A production build always reads the NSM. The TLS key comes from the kernel pool through `aws-lc-rs`. Inside an enclave the NSM is that pool's only seed, and requiring `/dev/nsm` at boot proves the runtime is in an enclave.
+If the device fails, `wasi:random` stops the process rather than return predictable bytes. The clock can serve a stale reading because a stale timestamp is still a real one and a caller can notice. Predictable bytes look random to the guest, and a key built from them can never be detected downstream. A production build always reads the NSM. What libraries draw inside themselves comes from the kernel pool: TLS keys and handshakes and the KMS recipient key through `aws-lc-rs`, and WebAuthn challenges through `webauthn-rs`. Inside an enclave the NSM is that pool's only seed, and requiring `/dev/nsm` at boot proves the runtime is in an enclave.
 
 `enclave-runtime --self-check` prints the chosen clock, its skew against `CLOCK_REALTIME` and a sanity check of the entropy source, then exits without touching storage.
 
 ### One identity
 
-Before asking for any key, the runtime uses the same NSM to extend PCR16 with the guest's hash and lock the register. The same device then signs every attestation document. Three independent parties check the resulting pair:
+Before asking for any key, the runtime uses the same NSM to extend PCR16 with the guest's hash and lock the register. The same device then signs every attestation document. Two independent parties check the resulting pair:
 
 ```mermaid
 flowchart TB
     M["PCR0: runtime image and measured configuration<br/>PCR16: the guest component"]
     M --> K["KMS<br/>releases this release's key to this pair<br/>(enforced by the key policy)"]
     M --> C["Native app<br/>checks /auth/* before sending<br/>a passkey-approved token"]
-    M --> S["Counterparty service<br/>checks every request the runtime<br/>sends on a held connection"]
 ```
 
 PCR0 covers configuration as well as code: the push application, the WebAuthn origins and the bucket identities. An app that pins PCR0 has therefore also pinned which push application can wake its devices. A guest's own settings are not image configuration: they travel in the guest file ([`guest-env.py`](deploy/qemu-nitro/guest-env.py) writes them before it is uploaded), so PCR16 measures them with the guest's code and one image serves any deployment. Where a guest can send data is not configuration: a guest reaches the public internet and nothing else, by address, so what it sends is its own code's decision — and that code is PCR16.
 
 ## Capabilities beyond WASI
 
-WASI has no interface for waking a person, letting a service speak first, or running something at 3 a.m. The runtime adds three small WIT packages for them. **No function takes a tenant ID.** The runtime binds each call to the tenant of the invocation making it, so a guest cannot reach another tenant's devices, connections or tasks.
+WASI has no interface for waking a person or running something at 3 a.m. The runtime adds small WIT packages for them. **No function takes a tenant ID.** The runtime binds each call to the tenant of the invocation making it, so a guest cannot reach another tenant's devices or tasks.
 
 A guest composes the worlds it needs. From the [example guest](examples/guest-http/wit/app.wit):
 
@@ -106,7 +106,7 @@ world app {
 }
 ```
 
-Held connections compose the same way, with `include enclave:streams/streaming@0.1.0`. Guests vendor the canonical definitions from [`wit/`](wit/), and `scripts/wit-drift.sh` fails if a copy drifts.
+Guests vendor the canonical definitions from [`wit/`](wit/), and `scripts/wit-drift.sh` fails if a copy drifts.
 
 ### `enclave:notify` — wake a phone without saying why
 
@@ -137,35 +137,6 @@ How notify draws on the rest of the runtime:
 
 A parent that borrows the role can send wake signals through that one application and nothing more. A wake carries no data, and the app's response to any wake is to fetch over the attested channel. Set `ENCLAVE_PUSH_APP_ID` (measured, not secret). See [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md).
 
-### `enclave:streams` — let a service talk first
-
-```wit
-stream-open:   func(id: string, origin: string) -> result<_, string>;   // durable; interactive only
-stream-close:  func(id: string) -> result<_, string>;                   // interactive only
-stream-send:   func(id: string, payload: list<u8>) -> result<_, string>;
-stream-status: func(id: string) -> result<string, string>;
-
-export on-message: func(id: string, message-id: string, payload: list<u8>) -> result<list<u8>, string>;
-```
-
-A guest instance lives for one invocation and cannot keep a socket open, so the runtime holds the connection: a server-sent-events `GET` for what arrives and one `POST` per message sent. After a network failure or a restart it reconnects, backing off from 1 s to 5 min, without involving the guest. Each incoming event runs `on-message` in a fresh instance scoped to the tenant, and a non-empty return value is posted back as the reply.
-
-```text
-GET  <origin>/escrow/stream?id=<tenant-hex>-<id>    held open; each event → on-message
-POST <origin>/escrow/send?id=<tenant-hex>-<id>      one message per request
-```
-
-**Every request the runtime makes carries an NSM attestation document** in `x-enclave-attestation`, bound to that request's exact bytes:
-
-```text
-user_data = SHA-256("enclave-runtime/stream/v1" 0x00 ‖ kind ‖ 0x00 ‖ wire_id ‖ 0x00 ‖ SHA-256(body))
-            kind = "open" for the GET, "send" for each POST
-```
-
-The service verifies the chain, pins PCR0 and PCR16, rejects documents more than five minutes old, and recomputes `user_data` from the URL's `id` and the body it received. Knowing a wire ID is not enough to pass as this enclave, whether by forging a message or by standing up a cosigner of one's own.
-
-The origin is checked like a guest's own request on every reconnect and send — the public internet only — so holding a connection reaches nothing the guest could not reach itself. Limits: 8 connections per tenant, 256 KiB per message. Delivery is at least once in both directions, so deduplicate by `message-id`. See [docs/STREAMING.md](docs/STREAMING.md).
-
 ### `enclave:tasks` — work while nobody is connected
 
 ```wit
@@ -179,25 +150,37 @@ export run-task: func(task-id: string, payload: list<u8>) -> result<list<u8>, st
 
 An approved request can schedule work for later, optionally recurring at intervals of one second or more. `run-at` is Unix milliseconds on the PTP clock. Task records live in the encrypted store and survive restarts. Each run gets a fresh instance, holds the tenant's lock and has a deadline. Failed runs are retried a bounded number of times, and results are kept for `status`. Execution is at least once, so deduplicate by the run ID (`<id>:<generation>:<occurrence>`). Payloads and results are capped at 64 KiB. They run when the guest exports `run-task`; see [docs/BACKGROUND_TASKS.md](docs/BACKGROUND_TASKS.md).
 
+### `enclave:signer` — sign with a wallet key the guest never holds
+
+```wit
+wallet-key:  func() -> result<key, string>;                        // public parts only
+dealt-share: func(identifier: list<u8>) -> result<list<u8>, string>;
+resource signing {
+    begin:  static func(messages: list<list<u8>>) -> result<tuple<signing, list<commitment>>, string>;
+    finish: func(rounds: list<wallet-round>) -> result<list<list<u8>>, string>;
+}
+```
+
+Each tenant's wallet key is a 2-of-2 FROST key between the owner's app and the cosigner, made by a DKG that rides the passkey's registration, whole: `register/options` carries the cosigner's opening and `register/verify` completes it ([client integration](docs/CLIENT_INTEGRATION.md#the-wallet-key)). The runtime keeps the cosigner's share on the tenant's pool and signs with it here, one round trip per batch; nothing returns it. The cosigner's DKG polynomial is derived from an operator master and the registration's user handle, so the same passkey always rebuilds the same key, and the master alone signs nothing: the cosigner's share also needs the wallet's `f_w(id_c)`, which only the wallet deals. The master is an SSM SecureString the operator writes once the enclave is up (`ENCLAVE_OPERATOR_MASTER_PARAMETER`), read on the first registration.
+
 ### Who may call what
 
 The runtime marks each invocation as either interactive (a passkey-approved request) or background, and allows different calls from each:
 
-| Call | Approved request | `run-task` | `on-message` |
-|---|:-:|:-:|:-:|
-| `tasks.enqueue`, `cancel`, `forget` | ✓ | | |
-| `tasks.status` | ✓ | ✓ | |
-| `notify.register-device`, `forget-device` | ✓ | | |
-| `notify.wake`, `devices` | ✓ | ✓ | ✓ |
-| `streams.stream-open`, `stream-close` | ✓ | | |
-| `streams.stream-send`, `stream-status` | ✓ | | ✓ |
-| `wasi:http` to the public internet | ✓ | ✓ | ✓ |
+| Call | Approved request | `run-task` |
+|---|:-:|:-:|
+| `tasks.enqueue`, `cancel`, `forget` | ✓ | |
+| `tasks.status` | ✓ | ✓ |
+| `notify.register-device`, `forget-device` | ✓ | |
+| `notify.wake`, `devices` | ✓ | ✓ |
+| `cosign.*` | ✓ | |
+| `wasi:http` to the public internet | ✓ | ✓ |
 
-Background work cannot grant itself more work, connections or devices. It can only use what an approved request already set up.
+Background work cannot grant itself more work or devices. It can only use what an approved request already set up.
 
 ### Instances are disposable
 
-Every request, `run-task` and `on-message` call gets a fresh instance, dropped when the call ends, so nothing in memory survives from one call to the next. Keep durable state in files and sync or close them before returning, because files an instance left open are released unflushed when it is dropped. A tenant's requests, tasks and message callbacks run one at a time; different tenants run concurrently.
+Every request and `run-task` call gets a fresh instance, dropped when the call ends, so nothing in memory survives from one call to the next. Keep durable state in files and sync or close them before returning, because files an instance left open are released unflushed when it is dropped. A tenant's requests and tasks run one at a time; different tenants run concurrently.
 
 ### All together: a background job wakes its owner
 
@@ -234,7 +217,7 @@ From the repository root, with Rust and its native build prerequisites (a C tool
 cargo test --workspace --lib
 ```
 
-This needs neither Docker nor an AWS account. It covers the clock and entropy adapters, tasks, streams, notifications, authentication, attestation verification and storage. Tests marked ignored need extra fixtures and do not run by default.
+This needs neither Docker nor an AWS account. It covers the clock and entropy adapters, tasks, notifications, authentication, attestation verification and storage. Tests marked ignored need extra fixtures and do not run by default.
 
 ### 2. Start the development enclave
 
@@ -358,7 +341,7 @@ The approval binds method, path and query, not the body or each message of a str
 
 ## Storage
 
-Each tenant has its own ZFS pool, on its own region of a disk the parent serves over vsock and cannot read: dm-crypt sits underneath, under a key derived from the tenant's key, which only its owner's app holds. The guest sees the pool's `data` dataset as `/`, through `wasmtime-wasi`'s filesystem, and nothing above it is reachable. The tenant's runtime records (tasks, streams, devices) are on the same pool, outside `data`. Passkeys and which region is whose are in the roots bucket, written once. SQLite runs unmodified in rollback-journal mode ([`guest-sqlite`](examples/guest-sqlite/)).
+Each tenant has its own ZFS pool, on its own region of a disk the parent serves over vsock and cannot read: dm-crypt sits underneath, under a key derived from the tenant's key, which only its owner's app holds. The guest sees the pool's `data` dataset as `/`, through `wasmtime-wasi`'s filesystem, and nothing above it is reachable. The tenant's runtime records (tasks, devices) are on the same pool, outside `data`. Passkeys and which region is whose are in the roots bucket, written once. SQLite runs unmodified in rollback-journal mode ([`guest-sqlite`](examples/guest-sqlite/)).
 
 Rollback is what ZFS alone cannot stop, since the parent holds the disk. So before anything is acknowledged — a response's end, a registration, a task's outcome — the pool is synced and its state anchored. A random value written into the pool is signed, chained and published to an Object-Locked bucket. Attaching a pool imports it as of the newest anchor and refuses one that does not hold its value. The anchor, the boot checks, the parent side and the limits are in [docs/STORAGE.md](docs/STORAGE.md); WASI differences are in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
@@ -371,8 +354,9 @@ Every setting is baked into the image and measured into PCR0, so changing one me
 | `ENCLAVE_ROOTS_BUCKET`, `ENCLAVE_BUCKET_PREFIX` | The Object-Locked bucket, and a key prefix so deployments can share one |
 | `ENCLAVE_ID` | The filesystem id, which salts every key |
 | `ENCLAVE_KMS_KEY_ALIAS`, `ENCLAVE_MASTER_KEY_PARAMETER` | Where each release finds its KMS key and its sealed master secret: `<alias>/<release id>` and `<parameter>/<release id>`, the id being `sha256(pcr0 ‖ pcr16)` |
+| `ENCLAVE_OPERATOR_MASTER_PARAMETER` | The SSM SecureString holding the operator master each wallet key's cosigner half is derived from; written by the operator after boot. The instance role needs `ssm:GetParameter` on it and `kms:Decrypt` on its key |
 | `ENCLAVE_RELEASE` | This runtime release's number, written into every anchor; a pool last written by a higher one is refused |
-| `ENCLAVE_ROOT_RETENTION_SECS` | How long anchors and catalog records are locked (ten years by default) |
+| `ENCLAVE_ROOT_RETENTION_SECS` | How long anchors and registry records are locked (ten years by default) |
 | `ENCLAVE_TLS_DOMAINS` | The certificate's domains. Let's Encrypt issues it over TLS-ALPN-01 |
 | `ENCLAVE_WEBAUTHN_RP_ID`, `ENCLAVE_WEBAUTHN_ALLOWED_ORIGINS` | The relying party, whose origin is `https://<rp id>`, and further origins such as `android:apk-key-hash:…` |
 | `ENCLAVE_PUSH_APP_ID` | An AWS End User Messaging Push application, or empty for none |
@@ -414,7 +398,7 @@ cargo build --release -p enclave-runtime --features testing --bin passkey-client
 | Command | Coverage |
 |---|---|
 | `scripts/ci-check.sh` | Formatting, Clippy with warnings denied, workspace library tests, boot-origin tests |
-| `scripts/ci-guests.sh` | Builds the guests; tests tasks, held connections, dispatch, TLS binding, HTTP/2, gRPC, authentication and logging |
+| `scripts/ci-guests.sh` | Builds the guests; tests tasks, dispatch, TLS binding, HTTP/2, gRPC, authentication and logging |
 | `scripts/ci-storage.sh` | Real MinIO/S3: retention, remount, corruption, rollback and competing claims (needs Docker) |
 | `scripts/ci-e2e.sh` | The stages above, then the full QEMU stack (needs KVM, Docker and Nix) |
 | `scripts/wit-drift.sh` | Vendored guest WIT matches [`wit/`](wit/) |
@@ -446,7 +430,7 @@ Reproducibility, and which inputs remain pinned AWS prebuilt artifacts, are cove
 | Nitro validation | Real recipient key release, refusal of substituted measurements, AWS-root attestation, PTP and NSM availability, IMDSv2 networking and CloudWatch delivery need hardware evidence |
 | Notifications | The push path is exercised against a stub, not yet against the real service |
 | Upgrades | Nothing is migrated: a tenant's data opens with the key its owner's app sends, on any release the app approves. Until the owner's next approval, a new release runs none of that tenant's background work |
-| Delivery | Tasks, held connections, notifications and logs each have their own retry and durability contract; none gives exactly-once side effects |
+| Delivery | Tasks, notifications and logs each have their own retry and durability contract; none gives exactly-once side effects |
 | Authorization scope | A passkey approves one interaction on one route, not every payload byte or stream message. Per-message approval needs a host import that is not built yet |
 | Single active writer | One enclave imports the pool; no failover |
 | Parent disk on Nitro | tofu creates the pool's EBS volume and the AMI serves it with stock nbdkit (`deploy/ami/units/nbdkit.service`); not yet proven on hardware. The emulator serves a disk image with `deploy/qemu-nitro/nbd-stub.py` |
@@ -460,11 +444,13 @@ The [roadmap](docs/ROADMAP.md) records milestone history.
 
 | Path | Contents |
 |---|---|
-| [`runtime`](runtime/) | WASI wiring ([`run.rs`](runtime/src/run.rs), [`linker.rs`](runtime/src/linker.rs)), [clock](runtime/src/clock.rs), [entropy](runtime/src/random.rs), measured boot, key sources, TLS and auth, tenancy, [tasks](runtime/src/tasks.rs), [streams](runtime/src/stream.rs), [notify](runtime/src/notify/), logging |
-| [`wit`](wit/) | Capability contracts: [`notify`](wit/notify/notify.wit), [`stream`](wit/stream/stream.wit), [`tasks`](wit/tasks/tasks.wit) |
+| [`runtime`](runtime/) | WASI wiring ([`run.rs`](runtime/src/run.rs), [`linker.rs`](runtime/src/linker.rs)), [clock](runtime/src/clock.rs), [entropy](runtime/src/random.rs), measured boot, key sources, TLS and auth, tenancy, [tasks](runtime/src/tasks.rs), [notify](runtime/src/notify/), logging |
+| [`wit`](wit/) | Capability contracts: [`notify`](wit/notify/notify.wit), [`tasks`](wit/tasks/tasks.wit), [`telemetry`](wit/telemetry/telemetry.wit), [`signer`](wit/signer/signer.wit) |
 | [`crates/nitro-nsm`](crates/nitro-nsm/) | NSM device access: entropy, PCRs, attestation requests |
 | [`crates/nitro-attestation`](crates/nitro-attestation/) | Attestation verification and the `nitro-attest` client |
-| [`runtime/src/zfs.rs`](runtime/src/zfs.rs), [`nix/kernel-zfs.nix`](nix/kernel-zfs.nix) | Storage: the pool, its disk, the anchor ([docs/STORAGE.md](docs/STORAGE.md)) |
+| [`crates/threshold`](crates/threshold/), [`crates/ark`](crates/ark/), [`crates/enclave-client`](crates/enclave-client/) | FROST/DKG for the runtime's [wallet key](runtime/src/signer/), the Ark protocol and its taproot trees for the cosigner, and attestation verification for the cosigner's clients |
+| [`guests/cosigner`](guests/cosigner/), [`protocol/protos`](protocol/protos/) | The cosigner component, and its wire ([README](guests/cosigner/README.md)) |
+| [`runtime/src/store/zfs.rs`](runtime/src/store/zfs.rs), [`nix/kernel-zfs.nix`](nix/kernel-zfs.nix) | Storage: the pool, its disk, the anchor ([docs/STORAGE.md](docs/STORAGE.md)) |
 | [`runtime/src/store`](runtime/src/store/) | The roots bucket's S3 backend, the key hierarchy and signing |
 | [`examples`](examples/) | HTTP (tasks and notify), bidirectional gRPC, and SQLite guests |
 | [`deploy/qemu-nitro`](deploy/qemu-nitro/) | Development enclave, emulator self-test, end-to-end harness |

@@ -15,7 +15,7 @@
 //! Serialised against itself, because a cosigner reserving a nonce must not
 //! race its own second request. Not against anyone else, because a client's
 //! dataset is theirs alone, so there is nothing for two clients to contend
-//! over in it. (Anchors are serialised across everyone — see [`crate::zfs`].)
+//! over in it. (Anchors are serialised across everyone — see [`crate::store::zfs`].)
 //!
 //! ## Keyed by tenant id
 //!

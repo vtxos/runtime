@@ -2,7 +2,7 @@
 """Stop the enclave at a named point in an anchor, for tests that play the host.
 
 The runtime's testing build dials this port at a few points in an anchor
-(`hook` in runtime/src/zfs.rs), sends `<point> <detail>`, and waits for one line
+(`hook` in runtime/src/store/zfs.rs), sends `<point> <detail>`, and waits for one line
 back: `continue` or `abort`. Rules come from files in <dir>, so a test can copy
 the disk at an exact moment, or kill the enclave between two steps:
 

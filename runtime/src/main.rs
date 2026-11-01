@@ -156,7 +156,7 @@ async fn start_telemetry(
     long_about = None
 )]
 struct Cli {
-    /// The Object-Locked bucket: each pool's anchor chain, the tenant catalog,
+    /// The Object-Locked bucket: each pool's anchor chain, the tenant registry,
     /// each release's sealed key and caches, and the guest. COMPLIANCE
     /// retention on it is the entire rollback guarantee. The state itself is
     /// on the pools.
@@ -222,6 +222,13 @@ struct Cli {
     /// as `<base>/<sha256(pcr0 ‖ pcr16)>`.
     #[arg(long, env = "ENCLAVE_MASTER_KEY_PARAMETER")]
     master_key_parameter: Option<String>,
+
+    /// The SSM `SecureString` parameter the operator writes its master to: 64
+    /// hex characters, read the first time a DKG needs it. Every wallet key's
+    /// cosigner half is derived from it, so the same passkey always rebuilds
+    /// the same key. Unset, the DKG is unavailable.
+    #[arg(long, env = "ENCLAVE_OPERATOR_MASTER_PARAMETER")]
+    operator_master_parameter: Option<String>,
 
     /// Domain to put in the certificate. Repeatable; at least one.
     ///
@@ -323,6 +330,11 @@ struct Testing {
     #[arg(long, env = "ENCLAVE_MASTER_KEY")]
     master_key: Option<String>,
 
+    /// The operator master, 64 hex characters, for the emulator. Refused
+    /// alongside `--operator-master-parameter`.
+    #[arg(long, env = "ENCLAVE_OPERATOR_MASTER")]
+    operator_master: Option<String>,
+
     /// Where the guest's wall-clock time comes from. The emulator has no PTP
     /// clock; `host` uses the system's.
     #[arg(long, env = "ENCLAVE_CLOCK_SOURCE", default_value = "ptp",
@@ -423,6 +435,7 @@ impl Testing {
         Testing {
             master_key_source: MasterKeySourceKind::Kms,
             master_key: None,
+            operator_master: None,
             clock_source: ClockSource::Ptp,
             ptp_device: PathBuf::from(DEFAULT_PTP_DEVICE),
             random_source: RandomSource::Nsm,
@@ -511,6 +524,8 @@ impl Cli {
             region: self.region.clone(),
             kms_endpoint: None,
             ssm_endpoint: None,
+            operator_master_parameter: self.operator_master_parameter.clone(),
+            operator_master: self.testing.operator_master.clone(),
             access_key_id: self.testing.access_key_id.clone(),
             secret_access_key: self.testing.secret_access_key.clone(),
             session_token: self.testing.session_token.clone(),
@@ -561,6 +576,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
 
     let clock = open_clock(cli.testing.clock_source, &cli.testing.ptp_device)?;
     let entropy = open_entropy(cli.testing.random_source, Path::new(DEFAULT_NSM_DEVICE))?;
+    enclave_runtime::random::install(entropy.clone())?;
 
     /// Wrap the device so its documents carry a signature, if this build can.
     ///
@@ -786,8 +802,8 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
             // What a page on the relying party's own domain claims. Native apps
             // claim theirs, from `--webauthn-allowed-origin`.
             let origin = format!("https://{rp_id}");
-            let credentials = std::sync::Arc::new(enclave_runtime::CatalogCredentials::new(
-                zfs.catalog().clone(),
+            let credentials = std::sync::Arc::new(enclave_runtime::RegistryCredentials::new(
+                zfs.registry().clone(),
             ));
             let gate = std::sync::Arc::new(enclave_runtime::Gate::new(
                 enclave_runtime::build_relying_party(&rp_id, &origin, &allowed_origins)?,
@@ -806,6 +822,8 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
                 credentials,
                 zfs.clone(),
                 entropy.clone(),
+                enclave_runtime::open_operator_master(&cli.master_key_config()?)?
+                    .map(std::sync::Arc::new),
             ));
             tracing::info!(
                 rp_id,
@@ -969,7 +987,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     // Before the listener binds, so no request can produce guest output
     // before there is a task consuming it. Held for the server's
     // lifetime and drained explicitly below.
-    let (guest_logs, log_collector) = enclave_runtime::guest_io::start(std::sync::Arc::new(
+    let (guest_logs, log_collector) = enclave_runtime::telemetry::logs::start(std::sync::Arc::new(
         enclave_runtime::FanOutSink::new(sinks),
     ));
 
@@ -1073,7 +1091,7 @@ fn init_tracing() {
         // Targets are shown, and that is not cosmetic. The console carries the
         // runtime's own events *and* whatever a guest chose to write, and the
         // target is the one thing separating them that a guest cannot
-        // influence — see `enclave_runtime::guest_io`. Guest lines say
+        // influence — see `enclave_runtime::telemetry::logs`. Guest lines say
         // `guest`; everything else names a module in this runtime. Hiding it
         // was right when every line was the runtime's own; it stopped being
         // right when untrusted text started sharing the same console.

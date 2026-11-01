@@ -71,17 +71,23 @@ token and no operator step.
 
 ```
 POST /auth/register/options   {"display_name": "optional"}
-  → 200 {"registration_id": "...", "options": <PublicKeyCredentialCreationOptions>}
+  → 200 {"registration_id": "...", "options": <PublicKeyCredentialCreationOptions>,
+         "dkg": {...}}                                          // the cosigner's opening
+  + header x-enclave-attestation: <base64 COSE_Sign1>
 
-POST /auth/register/verify    {"registration_id": "...", "credential": <RegisterPublicKeyCredential>}
-  → 200 {"tenant_id": "...", "credential_id": "..."}
+POST /auth/register/verify    {"registration_id": "...", "credential": <RegisterPublicKeyCredential>,
+                               "tenant_key": "...", "dkg": {...}}
+  → 200 {"tenant_id": "...", "credential_id": "...", "dkg": {...}}
 ```
 
-`options` is what you hand to `navigator.credentials.create()` — or to your
-platform authenticator. Keep `credential_id`; every later request names it.
+`options` is what you hand to the platform authenticator's `create()`. Keep
+`credential_id`; every later request names it.
 
-Registering creates the tenant's record and a place for its data, but no data:
-that is opened with the tenant key, which comes with the first approval.
+Registering creates the tenant's record and its data, under the tenant key it
+carries, and makes the wallet key: the whole DKG rides these two calls — see
+[The wallet key](#the-wallet-key). Verify the attestation on the
+`register/options` answer (step 2, below) before `create()`: `register/verify`
+carries secrets.
 
 ### One request
 
@@ -138,19 +144,67 @@ Test vector: PRF output `11` × 32 and tenant id `22` × 16 give
 `57c4b615bf5da47923a682fed599cc34355bf19467ea46c482f244d13bebde6c`.
 
 - **Send `K_t` only after step 2 has passed on this same connection**, with PCR0
-  and PCR16 matching a release the app approves. A release the app does not
+  and PCR16 matching a release the app approves: on the `register/options`
+  answer at registration, on `request/options` after. A release the app does not
   approve — a substituted guest, a runtime nobody built — is never sent the key
   and opens none of the tenant's data.
 - **Never send the PRF output itself.** The wallet's DKG polynomial is seeded
   from the same output; with it and the share the cosigner dealt, the enclave
   would hold the whole key.
 - Don't store `K_t`. Derive it from each assertion's PRF output.
-- The first approval creates the tenant's data under `K_t`, and the data opens
-  under that key forever after. A different key earns a 401 and no token.
+- Registration creates the tenant's data under `K_t`, and the data opens under
+  that key forever after. A different key earns a 401 and no token.
 - After a new release, the tenant's background work, the cosigner's VTXO
   renewal included, waits until the owner's next approval sends the release
   the key. A release keeps the key for background work only while it remains
   that release.
+
+### The wallet key
+
+The wallet key is a 2-of-2 FROST key between the app and the cosigner, made by
+a Pedersen DKG that rides the passkey's registration, whole. The runtime keeps
+the cosigner's half and signs with it for the guest; no guest holds a FROST
+secret.
+
+```
+register/options  ← "dkg": {"identifier":         "<id_c, hex>",
+                            "verifying_key":      "<a0_c·G, compressed, hex>",
+                            "proof_of_knowledge": {"R": "<hex>", "Z": "<hex>"}}
+register/verify   → "tenant_key": "<K_t, base64url>",
+                    "dkg": {"round1_package": "<the wallet's round-1 package, JSON>",
+                            "round2_package": "<f_w(id_c): the wallet's share for the cosigner, JSON>"}
+                  ← "dkg": {"round1_package": "<the cosigner's round-1 package, JSON>",
+                            "round2_package": "<f_c(id_w): the share dealt to the wallet, JSON>",
+                            "group_key":      "<compressed, hex>"}
+```
+
+1. **The opening** comes with the registration challenge: the cosigner commits
+   to its secret before the app makes anything. Check the attestation (step 2),
+   then that `identifier` is `Identifier::derive(verifying_key)` and the proof
+   verifies under it.
+2. **`create()`** with the PRF evaluated. From its output: `K_t` (above), and
+   the wallet's polynomial (HKDF, salt `merlin/frost/v1`), whose part 1 gives
+   round one. Part 2 deals to `identifier` as a receiver, before the cosigner's
+   round one exists.
+3. **`register/verify`** carries the credential with its PRF results removed
+   (a `prf` or `hmac_get_secret` result is a 400), `K_t` and both packages. The
+   answer's round one must open with the `verifying_key` the opening gave and
+   hold two commitments; then part 3 with the dealt share, and the `group_key`
+   must match the app's own.
+
+- **The cosigner's polynomial is derived, not random**:
+  `a0_c = HKDF-SHA256(operator master, "aegira/cosigner-dkg/v1", handle ‖ 0x00)`
+  and `a1_c = HKDF(…, handle ‖ id_w ‖ 0x01)`, where `handle` is the WebAuthn
+  user handle `register/options` minted. So the opening exists before the
+  passkey does, and one handle deals to one wallet identifier.
+- **On an enclave that makes wallet keys, `dkg` and `tenant_key` are required.**
+  A registration whose DKG does not verify is refused whole: no passkey is kept.
+  No later call makes a wallet key, and `request/verify` refuses a `dkg` field;
+  a registration that fails after the passkey is kept needs a new passkey.
+- **Recovery** needs nothing stored on the device: a new phone with the passkey
+  re-derives `f_w` and `id_w`, and `Recover`, or the first round of any signing
+  stream, returns the dealt share.
+- With no operator master provisioned yet, `register/options` is a 503.
 
 ### Step 2, in full
 

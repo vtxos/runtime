@@ -47,8 +47,9 @@ async fn handle_over_with(fs: Arc<enclave_runtime::Zfs>, env: &[(String, String)
     // Detached deliberately: the collector runs for as long as this
     // environment can send, which is what a test wants. Production drains it
     // explicitly instead.
-    let (logs, _collector) =
-        enclave_runtime::guest_io::start(std::sync::Arc::new(enclave_runtime::TracingLogSink));
+    let (logs, _collector) = enclave_runtime::telemetry::logs::start(std::sync::Arc::new(
+        enclave_runtime::TracingLogSink,
+    ));
     let guest = GuestEnvironment::new(
         fs,
         Arc::new(HostClock),

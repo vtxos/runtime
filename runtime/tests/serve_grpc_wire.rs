@@ -159,7 +159,7 @@ async fn start() -> Harness {
     });
 
     let (logs, _collector) =
-        enclave_runtime::guest_io::start(Arc::new(enclave_runtime::TracingLogSink));
+        enclave_runtime::telemetry::logs::start(Arc::new(enclave_runtime::TracingLogSink));
     let guest = GuestEnvironment::new(fs, Arc::new(HostClock), nsm.clone(), &[], &[], logs)
         .expect("guest environment");
 

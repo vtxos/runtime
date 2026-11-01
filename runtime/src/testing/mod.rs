@@ -65,6 +65,9 @@ pub const RP_ID: &str = "enclave.test";
 /// The origin its assertions claim.
 pub const ORIGIN: &str = "https://enclave.test";
 
+/// The operator master this harness derives wallet keys from.
+pub const OPERATOR_MASTER: [u8; 32] = [7; 32];
+
 /// What `SigningNsm` reports as PCR0. A constant, and honest about it: nothing
 /// measured this.
 pub const PCR0: [u8; 48] = [0x5a; 48];
@@ -153,13 +156,13 @@ impl Enclave {
 
     async fn start(builder: EnclaveBuilder) -> Result<Enclave> {
         use crate::{
-            AuthEndpoints, CatalogCredentials, ChallengeStore, Gate, GuestEnvironment, HostClock,
-            PoolLimits, ServeConfig, Tenancy, TlsIdentity,
+            AuthEndpoints, ChallengeStore, Gate, GuestEnvironment, HostClock, PoolLimits,
+            RegistryCredentials, ServeConfig, Tenancy, TlsIdentity,
         };
 
         // A directory standing in for the pool: the harness runs without root
         // and without ZFS. What ZFS itself does is the emulator's to prove.
-        let fs = crate::zfs::Zfs::scratch().await;
+        let fs = crate::store::zfs::Zfs::scratch().await;
 
         let nsm = Arc::new(SigningNsm::new()?);
         // As `main` does, before anything could attest: the documents this
@@ -167,7 +170,7 @@ impl Enclave {
         crate::measure_guest(nsm.as_ref(), &builder.guest).context("measuring the guest")?;
         let entropy: Arc<dyn nitro_nsm::Nsm> = nsm.clone();
 
-        let credentials = Arc::new(CatalogCredentials::new(fs.catalog().clone()));
+        let credentials = Arc::new(RegistryCredentials::new(fs.registry().clone()));
         let gate = Arc::new(Gate::new(
             crate::build_relying_party(RP_ID, ORIGIN, &[])?,
             ChallengeStore::new(std::time::Duration::from_secs(60), 256),
@@ -182,11 +185,14 @@ impl Enclave {
             credentials,
             fs.clone(),
             entropy.clone(),
+            // A master from configuration, as the emulator has: the harness
+            // reaches no SSM.
+            Some(Arc::new(crate::OperatorMaster::fixed(OPERATOR_MASTER))),
         ));
 
         // Detached: the collector runs as long as this environment can send,
         // which is what a harness wants. Production drains it explicitly.
-        let (logs, _collector) = crate::guest_io::start(Arc::new(crate::TracingLogSink));
+        let (logs, _collector) = crate::telemetry::logs::start(Arc::new(crate::TracingLogSink));
         // As the binary does it: what the guest file carries is the guest's environment.
         let env = crate::env::from_guest(&builder.guest)?;
         let guest_env = GuestEnvironment::new(fs, Arc::new(HostClock), entropy, &env, &[], logs)

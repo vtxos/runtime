@@ -8,12 +8,12 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 /// the filesystem included, over the directory the guest was preopened.
 pub struct State {
     pub(crate) tasks: Option<crate::tasks::TaskContext>,
-    /// The connections the runtime holds for this tenant — see [`crate::stream`].
-    pub(crate) streams: Option<crate::stream::StreamContext>,
     pub(crate) notify: Option<crate::notify::NotifyContext>,
     /// This invocation's trace and where its metrics go — see [`crate::telemetry`]. Its trace is
     /// shipped when this is dropped, which is when the store is.
     pub(crate) telemetry: Option<crate::telemetry::TelemetryContext>,
+    /// This tenant's wallet key, on an authenticated request only — see [`crate::signer`].
+    pub(crate) signer: Option<crate::signer::SignerContext>,
     wasi: WasiCtx,
     table: ResourceTable,
     http: wasmtime_wasi_http::WasiHttpCtx,
@@ -26,9 +26,9 @@ impl State {
     pub fn new(wasi: WasiCtx) -> Self {
         State {
             tasks: None,
-            streams: None,
             notify: None,
             telemetry: None,
+            signer: None,
             wasi,
             table: ResourceTable::new(),
             http: wasmtime_wasi_http::WasiHttpCtx::new(),
@@ -45,6 +45,12 @@ impl State {
         &mut ResourceTable,
     ) {
         (self.telemetry.as_mut(), &mut self.table)
+    }
+}
+
+impl State {
+    pub(crate) fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
     }
 }
 

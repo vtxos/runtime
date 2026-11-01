@@ -135,6 +135,13 @@ base64         = "0.22"
 # Scrubs key material on drop. Already in the tree via aws-credential-types.
 zeroize        = { workspace = true }
 hex            = "0.4"
+# The cosigner's half of each wallet key (src/signer): its DKG, its FROST rounds, its record.
+threshold      = { path = "../crates/threshold", features = ["std"] }
+k256           = { version = "0.13", default-features = false, features = ["arithmetic"] }
+hkdf           = "0.12"
+sha2           = "0.10"
+# The generator trait `threshold` takes, served from the NSM (src/random.rs).
+rand_core      = "0.6"
 
 # The PTP clock is read through the POSIX dynamic-clock mechanism. rustix is
 # already compiled into the tree via wasmtime, so this adds no build cost and
@@ -197,6 +204,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Checking the wallet key's signatures as BIP-340 (src/signer/signing.rs).
+k256 = { version = "0.13", default-features = false, features = ["arithmetic", "schnorr"] }
+# The test wallet's `OsRng`: it stands in for the phone, not the enclave.
+rand_core = { version = "0.6", features = ["getrandom"] }
 # `tests/minio_integration.rs`: the S3 backend against a real MinIO.
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["minio"] }

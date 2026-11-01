@@ -19,7 +19,7 @@
 //!
 //! Also modelled: **a plain `put_blob` over a retained object**, which real S3
 //! accepts as a new current version while the retained one stays beneath it.
-//! The tenant catalog and region claims are not signed — no key outlives a
+//! The tenant registry and region claims are not signed — no key outlives a
 //! release to sign them with — so a forged newer version is exactly what they
 //! must survive, and a fake that refused the write could not show they do.
 //! Readers that matter take [`Backend::get_retained_blob`], the oldest version.

@@ -39,8 +39,8 @@ guest reported.
 
 ## What happens to it
 
-**One trace per invocation.** An inbound request, a task run and a stream
-message are each one X-Ray trace. Its root segment is named `enclave-guest` and
+**One trace per invocation.** An inbound request and a task run are each one
+X-Ray trace. Its root segment is named `enclave-guest` and
 carries two *annotations*, the `tenant` (hex) and the `invocation` kind, which
 X-Ray indexes, so "every trace for this tenant" is a filter expression. Each span
 a guest opens is a subsegment of whichever span was open when it was created;

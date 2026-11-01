@@ -5,16 +5,13 @@
 //! key over another's — by anyone who can write to the bucket.
 
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, NONCE_LEN};
-use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
 use crate::store::error::{StoreError, StoreResult};
 
 /// `nonce ‖ ciphertext ‖ tag`, under a fresh random nonce.
 pub fn seal(key: &LessSafeKey, aad: &[u8], plaintext: &[u8]) -> StoreResult<Vec<u8>> {
     let mut nonce = [0u8; NONCE_LEN];
-    SystemRandom::new()
-        .fill(&mut nonce)
-        .map_err(|_| StoreError::Io("generating a nonce".to_string()))?;
+    crate::random::fill(&mut nonce);
     let mut buffer = plaintext.to_vec();
     key.seal_in_place_append_tag(
         Nonce::assume_unique_for_key(nonce),

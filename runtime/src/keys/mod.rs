@@ -33,14 +33,15 @@
 //! every boot mode without hardware. It is not protection, and the image
 //! environment that selects it is measured, so PCR0 says which an enclave runs.
 
-mod ber;
 mod kms;
+mod operator;
 mod policy;
 mod recipient;
 #[cfg(any(test, feature = "testing"))]
 mod static_key;
 
 pub use kms::{KeyPointer, KmsAttestedKey, KmsKeyConfig};
+pub use operator::OperatorMaster;
 #[cfg(any(test, feature = "testing"))]
 pub use static_key::StaticKey;
 
@@ -177,6 +178,11 @@ pub struct MasterKeyConfig {
     /// a credentials problem.
     pub kms_endpoint: Option<String>,
     pub ssm_endpoint: Option<String>,
+    /// The SSM `SecureString` parameter the operator writes its master to.
+    pub operator_master_parameter: Option<String>,
+    /// The operator master as hex: testing builds only, and refused beside
+    /// the parameter.
+    pub operator_master: Option<String>,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
     pub session_token: Option<String>,
@@ -238,6 +244,28 @@ pub fn open_key_source(
                 },
             )))
         }
+    }
+}
+
+/// The operator master, when this deployment has one: read from SSM, or fixed
+/// by configuration in a testing build. Both at once is refused, as for the
+/// master key, and neither leaves the DKG unavailable.
+pub fn open_operator_master(config: &MasterKeyConfig) -> Result<Option<OperatorMaster>> {
+    match (&config.operator_master_parameter, &config.operator_master) {
+        (Some(_), Some(_)) => bail!(
+            "--operator-master was given alongside --operator-master-parameter. One of the \
+             two is not what was meant, and guessing which would mean deriving every wallet \
+             key from the wrong master."
+        ),
+        (Some(parameter), None) => Ok(Some(OperatorMaster::ssm(
+            ssm_client(config),
+            parameter.clone(),
+        ))),
+        #[cfg(any(test, feature = "testing"))]
+        (None, Some(hex)) => Ok(Some(OperatorMaster::fixed(*operator::parse(hex)?))),
+        #[cfg(not(any(test, feature = "testing")))]
+        (None, Some(_)) => bail!("--operator-master is a testing setting"),
+        (None, None) => Ok(None),
     }
 }
 
@@ -311,6 +339,8 @@ mod tests {
             region: "us-east-1".into(),
             kms_endpoint: None,
             ssm_endpoint: None,
+            operator_master_parameter: None,
+            operator_master: None,
             access_key_id: access_key_id.map(str::to_string),
             secret_access_key: access_key_id.map(str::to_string),
             session_token: None,

@@ -1,7 +1,7 @@
 //! Guest stdout and stderr, end to end: a real component writing real bytes,
 //! observed through a test sink rather than by scraping a terminal.
 //!
-//! The unit tests in `guest_io` cover the framing rules directly. What only an
+//! The unit tests in `telemetry::logs` cover the framing rules directly. What only an
 //! integration test can show is that a guest's `write` actually arrives here —
 //! that the WASI streams are wired to this pipeline at all, and that nothing
 //! between the guest and the sink reorders, merges or loses what it wrote.
@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use enclave_runtime::guest_io::{GuestLogRecord, GuestLogSink, GuestStream};
+use enclave_runtime::telemetry::logs::{GuestLogRecord, GuestLogSink, GuestStream};
 use enclave_runtime::{GuestEnvironment, HostClock, ServeHandle};
 use http_body_util::{BodyExt, Full};
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
@@ -67,7 +67,7 @@ async fn handle_with(sink: Arc<MemorySink>) -> (ServeHandle, enclave_runtime::Gu
 
     // Started before the handle exists, so there is no window in which a guest
     // could write with nothing consuming it.
-    let (logs, collector) = enclave_runtime::guest_io::start(sink);
+    let (logs, collector) = enclave_runtime::telemetry::logs::start(sink);
     let guest = GuestEnvironment::new(
         fs,
         Arc::new(HostClock),

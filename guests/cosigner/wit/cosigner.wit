@@ -1,0 +1,39 @@
+// What the cosigner needs from the runtime it runs inside.
+//
+// Its own world, rather than an edited copy of `enclave:tasks`'s: the WIT under `deps/` is copied
+// byte for byte from the runtime's `wit/`, and the wallet's e2e, on a real runtime, is what shows
+// the two still fit. A guest that wants two capabilities composes them here instead of editing
+// either.
+//
+// Not yet generated from. The crate now builds as a wasm32-wasip2 component — `make cosigner-wasm`
+// — serving gRPC over `wasi:http/incoming-handler`, which removed the reason this could not be
+// generated. What remains is composing this world with the one `wstd::http_server` exports, so
+// `src/host.rs` still mirrors these signatures behind a trait and `tests/wit_test.rs` checks the
+// mirror against this file. Wiring `wit_bindgen::generate!` over this world replaces the trait's
+// `Detached` impl and is the last step.
+package vtxos:cosigner@0.1.0;
+
+world cosigner {
+    // `run-task`, plus the queue to arm it with. The cosigner uses this for one thing: a settle
+    // that has come due. Where the image allowlists the ASP the task executes the sealed delegate
+    // itself; where it does not, it reads the delegate, compares the deadline to the clock, and
+    // wakes its owner instead. Egress is the image's to grant, and is not named in this world.
+    include enclave:tasks/background@0.1.0;
+
+    // Waking those devices. The cosigner never sees a token and never sends a message; it spends
+    // an enrolment an interactive call already made.
+    import enclave:notify/notify@0.1.0;
+
+    // The wallet key, held by the runtime: the cosigner asks for its FROST rounds and holds no
+    // share of its own.
+    import enclave:signer/wallet@0.1.0;
+
+    // Spans to X-Ray and metrics to CloudWatch, attributed by the runtime to the tenant this
+    // invocation runs for.
+    //
+    // Free until it is called. An interface the code never calls is not an import of the built
+    // component — checked with `wasm-tools component wit` on the release build, whose imports were
+    // identical with and without this line — so the cosigner still instantiates on a runtime
+    // without telemetry, and only starts to need one from its first call.
+    include enclave:telemetry/observed@0.1.0;
+}

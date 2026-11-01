@@ -23,9 +23,17 @@
     };
 
     crane.url = "github:ipetkov/crane";
+
+    # The cosigner's compiler: the exact release rust-toolchain.toml names,
+    # which needs a newer overlay than the runtime's `stable.latest` is pinned
+    # to. Its own input, so moving one never moves the other's bytes.
+    cosigner-rust-overlay = {
+      url = "github:oxalica/rust-overlay/e9d12b9d8266ed9afdc5add5537ec8b5f789645c";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, crane }:
+  outputs = { self, nixpkgs, rust-overlay, crane, cosigner-rust-overlay }:
     let
       # An EIF is x86_64 only. Nothing here is meant to build elsewhere, and
       # pretending otherwise would just produce a confusing failure.
@@ -49,10 +57,21 @@
       # by `include_str!`. Losing it fails deep in the build naming something
       # else entirely.
       srcFilter = path: type:
-        # Guests are separate workspaces. Including their sources here changes
-        # the runtime's store path (and its image's PCR0) on guest-only edits.
-        !(lib.hasPrefix "${toString ./.}/examples/" (toString path)
-          || toString path == "${toString ./.}/examples")
+        let
+          p = toString path;
+          root = toString ./.;
+          under = d: lib.hasPrefix "${root}/${d}/" p || p == "${root}/${d}";
+          # Workspace members the runtime does not build: their manifests stay
+          # (cargo loads every member), their code does not, so editing the
+          # cosigner or the crates only it and the services use leaves the
+          # runtime's store path, and its image's PCR0, alone. Their target
+          # paths are explicit, which is what lets cargo load them without it.
+          manifestOnly = d: under d && p != "${root}/${d}" && p != "${root}/${d}/Cargo.toml";
+        in
+        # The example guests are separate workspaces, and the fake host too.
+        !(under "examples" || under "guests/fake-host")
+        && !(manifestOnly "guests/cosigner" || manifestOnly "crates/ark"
+          || manifestOnly "crates/enclave-client")
         && ((lib.hasSuffix ".pem" path)
         || (craneLib.filterCargoSources path type));
 
@@ -145,6 +164,57 @@
       guestDeps = craneLib.buildDepsOnly guestArgs;
       guest-http = craneLib.buildPackage (guestArgs // {
         cargoArtifacts = guestDeps;
+      });
+
+      # ---- the cosigner ----------------------------------------------------
+      # cosigner.wasm is what PCR16 measures for the cosigner, so anyone must be
+      # able to rebuild a release and get the same bytes. It is a member of this
+      # workspace, so its path dependencies hash by relative path; the compiler
+      # is the exact one rust-toolchain.toml names; the clang that compiles
+      # secp256k1-sys's C to wasm is pinned by flake.lock; and the build
+      # directory is mapped out of the binary.
+      cosignerPkgs = import nixpkgs {
+        inherit system;
+        overlays = [ (import cosigner-rust-overlay) ];
+      };
+      cosignerCraneLib = (crane.mkLib cosignerPkgs).overrideToolchain
+        (p: p.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml);
+      # Unwrapped: the wrapper's flags are the host's. secp256k1-sys brings its
+      # own wasm headers, so a clang with a wasm backend is all it needs.
+      cosignerClang = pkgs.llvmPackages.clang-unwrapped;
+      cosignerArgs = {
+        pname = "cosigner";
+        version = "0.1.0";
+        # The whole workspace's Rust, plus the protos its build scripts compile
+        # and the WIT its bindings come from.
+        src = lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            let p = toString path; root = toString ./.; in
+            !(lib.hasPrefix "${root}/examples" p || lib.hasPrefix "${root}/guests/fake-host" p)
+            && (lib.hasSuffix ".proto" path || lib.hasSuffix ".wit" path
+              || lib.hasSuffix ".pem" path || cosignerCraneLib.filterCargoSources path type);
+          name = "cosigner-source";
+        };
+        cargoExtraArgs = "--locked -p cosigner --bin cosigner";
+        # Sized for the enclave; the runtime's own release profile is untouched.
+        CARGO_PROFILE = "wasm-release";
+        CARGO_BUILD_TARGET = "wasm32-wasip2";
+        strictDeps = true;
+        doCheck = false;
+        nativeBuildInputs = [ pkgs.protobuf ];
+        PROTOC = "${pkgs.protobuf}/bin/protoc";
+        CC_wasm32_wasip2 = "${cosignerClang}/bin/clang";
+        AR_wasm32_wasip2 = "${pkgs.llvmPackages.bintools-unwrapped}/bin/llvm-ar";
+        # Where the build ran must not reach the binary: a sandboxed Nix builds
+        # in /build, one without a sandbox in a temporary directory.
+        preBuild = ''
+          export RUSTFLAGS="''${RUSTFLAGS:-} --remap-path-prefix=$NIX_BUILD_TOP=/build"
+          export CFLAGS_wasm32_wasip2="-ffile-prefix-map=$NIX_BUILD_TOP=/build"
+        '';
+      };
+      cosigner = cosignerCraneLib.buildPackage (cosignerArgs // {
+        cargoArtifacts = cosignerCraneLib.buildDepsOnly cosignerArgs;
       });
 
       # What an operator uploads to the roots bucket, and the PCR16 a key policy
@@ -350,6 +420,9 @@
           # deployment, since they name resources this repository does not own.
           ENCLAVE_KMS_KEY_ALIAS = deployment.kmsKeyAlias;
           ENCLAVE_MASTER_KEY_PARAMETER = deployment.masterKeyParameter;
+          # What each wallet key's cosigner half is derived from, written by
+          # the operator after boot and read on the first DKG.
+          ENCLAVE_OPERATOR_MASTER_PARAMETER = deployment.operatorMasterParameter;
 
           # This runtime release's number, written into every anchor. Bump it
           # with every release, and never reuse one.
@@ -440,6 +513,7 @@
         env = builtins.removeAttrs runtimeImage.env [
           "ENCLAVE_KMS_KEY_ALIAS"
           "ENCLAVE_MASTER_KEY_PARAMETER"
+          "ENCLAVE_OPERATOR_MASTER_PARAMETER"
         ] // {
           ENCLAVE_CLOCK_SOURCE = "host";
 
@@ -468,6 +542,9 @@
           # keeps the development key source. PCR0 differs between the two
           # images, so a client can tell which it is talking to.
           ENCLAVE_MASTER_KEY_SOURCE = "static";
+          # The emulator reaches no SSM either, so its operator master is fixed
+          # here: a test value in a test image, which PCR0 records.
+          ENCLAVE_OPERATOR_MASTER = "0707070707070707070707070707070707070707070707070707070707070707";
           # Real ACME, against a Pebble running on the host — the same code
           # path production takes, which is the whole reason to prefer it.
           #
@@ -533,7 +610,7 @@
       lib.${system} = { inherit eifQemu mkEif; };
 
       packages.${system} = {
-        inherit enclave-runtime guest-http guest-release nsm-selftest nitro-attest eif-build blobs;
+        inherit enclave-runtime guest-http guest-release cosigner nsm-selftest nitro-attest eif-build blobs;
 
         # Both ends of the vsock from one package: `make build` emits gvproxy
         # for the parent and gvforwarder for the enclave, so they cannot drift.

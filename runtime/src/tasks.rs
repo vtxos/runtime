@@ -16,7 +16,7 @@ use wasmtime_wasi::HostWallClock;
 
 use crate::clock::WallClockAdapter;
 use crate::state::State;
-use crate::zfs::{TenantLoader, Zfs};
+use crate::store::zfs::{TenantLoader, Zfs};
 
 const MAX_PAYLOAD: usize = 64 * 1024;
 const MAX_RECORD: usize = 1024 * 1024;
@@ -266,8 +266,7 @@ impl TaskQueue {
             "task quota reached; forget terminal tasks"
         );
         let mut generation = [0; 16];
-        getrandom::fill(&mut generation)
-            .map_err(|e| anyhow::anyhow!("task identity entropy: {e}"))?;
+        crate::random::fill(&mut generation);
         let task = Task {
             version: 1,
             tenant,
@@ -570,7 +569,7 @@ mod tests {
     use super::*;
     use crate::clock::{HostClock, TrustedClock};
     use crate::store::backend::memory::MemoryBackend;
-    use crate::zfs::{Disk, Zfs};
+    use crate::store::zfs::{Disk, Zfs};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[derive(Debug, Clone)]
@@ -848,7 +847,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm");
         let bytes = std::fs::read(path).expect("build examples/guest-http for wasm32-wasip2");
-        let (logs, _collector) = crate::guest_io::start(Arc::new(crate::TracingLogSink));
+        let (logs, _collector) = crate::telemetry::logs::start(Arc::new(crate::TracingLogSink));
         let env = crate::GuestEnvironment::new(
             q.zfs.clone(),
             Arc::new(HostClock),

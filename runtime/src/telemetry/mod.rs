@@ -1,6 +1,8 @@
-//! Telemetry a guest reports: spans and events to AWS X-Ray, metrics to CloudWatch.
+//! Telemetry a guest reports: spans and events to AWS X-Ray, metrics to CloudWatch, and its
+//! stdout and stderr to CloudWatch Logs.
 //!
-//! The ABI is `wit/telemetry/telemetry.wit`. Like every interface the runtime adds, nothing in it
+//! Logs are the guest's own stdout and stderr ([`logs`], shipped by [`cloudwatch`]). For
+//! spans and metrics the ABI is `wit/telemetry/telemetry.wit`. Like every interface the runtime adds, nothing in it
 //! takes a tenant id: the serve layer puts a [`TelemetryContext`] on the store before the guest
 //! runs, carrying the tenant it has already authenticated.
 //!
@@ -16,7 +18,7 @@
 //! metric is an entry in a map, and a finished trace goes to a bounded queue by `try_send`. The
 //! network belongs to the forwarders ([`xray`], [`metrics`]) on tasks of their own. Telemetry that
 //! cannot keep up is dropped and counted, never waited for — the guest-log pipeline's rule (see
-//! [`crate::guest_io`]), for the same reason.
+//! [`logs`]), for the same reason.
 //!
 //! With X-Ray or metrics off the calls still succeed; they do less. Every event and closed span is
 //! also mirrored to the runtime's console, so an emulator with neither still shows what a guest
@@ -29,6 +31,8 @@
 //! never a metric dimension — CloudWatch bills per unique combination), the kind of invocation,
 //! the image's PCR0, the region and its own version.
 
+pub mod cloudwatch;
+pub mod logs;
 mod metrics;
 mod xray;
 
@@ -146,8 +150,6 @@ pub enum Invocation {
     Request,
     /// A background task run.
     Task,
-    /// A message on a held connection.
-    Message,
 }
 
 impl Invocation {
@@ -155,7 +157,6 @@ impl Invocation {
         match self {
             Invocation::Request => "request",
             Invocation::Task => "task",
-            Invocation::Message => "message",
         }
     }
 }
@@ -277,7 +278,7 @@ impl Drop for TelemetryContext {
 /// Mirror one report to the runtime's console.
 ///
 /// The guest's text is only ever a quoted **value**, never the message — the rule
-/// [`crate::guest_io::TracingLogSink`] follows, for the same reason: a guest that can choose the
+/// [`logs::TracingLogSink`] follows, for the same reason: a guest that can choose the
 /// message can forge a line that looks like the runtime's own.
 fn console(
     level: Level,
@@ -334,7 +335,7 @@ impl std::fmt::Display for SendError {
     }
 }
 
-/// Sort an SDK failure, the way [`crate::guest_io::cloudwatch`] does for logs.
+/// Sort an SDK failure, the way [`cloudwatch`] does for logs.
 ///
 /// Credential errors are deliberately transient: an `UnrecognizedClientException` is usually an
 /// expired session token, which heals the moment the SDK refreshes it from IMDS.

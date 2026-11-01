@@ -178,9 +178,9 @@ pub struct ServeHandle {
     pre: ProxyPre<State>,
     background_pre: InstancePre<State>,
     tasks: Option<Arc<crate::tasks::TaskQueue>>,
-    /// Connections this runtime holds for guests — see [`crate::stream`].
-    streams: Option<Arc<crate::stream::StreamRegistry>>,
     notify: Option<Arc<crate::notify::Notifier>>,
+    /// What each wallet's dealt share is recomputed from, for `enclave:signer`.
+    operator_master: Option<Arc<crate::keys::OperatorMaster>>,
     /// Where each invocation's trace and metrics go. Every invocation gets a context, so a guest's
     /// telemetry calls always resolve.
     telemetry: crate::telemetry::Telemetry,
@@ -238,7 +238,7 @@ impl Tenancy {
 
 impl ServeHandle {
     /// The storage the guest's tenants live on.
-    pub fn zfs(&self) -> &Arc<crate::zfs::Zfs> {
+    pub fn zfs(&self) -> &Arc<crate::store::zfs::Zfs> {
         self.guest.zfs()
     }
 
@@ -294,8 +294,8 @@ impl ServeHandle {
         Ok(ServeHandle {
             background_pre: instance_pre,
             tasks: None,
-            streams: None,
             notify: None,
+            operator_master: None,
             telemetry: Default::default(),
             pre,
             guest: Arc::new(guest),
@@ -327,21 +327,6 @@ impl ServeHandle {
         Ok(self)
     }
 
-    /// Let the runtime hold outbound connections on a guest's behalf.
-    ///
-    /// Tenant isolation is required for the same reason tasks require it: a
-    /// connection belongs to a tenant, and the invocations its messages cause
-    /// run in that tenant's filesystem. Without tenancy there is nobody to
-    /// attribute either to.
-    pub fn with_streams(mut self, registry: Arc<crate::stream::StreamRegistry>) -> Result<Self> {
-        anyhow::ensure!(
-            self.tenancy.is_some(),
-            "held connections require tenant isolation"
-        );
-        self.streams = Some(registry);
-        Ok(self)
-    }
-
     /// Let the guest wake its tenant's devices.
     ///
     /// Tenant isolation is required for the same reason tasks require it: a
@@ -356,99 +341,21 @@ impl ServeHandle {
         Ok(self)
     }
 
+    /// What `enclave:signer` recomputes each wallet's dealt share from: the auth
+    /// endpoints' operator master, since the DKG made the keys with it.
+    pub fn with_operator_master(
+        mut self,
+        master: Option<Arc<crate::keys::OperatorMaster>>,
+    ) -> Self {
+        self.operator_master = master;
+        self
+    }
+
     /// Ship guest spans and metrics. No tenancy requirement: an anonymous request is attributed
     /// to the anonymous tenant, as its filesystem is.
     pub fn with_telemetry(mut self, telemetry: crate::telemetry::Telemetry) -> Self {
         self.telemetry = telemetry;
         self
-    }
-
-    /// An internal component export, never an HTTP route or a fabricated token.
-    /// One message from a held connection, as one guest invocation.
-    ///
-    /// The same shape as [`Self::run_background`] and for the same reasons: a
-    /// fresh instance, the tenant's lock, a wall deadline. What differs is only
-    /// what woke it — a counterparty rather than a clock — and that it may reply.
-    ///
-    /// `interactive` is FALSE. A message arriving over a connection is not its
-    /// owner asking for something, so it cannot open connections or schedule
-    /// work, exactly as a background run cannot.
-    pub(crate) async fn run_message(
-        &self,
-        streams: &Arc<crate::stream::StreamRegistry>,
-        tenant: [u8; 16],
-        id: &str,
-        message_id: &str,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        let tenancy = self
-            .tenancy
-            .as_ref()
-            .context("held connections require tenants")?;
-        let checkout = tenancy.pool.checkout(&tenant);
-        let _guard = checkout.slot().lock().clone().lock_owned().await;
-        let work = async {
-            let state = self.tenant_state(tenant).await?;
-            let mut store = Store::new(self.pre.engine(), state);
-            store.set_epoch_deadline(1);
-            store.epoch_deadline_async_yield_and_update(1);
-            let instance = self.background_pre.instantiate_async(&mut store).await?;
-            store.data_mut().streams = Some(crate::stream::StreamContext {
-                registry: streams.clone(),
-                tenant,
-                interactive: false,
-            });
-            store.data_mut().notify =
-                self.notify
-                    .as_ref()
-                    .map(|notifier| crate::notify::NotifyContext {
-                        notifier: notifier.clone(),
-                        tenant,
-                        interactive: false,
-                    });
-            store.data_mut().telemetry = Some(
-                self.telemetry
-                    .context(tenant, crate::telemetry::Invocation::Message),
-            );
-            let run = instance
-                .get_typed_func::<(String, String, Vec<u8>), (std::result::Result<Vec<u8>, String>,)>(
-                    &mut store,
-                    "on-message",
-                )
-                .map_err(|e| anyhow::anyhow!(e.to_string()))
-                .context("held connections require the on-message export")?;
-            let (result,) = run
-                .call_async(
-                    &mut store,
-                    (id.to_string(), message_id.to_string(), payload),
-                )
-                .await?;
-            let bytes = result.map_err(anyhow::Error::msg)?;
-            anyhow::ensure!(
-                bytes.len() <= crate::stream::MAX_MESSAGE,
-                "reply exceeds the message ceiling"
-            );
-            // Before the reply leaves: it may say what was written.
-            match self.guest.zfs().anchor_tenant(tenant).await {
-                Ok(()) => {
-                    if let Some(notify) = &self.notify {
-                        notify.deliver_staged(tenant);
-                    }
-                }
-                Err(e) => {
-                    if let Some(notify) = &self.notify {
-                        notify.drop_staged(tenant);
-                    }
-                    return Err(e);
-                }
-            }
-            Ok(bytes)
-        };
-        // The same wall clock that bounds an interaction. A guest parked in a
-        // host call executes no wasm, so the epoch alone would never reach it.
-        tokio::time::timeout(self.timeout, work)
-            .await
-            .context("the guest took too long to answer a message")?
     }
 
     /// One task run: a fresh instance, under the same tenant lock as requests.
@@ -648,17 +555,6 @@ impl ServeHandle {
         let dir = self.guest.zfs().attached_dir(tenant_id)?;
 
         let mut instance = self.instantiate(&dir).await?;
-        instance.store.data_mut().streams =
-            self.streams
-                .as_ref()
-                .map(|registry| crate::stream::StreamContext {
-                    registry: registry.clone(),
-                    tenant: tenant_id,
-                    // Its owner is here, so this invocation may open and close
-                    // connections — unlike one caused by a message arriving on
-                    // one, which may only reply.
-                    interactive: true,
-                });
         instance.store.data_mut().tasks =
             self.tasks.as_ref().map(|queue| crate::tasks::TaskContext {
                 queue: queue.clone(),
@@ -677,6 +573,13 @@ impl ServeHandle {
             self.telemetry
                 .context(tenant_id, crate::telemetry::Invocation::Request),
         );
+        // Here and nowhere else: signing needs the wallet's half of each round,
+        // so its owner connected.
+        instance.store.data_mut().signer = Some(crate::signer::SignerContext {
+            zfs: self.guest.zfs().clone(),
+            master: self.operator_master.clone(),
+            tenant: tenant_id,
+        });
         let progress = instance.progress.clone();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         // Wrapped before it becomes a guest resource, which is the last point
@@ -1017,7 +920,7 @@ fn resumed<S>(stream: &tokio_rustls::server::TlsStream<S>, peer: SocketAddr) -> 
 
 /// The tenant callers without a gate share. A tenant id is a hash of a
 /// credential id, so none is ever all zeroes.
-use crate::catalog::ANONYMOUS;
+use crate::store::registry::ANONYMOUS;
 
 /// Hold a response's end until what produced it is anchored, so no client can
 /// see it finish before the writes it may describe would survive the host.
@@ -1494,23 +1397,6 @@ impl Server {
             );
             scheduler.spawn(queue.clone().run(self.guest.clone()));
         }
-        // The supervisors, started from what is already on disk. This is what
-        // re-establishes a connection after a restart — no guest is involved and
-        // nothing is scheduled; the records are the instruction and this reads
-        // them. See [`crate::stream`].
-        if let Some(streams) = &self.guest.streams {
-            anyhow::ensure!(
-                self.gate.is_some(),
-                "held connections require authentication"
-            );
-            // The attestor `/auth/*` uses, not a second one: one device, and one
-            // limit on it for both directions. Set before the supervisor starts,
-            // so not even the first dial after a restart goes out unsigned.
-            if let Some(attestor) = &self.attestor {
-                streams.set_attestor(attestor.clone()).await;
-            }
-            scheduler.spawn(streams.clone().run(self.guest.clone()));
-        }
         let listener = TcpListener::bind(self.addr)
             .await
             .with_context(|| format!("binding {}", self.addr))?;
@@ -1685,17 +1571,6 @@ pub async fn serve_component(
         .await?;
         handle = handle.with_tasks(queue)?;
     }
-    // Held connections, whenever there is a tenant to attribute one to and a gate to authenticate
-    // that tenant. No flag of its own: the registry is a directory and a supervisor loop over
-    // whatever records exist, and a guest that never asks for a connection has neither. A held
-    // connection reaches only what the guest's own request could, checked on every dial and
-    // every send — so enabling this widens nothing.
-    if config.tenancy.is_some() && config.authentication.is_some() {
-        let registry =
-            crate::stream::StreamRegistry::open_registry(handle.environment().zfs().clone())
-                .await?;
-        handle = handle.with_streams(registry)?;
-    }
     let mut notify_forwarder = None;
     if let Some(notify) = config.notify.take() {
         anyhow::ensure!(
@@ -1753,6 +1628,10 @@ pub async fn serve_component(
     // Before the listener binds. A guest that will not instantiate should stop
     // the enclave, not the first client unlucky enough to arrive.
     handle.verify_instantiates().await?;
+
+    if let Some((auth, _)) = &config.authentication {
+        handle = handle.with_operator_master(auth.operator_master().cloned());
+    }
 
     let mut server = Server::new(handle, config.addr);
     match config.authentication {

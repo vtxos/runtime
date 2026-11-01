@@ -1,0 +1,64 @@
+package enclave:signer@0.1.0;
+
+/// The signer's half of this tenant's wallet key, held by the runtime.
+///
+/// The key is a 2-of-2 FROST key between the owner's wallet and the signer,
+/// made by the DKG that rides the passkey's registration. The runtime keeps the
+/// signer's share on the tenant's pool and signs with it here; no function
+/// returns it, so a guest holds no FROST secret and its business is deciding
+/// what to sign.
+///
+/// Calls are bound to the current tenant by the runtime; no function here
+/// accepts a tenant id. **Interactive only**: signing needs the wallet's half
+/// of each round, so it needs its owner connected, and background work is
+/// refused.
+interface wallet {
+    /// One message's commitment from the signer: two compressed points.
+    record commitment {
+        hiding: list<u8>,
+        binding: list<u8>,
+    }
+
+    /// The wallet's half of one message's round: its commitment, two
+    /// compressed points, and its 32-byte share over both commitments.
+    record wallet-round {
+        hiding: list<u8>,
+        binding: list<u8>,
+        share: list<u8>,
+    }
+
+    /// The tenant's wallet key, public parts only.
+    record key {
+        /// The group key, compressed and even-Y.
+        group-key: list<u8>,
+        /// The public key package, as threshold's JSON.
+        public-key-package: string,
+        /// Each signer's FROST identifier, 32 bytes.
+        signer-identifier: list<u8>,
+        wallet-identifier: list<u8>,
+    }
+
+    /// This tenant's wallet key. An error if it has none.
+    wallet-key: func() -> result<key, string>;
+
+    /// The share the signer dealt the wallet that is `identifier` at the
+    /// DKG, 32 bytes, recomputed: the half of its own share a wallet cannot
+    /// derive from its passkey. Refused for any identifier but the key's
+    /// wallet's, so a wallet whose passkey derives another identifier is told
+    /// so rather than handed a share that would not add up.
+    dealt-share: func(identifier: list<u8>) -> result<list<u8>, string>;
+
+    /// One FROST round over a batch of messages, in one round trip: the
+    /// signer commits, the wallet answers with its commitment and share, and
+    /// the signer signs and aggregates. Script-path: the signer signs
+    /// untweaked. Each message's nonce is the runtime's, used once.
+    resource signing {
+        /// Round one: the signer's commitment for each message.
+        begin: static func(messages: list<list<u8>>) -> result<tuple<signing, list<commitment>>, string>;
+
+        /// Round two: the wallet's half for each message, in order, in;
+        /// 64-byte BIP-340 signatures out. A share that does not verify is
+        /// refused. Once only.
+        finish: func(rounds: list<wallet-round>) -> result<list<list<u8>>, string>;
+    }
+}

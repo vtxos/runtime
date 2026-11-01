@@ -35,6 +35,12 @@
   kmsKeyAlias = "alias/CHANGE-ME";
   masterKeyParameter = "/CHANGE-ME/master-key";
 
+  # The SSM SecureString the operator writes its master to, once the enclave is
+  # up: 64 hex characters. Each wallet key's cosigner half is derived from it,
+  # so the same passkey always rebuilds the same key. The instance role needs
+  # ssm:GetParameter on it and kms:Decrypt on the key SSM encrypts it with.
+  operatorMasterParameter = "/CHANGE-ME/operator-master";
+
   # This runtime release's number. Bump it with every release and never reuse
   # one: a pool last written by a higher number is refused.
   release = 1;

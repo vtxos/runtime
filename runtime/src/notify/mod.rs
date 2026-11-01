@@ -555,7 +555,7 @@ mod tests {
     use super::pinpoint::testing::{Counted, Recorder, SENT};
     use super::*;
     use crate::clock::HostClock;
-    use crate::zfs::Zfs;
+    use crate::store::zfs::Zfs;
 
     const ALICE: [u8; 16] = [1; 16];
     const BOB: [u8; 16] = [2; 16];

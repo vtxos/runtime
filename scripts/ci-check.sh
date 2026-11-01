@@ -7,16 +7,23 @@
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 cd "$REPO"
 
+# The runtime's packages. The cosigner's (its component and the crates it
+# shares with the wallet) are checked by ci-cosigner.sh, to their own standard,
+# and need protoc to build.
+RUNTIME=(-p enclave-runtime -p nitro-attestation -p nitro-nsm)
+
 say "rustfmt"
-cargo fmt --all -- --check
+cargo fmt "${RUNTIME[@]}" -- --check
 
 # `--all-targets` so the lints cover tests and benches too, and `-D warnings`
-# because a lint nobody has to fix is a lint that accumulates.
+# because a lint nobody has to fix is a lint that accumulates. `--no-deps`
+# keeps threshold, which the runtime's wallet key builds on, to ci-cosigner.sh's
+# standard.
 say "clippy"
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy "${RUNTIME[@]}" --all-targets --no-deps -- -D warnings
 
 say "unit tests"
-cargo test --workspace --lib
+cargo test "${RUNTIME[@]}" --lib
 # The runtime's settings are parsed in the binary, whose tests `--lib` skips.
 cargo test -p enclave-runtime --bin enclave-runtime
 

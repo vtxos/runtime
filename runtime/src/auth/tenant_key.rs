@@ -6,8 +6,8 @@
 //!
 //! The PRF output is what the passkey's WebAuthn `prf` extension returns
 //! during the same `get()` that produces the assertion, so deriving it costs
-//! no prompt. The wallet already seeds its DKG polynomial from that output
-//! (`SHA256(seed ‖ i)`); HKDF under its own salt keeps the two apart.
+//! no prompt. The wallet also seeds its DKG polynomial from that output, with
+//! HKDF under the salt `merlin/frost/v1`; this salt keeps the two apart.
 //!
 //! The client sends `K_t` in `POST /auth/request/verify`, **never the PRF
 //! output itself** — with that and the share the cosigner dealt it, the

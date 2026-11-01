@@ -10,7 +10,7 @@ This replaced the runtime's original storage engine, s3fs: a copy-on-write files
 
 ```text
   /pools/<pool_id>/data          a tenant's pool, mounted here: the guest's only preopen
-  /pools/<pool_id>/runtime       the tenant's tasks, streams and devices
+  /pools/<pool_id>/runtime       the tenant's tasks and devices
   pool "p<pool_id>" (region N)   a tenant's pool
   /dev/mapper/zcrypt-<id>        per-region plain dm-crypt, aes-xts-plain64, a key per pool
   /dev/nbd0                      the parent's disk, cut into equal regions: NBD over vsock 10809
@@ -18,13 +18,13 @@ This replaced the runtime's original storage engine, s3fs: a copy-on-write files
 
 ### A pool per tenant
 
-The disk is divided into fixed, 4 KiB-aligned regions (`region_bounds` in [`zfs.rs`](../runtime/src/zfs.rs)). Each tenant is given one when it registers. A region is mapped as its own `dm-crypt` device, `zcrypt-<pool_id>`. On it sits one pool, `p<pool_id>`, with a `data` dataset the guest sees as `/` and a `runtime` dataset for the tenant's tasks, streams and devices.
+The disk is divided into fixed, 4 KiB-aligned regions (`region_bounds` in [`zfs.rs`](../runtime/src/store/zfs.rs)). Each tenant is given one when it registers. A region is mapped as its own `dm-crypt` device, `zcrypt-<pool_id>`. On it sits one pool, `p<pool_id>`, with a `data` dataset the guest sees as `/` and a `runtime` dataset for the tenant's tasks and devices.
 
 **Keyed by the tenant.** A pool's dm-crypt key is `HKDF(K_t, fs_uuid, "aegira/pool/dmcrypt/v1" ‖ pool_id)` and its anchor-signing key `HKDF(K_t, fs_uuid, "aegira/pool/anchor-sign/v1" ‖ pool_id)`. `K_t` is the **tenant key**: the owner's app derives it from its passkey's PRF output and sends it with an approval ([client integration](CLIENT_INTEGRATION.md#the-tenant-key)), only to a release whose PCR0 and PCR16 it approves. So a pool is **attached** the first time its owner signs in to a release, and not before. Anchor 0 is written once and locked, so it pins `K_t` for good: a wrong key fails "signed by an unexpected key" before anything is mapped. Every release opens the pool with the right key, so nothing is migrated when the runtime or the guest changes.
 
-**The catalog** is in the roots bucket, each record written once under Object Lock and read back as its retained version: `tenants/<tid>` (the passkey, the pool id, the region) and `regions/<r>` (which tenant and pool hold it). A region's claim is checked before the region is mapped, so no tenant's pool is ever opened on another's region. None of it is signed, since no key outlives a release, and none of it opens anything: that takes `K_t`.
+**The registry** is in the roots bucket, each record written once under Object Lock and read back as its retained version: `tenants/<tid>` (the passkey, the pool id, the region) and `regions/<r>` (which tenant and pool hold it). A region's claim is checked before the region is mapped, so no tenant's pool is ever opened on another's region. None of it is signed, since no key outlives a release, and none of it opens anything: that takes `K_t`.
 
-**Each release keeps** the keys of tenants with background work, sealed under a key only it is released (`versions/<vid>/tenant-keys/<tid>`), and attaches them at boot. A new release starts with none: a tenant's tasks, streams and wakes wait until its owner signs in to it.
+**Each release keeps** the keys of tenants with background work, sealed under a key only it is released (`versions/<vid>/tenant-keys/<tid>`), and attaches them at boot. A new release starts with none: a tenant's tasks and wakes wait until its owner signs in to it.
 
 An anchor names the pool it speaks for — its pool id and tenant id, signed (`ZFSANCH3`) — and the releases that wrote it. Each pool anchors on its own chain, under `zfs/pools/<pool_id>/anchors/`, with its own last-anchor lock, so two tenants anchor independently: one held mid-anchor does not stop another. Each attach claims the pool's next **generation** (`zfs/pools/<pool_id>/generations/<g>`, signed by the pool's key), and an enclave stops anchoring a pool once a higher generation exists, so an older enclave cannot acknowledge a write a newer one has forked away from. A pool is kept attached for the life of the process; the number of pools is bounded by how many regions the disk holds, and registration is refused once none is free.
 
@@ -36,7 +36,7 @@ The region size is **fixed for the life of a store**, not a runtime flag. A regi
 
 - **The pool.** The enclave loads `spl.ko` and `zfs.ko` at boot. They are built against a kernel compiled from AWS's own enclave recipe; see [the parent side](#the-parent-side).
 - **The disk.** The parent's NBD server is reached over vsock. The kernel refuses a vsock socket for NBD, so it is handed one end of a Unix socket pair, and two threads copy between that and the vsock connection.
-- **The roots bucket** holds what must outlive any disk and that no host may rewrite. That is each pool's anchor chain and generations, the catalog, each release's sealed key, tenant-key cache and ACME cache, and the guest.
+- **The roots bucket** holds what must outlive any disk and that no host may rewrite. That is each pool's anchor chain and generations, the registry, each release's sealed key, tenant-key cache and ACME cache, and the guest.
 
 ### What the host can do to the disk
 
@@ -95,13 +95,10 @@ Anchors are found by their retained versions, by galloping then bisecting, becau
 | Write made by | Anchored before |
 |---|---|
 | A request | The response ends. A streamed body streams as written, and only its end (with any trailers, such as gRPC's status) waits. A body with `Content-Length` is held whole, because a client counting bytes would otherwise act on it first. So is a response that cannot have a body (to a HEAD, or a 1xx, 204 or 304), which would otherwise be complete when its head went out. |
-| A held connection's message run | Its reply is sent. |
 | A background task | Its outcome is recorded. Its attempt is also anchored before it runs, so a task that crashes the enclave still spends the attempt rather than looping on it for ever. |
-| A wake | The invocation that raised it is anchored. A `wake` the guest raises during a request, a message or a task is held and delivered only once that invocation's writes are durable — never before, since a wake tells an owner to come and look. If the anchor fails, the wake is dropped. |
+| A wake | The invocation that raised it is anchored. A `wake` the guest raises during a request or a task is held and delivered only once that invocation's writes are durable — never before, since a wake tells an owner to come and look. If the anchor fails, the wake is dropped. |
 | A passkey registration | The response. The region claim and the tenant record are written once to the bucket, under Object Lock, before the user is told they are registered. The pool is created with the first approval, which brings the tenant key. |
 | A passkey revocation | The response; a marker written once to the bucket. |
-
-One effect still precedes its anchor: a **stream dial or send** (`enclave:streams`). When a guest opens a stream or sends on one, the runtime dials or `POST`s the far side during the invocation, before that invocation's record is anchored. It is left this way deliberately — the dial carries no committed state (it is an attested request, and the far side deduplicates, so a crash before the anchor simply rewinds the stream record and the supervisor re-establishes or drops it on the next boot), and deferring it would mean reworking the reconnect supervisor. Moving it behind the anchor, like wakes, is the remaining piece of the one-operation boundary.
 
 After a crash, the next attach goes on from whatever reached the disk. Writes no anchor covered may be there or not; none was acknowledged.
 
@@ -109,9 +106,9 @@ After a crash, the next attach goes on from whatever reached the disk. Writes no
 
 | Path | What |
 |---|---|
-| `/pools/<pool_id>/data` | A tenant's pool, mounted here once attached. A tenant id is the first 16 bytes of a SHA-256 of the passkey's credential id; a guest without a gate (development only) gets the all-zero id, and a pool keyed by the release. The pool id is random, in the catalog. |
-| `/pools/<pool_id>/runtime/{tasks,streams,devices}` | The tenant's records: JSON, each written to a temporary file and renamed over the record. Loaded when the pool is attached. |
-| `tenants/<tid>`, `regions/<r>`, `revoked/<tid>` | The catalog, in the roots bucket: written once, read as the retained version. |
+| `/pools/<pool_id>/data` | A tenant's pool, mounted here once attached. A tenant id is the first 16 bytes of a SHA-256 of the passkey's credential id; a guest without a gate (development only) gets the all-zero id, and a pool keyed by the release. The pool id is random, in the registry. |
+| `/pools/<pool_id>/runtime/{tasks,devices}` | The tenant's records: JSON, each written to a temporary file and renamed over the record. Loaded when the pool is attached. |
+| `tenants/<tid>`, `regions/<r>`, `revoked/<tid>` | The registry, in the roots bucket: written once, read as the retained version. |
 | `versions/<vid>/sealed-key`, `versions/<vid>/tenant-keys/<tid>`, `versions/<vid>/acme/` | One release's own: its KMS pointer, the tenant keys it keeps for background work, its certificate. `vid` is `sha256(pcr0 ‖ pcr16)`. |
 
 No guest can reach `runtime` or another tenant (a different pool, a different encrypted device). A guest's only preopen is its own pool's `data` dataset, and `wasmtime-wasi` resolves paths through `cap-std`, which refuses `..` past the preopen, absolute paths and symlinks out of it.
@@ -171,7 +168,7 @@ The bucket's identity lives in the measured image: `ENCLAVE_ROOTS_BUCKET` is par
 - the abandoned fork is refused;
 - the disk as of an anchor's marker, before its sync, is refused.
 
-The testing build stops at named points in an anchor and asks the host, over vsock port 9101, whether to go on (`hook` in [`zfs.rs`](../runtime/src/zfs.rs), answered by [`test-hooks.py`](../deploy/qemu-nitro/test-hooks.py)). A leg can hold an anchor there, copy the disk at that exact moment, or kill the enclave between two steps.
+The testing build stops at named points in an anchor and asks the host, over vsock port 9101, whether to go on (`hook` in [`zfs.rs`](../runtime/src/store/zfs.rs), answered by [`test-hooks.py`](../deploy/qemu-nitro/test-hooks.py)). A leg can hold an anchor there, copy the disk at that exact moment, or kill the enclave between two steps.
 
 ### The flaw the last leg is for
 

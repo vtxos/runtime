@@ -5,11 +5,17 @@
 //! convenience. A guest able to answer under `/auth/` could hand out its own
 //! challenges and verify its own assertions, which is the same as having none.
 //!
-//! Nothing here performs a cosigner action. Registration creates a new tenant,
-//! which anyone may do: it is open, and what it grants is an empty tenant and
-//! nothing else. Verifying an assertion is also where a tenant's pool is
-//! attached, with the tenant key the app sends beside the assertion — the only
-//! way a release ever opens a tenant's data.
+//! Registration creates a new tenant, which anyone may do: it is open, and what
+//! it grants is an empty tenant and nothing else. A tenant's pool is attached
+//! only with the tenant key the app sends: created with it at registration,
+//! and opened with it beside every assertion after — the only way a release
+//! ever opens a tenant's data.
+//!
+//! Registration also carries the whole of the wallet key's DKG
+//! ([`crate::signer::dkg`]): `register/options` answers with the cosigner's
+//! opening, and `register/verify` completes the ceremony and keeps the key on
+//! the pool it creates. The cosigner's half is derived from the operator master
+//! and the registration's user handle.
 //!
 //! ## Why registration is two calls
 //!
@@ -28,9 +34,10 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
 
-use super::credential::{tenant_of, CatalogCredentials};
+use super::credential::{tenant_of, RegistryCredentials};
 use super::gate::Gate;
 use super::token::InteractionScope;
+use crate::keys::OperatorMaster;
 
 /// The prefix the guest can never see.
 pub const AUTH_PREFIX: &str = "/auth/";
@@ -60,18 +67,67 @@ struct RegisterOptionsRequest {
 struct RegisterOptionsResponse {
     registration_id: String,
     options: CreationChallengeResponse,
+    /// The cosigner's opening, on an enclave that makes wallet keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dkg: Option<DkgOpening>,
+}
+
+/// The cosigner's opening: its commitment to its secret, before the wallet has
+/// made anything.
+#[derive(Serialize)]
+struct DkgOpening {
+    /// `id_c`, hex: the identifier the wallet deals its share to.
+    identifier: String,
+    /// `a0_c·G`, compressed, hex.
+    verifying_key: String,
+    /// The proof of knowledge of `a0_c` under `identifier`, as a round-one
+    /// package carries it: `{"R": hex, "Z": hex}`.
+    proof_of_knowledge: serde_json::Value,
 }
 
 #[derive(Deserialize)]
 struct RegisterVerifyRequest {
     registration_id: String,
+    /// The new credential, **with its PRF results removed**.
     credential: RegisterPublicKeyCredential,
+    /// Base64url of the tenant key, 32 bytes: the new tenant's pool is created
+    /// with it.
+    #[serde(default)]
+    tenant_key: Option<String>,
+    /// The wallet's half of the DKG.
+    #[serde(default)]
+    dkg: Option<DkgRequest>,
 }
 
 #[derive(Serialize)]
 struct RegisterVerifyResponse {
     tenant_id: String,
     credential_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dkg: Option<DkgAnswer>,
+}
+
+/// The wallet's half of the DKG, its packages as threshold's JSON.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DkgRequest {
+    /// The wallet's round-one package.
+    round1_package: String,
+    /// The share the wallet dealt the cosigner, `f_w(id_c)`, as a round-two
+    /// package.
+    round2_package: String,
+}
+
+/// The cosigner's half of the DKG, finished.
+#[derive(Serialize)]
+struct DkgAnswer {
+    /// The cosigner's round-one package, for the wallet's part three.
+    round1_package: String,
+    /// The share the cosigner dealt the wallet, `f_c(id_w)`, as a round-two
+    /// package.
+    round2_package: String,
+    /// The group key, compressed, hex.
+    group_key: String,
 }
 
 /// What an interaction challenge is issued for.
@@ -107,8 +163,8 @@ struct RequestVerifyRequest {
     tenant_key: String,
 }
 
-/// Whether an assertion carries the output of a PRF — the WebAuthn `prf`
-/// extension, or the CTAP `hmac-secret` it is built on.
+/// Whether a credential or an assertion carries the output of a PRF — the
+/// WebAuthn `prf` extension, or the CTAP `hmac-secret` it is built on.
 ///
 /// The one thing a client must never send. The tenant key is derived from
 /// that output, and so is the wallet's DKG polynomial: with it and the share
@@ -124,6 +180,13 @@ fn carries_prf(assertion: &serde_json::Value) -> bool {
                 .iter()
                 .any(|name| ext.get(name).is_some_and(|v| !v.is_null()))
         })
+}
+
+/// A tenant key as the app sends it: base64url of 32 bytes.
+fn tenant_key_of(encoded: &str) -> Option<crate::store::crypto::TenantKey> {
+    decode(encoded)
+        .and_then(|k| <[u8; 32]>::try_from(k).ok())
+        .map(crate::store::crypto::TenantKey::from_bytes)
 }
 
 /// The token, and how long it has to be spent.
@@ -143,6 +206,9 @@ struct RequestOptionsResponse {
 
 struct PendingRegistration {
     state: PasskeyRegistration,
+    /// The WebAuthn user handle this registration was started with: what the
+    /// cosigner's polynomial is derived from.
+    handle: [u8; 16],
     expires: Instant,
 }
 
@@ -159,26 +225,37 @@ impl std::fmt::Debug for AuthEndpoints {
 
 pub struct AuthEndpoints {
     gate: Arc<Gate>,
-    credentials: Arc<CatalogCredentials>,
+    credentials: Arc<RegistryCredentials>,
     entropy: Arc<dyn nitro_nsm::Nsm>,
-    zfs: Arc<crate::zfs::Zfs>,
+    zfs: Arc<crate::store::zfs::Zfs>,
+    /// What the cosigner's DKG polynomials are derived from. `None`, and this
+    /// enclave makes no wallet keys.
+    operator_master: Option<Arc<OperatorMaster>>,
     registrations: Mutex<HashMap<[u8; 16], PendingRegistration>>,
 }
 
 impl AuthEndpoints {
     pub fn new(
         gate: Arc<Gate>,
-        credentials: Arc<CatalogCredentials>,
-        zfs: Arc<crate::zfs::Zfs>,
+        credentials: Arc<RegistryCredentials>,
+        zfs: Arc<crate::store::zfs::Zfs>,
         entropy: Arc<dyn nitro_nsm::Nsm>,
+        operator_master: Option<Arc<OperatorMaster>>,
     ) -> Self {
         AuthEndpoints {
             gate,
             credentials,
             entropy,
             zfs,
+            operator_master,
             registrations: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// What the DKG derives from, for the guest's signing to recompute dealt
+    /// shares with.
+    pub fn operator_master(&self) -> Option<&Arc<OperatorMaster>> {
+        self.operator_master.as_ref()
     }
 
     fn random_id(&self) -> anyhow::Result<[u8; 16]> {
@@ -238,6 +315,22 @@ impl AuthEndpoints {
         // there. Admission control over resource creation is what was given up
         // here; access control was not.
         let name = request.display_name.as_deref().unwrap_or("cosigner");
+        let Ok(handle) = self.random_id() else {
+            return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+        };
+        let handle = Uuid::from_bytes(handle);
+
+        // The cosigner commits first: its opening goes out with the challenge,
+        // before the wallet has made anything. It is derived from the handle
+        // alone, so nothing about the passkey is needed yet.
+        let dkg = match &self.operator_master {
+            None => None,
+            Some(_) => match self.opening(handle.as_bytes()).await {
+                Ok(opening) => Some(opening),
+                Err((status, message)) => return problem(status, message),
+            },
+        };
+
         // A discoverable platform passkey (`residentKey: required`,
         // `authenticatorAttachment: platform`), not webauthn-rs's default of
         // `residentKey: discouraged` with no attachment. Android below 14 takes
@@ -251,10 +344,7 @@ impl AuthEndpoints {
             .gate
             .webauthn()
             .start_google_passkey_in_google_password_manager_only_registration(
-                Uuid::new_v4(),
-                name,
-                name,
-                None,
+                handle, name, name, None,
             ) {
             Ok(pair) => pair,
             Err(e) => {
@@ -277,6 +367,7 @@ impl AuthEndpoints {
                 id,
                 PendingRegistration {
                     state,
+                    handle: *handle.as_bytes(),
                     expires: now + REGISTRATION_TTL,
                 },
             );
@@ -287,6 +378,7 @@ impl AuthEndpoints {
             &RegisterOptionsResponse {
                 registration_id: b64(&id),
                 options,
+                dkg,
             },
         )
     }
@@ -295,8 +387,22 @@ impl AuthEndpoints {
         &self,
         body: &[u8],
     ) -> hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody> {
-        let Ok(request) = serde_json::from_slice::<RegisterVerifyRequest>(body) else {
+        let Ok(raw) = serde_json::from_slice::<serde_json::Value>(body) else {
             return problem(hyper::StatusCode::BAD_REQUEST, "malformed request");
+        };
+        if raw.get("credential").is_some_and(carries_prf) {
+            return problem(
+                hyper::StatusCode::BAD_REQUEST,
+                "the credential carries a PRF result; send the tenant key, never the PRF output",
+            );
+        }
+        let Ok(request) = serde_json::from_value::<RegisterVerifyRequest>(raw) else {
+            return problem(hyper::StatusCode::BAD_REQUEST, "malformed request");
+        };
+        let tenant_key = match request.tenant_key.as_deref().map(tenant_key_of) {
+            None => None,
+            Some(Some(key)) => Some(key),
+            Some(None) => return problem(hyper::StatusCode::BAD_REQUEST, "malformed tenant key"),
         };
         let Some(id) = decode_id(&request.registration_id) else {
             return problem(hyper::StatusCode::BAD_REQUEST, "malformed registration id");
@@ -327,13 +433,57 @@ impl AuthEndpoints {
         let credential_id = request.credential.raw_id.as_ref().to_vec();
         let tenant_id = tenant_of(&credential_id);
 
+        // The whole DKG, in memory, before anything is kept: a registration
+        // whose wallet key cannot be made is refused whole. On an enclave that
+        // makes wallet keys this is the only place one is made, so it is not
+        // optional there.
+        let registered = match (&self.operator_master, &request.dkg) {
+            (None, None) => None,
+            (Some(_), None) => {
+                return problem(
+                    hyper::StatusCode::BAD_REQUEST,
+                    "the wallet key is made at registration: send the DKG",
+                );
+            }
+            (_, Some(_)) if tenant_key.is_none() => {
+                return problem(
+                    hyper::StatusCode::BAD_REQUEST,
+                    "the wallet key is kept on the tenant's pool: send the tenant key",
+                );
+            }
+            (_, Some(dkg)) => match self.register_dkg(tenant_id, &pending.handle, dkg).await {
+                Ok(registered) => Some(registered),
+                Err((status, message)) => return problem(status, message),
+            },
+        };
+
         // A record and a place for the tenant's pool, durable before this
-        // returns. The pool itself waits for the tenant's key, which comes
-        // with its first assertion.
+        // returns.
         if let Err(e) = self.credentials.register(passkey).await {
             tracing::error!(error = format!("{e:#}"), "storing a credential");
             return problem(hyper::StatusCode::CONFLICT, "could not register");
         }
+        // The pool, created with the key the new passkey's PRF gave. Failing
+        // from here leaves a passkey without a wallet key, which nothing makes
+        // later: its app registers another.
+        if let Some(key) = &tenant_key {
+            if let Err((status, message)) = self.attach(tenant_id, key).await {
+                return problem(status, message);
+            }
+        }
+        let dkg = match registered {
+            None => None,
+            Some(registered) => {
+                if let Err((status, message)) = self.keep(tenant_id, &registered.key).await {
+                    return problem(status, message);
+                }
+                Some(DkgAnswer {
+                    round1_package: registered.package.to_json(),
+                    round2_package: registered.dealt.to_json(),
+                    group_key: hex::encode(registered.key.group_key()),
+                })
+            }
+        };
 
         tracing::info!(
             tenant = %hex::encode(tenant_id),
@@ -345,6 +495,7 @@ impl AuthEndpoints {
             &RegisterVerifyResponse {
                 tenant_id: hex::encode(tenant_id),
                 credential_id: b64(&credential_id),
+                dkg,
             },
         )
     }
@@ -370,10 +521,7 @@ impl AuthEndpoints {
         let Some(challenge_id) = decode_id(&request.challenge_id) else {
             return problem(hyper::StatusCode::BAD_REQUEST, "malformed challenge id");
         };
-        let Some(tenant_key) = decode(&request.tenant_key)
-            .and_then(|k| <[u8; 32]>::try_from(k).ok())
-            .map(crate::store::crypto::TenantKey::from_bytes)
-        else {
+        let Some(tenant_key) = tenant_key_of(&request.tenant_key) else {
             return problem(hyper::StatusCode::BAD_REQUEST, "malformed tenant key");
         };
         let Some(assertion_json) = decode(&request.assertion) else {
@@ -498,7 +646,7 @@ impl AuthEndpoints {
         tenant: [u8; 16],
         key: &crate::store::crypto::TenantKey,
     ) -> Result<(), (hyper::StatusCode, &'static str)> {
-        let place = match self.zfs.catalog().tenant(tenant).await {
+        let place = match self.zfs.registry().tenant(tenant).await {
             Ok(Some(record)) => record.place,
             Ok(None) => {
                 tracing::error!(tenant = %hex::encode(tenant), "a verified tenant has no record");
@@ -510,19 +658,19 @@ impl AuthEndpoints {
             }
         };
         match self.zfs.attach(tenant, place, key).await {
-            Ok(crate::tenant::Arrival::New) => {
+            Ok(crate::store::zfs::Arrival::New) => {
                 tracing::info!(tenant = %hex::encode(tenant), "created a tenant's pool");
                 Ok(())
             }
-            Ok(crate::tenant::Arrival::Returning) => Ok(()),
-            Err(crate::zfs::AttachError::WrongKey) => {
+            Ok(crate::store::zfs::Arrival::Returning) => Ok(()),
+            Err(crate::store::zfs::AttachError::WrongKey) => {
                 tracing::warn!(
                     tenant = %hex::encode(tenant),
                     "a verified assertion came with a tenant key that does not open its pool"
                 );
                 Err((hyper::StatusCode::UNAUTHORIZED, "not approved"))
             }
-            Err(e @ crate::zfs::AttachError::Superseded(_)) => {
+            Err(e @ crate::store::zfs::AttachError::Superseded(_)) => {
                 tracing::error!(tenant = %hex::encode(tenant), error = %e, "refusing a tenant");
                 Err((
                     hyper::StatusCode::CONFLICT,
@@ -534,6 +682,88 @@ impl AuthEndpoints {
                 Err((hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable"))
             }
         }
+    }
+
+    /// The cosigner's opening for the registration whose user handle is
+    /// `handle`.
+    async fn opening(
+        &self,
+        handle: &[u8; 16],
+    ) -> Result<DkgOpening, (hyper::StatusCode, &'static str)> {
+        let master = self.master().await?;
+        let opening = crate::signer::dkg::opening(master, handle).map_err(|e| {
+            tracing::error!(error = %e, "making the cosigner's opening");
+            (hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable")
+        })?;
+        Ok(DkgOpening {
+            identifier: hex::encode(opening.identifier.serialize()),
+            verifying_key: hex::encode(opening.verifying_key.serialize()),
+            proof_of_knowledge: opening.proof.to_json_value(),
+        })
+    }
+
+    /// The cosigner's whole DKG for a registration, in memory: nothing is kept.
+    async fn register_dkg(
+        &self,
+        tenant: [u8; 16],
+        handle: &[u8; 16],
+        dkg: &DkgRequest,
+    ) -> Result<crate::signer::dkg::Registered, (hyper::StatusCode, &'static str)> {
+        use threshold::dkg::{Round1Package, Round2Package};
+        let malformed = (hyper::StatusCode::BAD_REQUEST, "malformed DKG package");
+        let wallet = Round1Package::from_json(&dkg.round1_package).map_err(|_| malformed)?;
+        let from_wallet = Round2Package::from_json(&dkg.round2_package).map_err(|_| malformed)?;
+        let master = self.master().await?;
+        crate::signer::dkg::register(master, handle, &wallet, &from_wallet).map_err(|e| {
+            tracing::info!(tenant = %hex::encode(tenant), reason = %e, "refused a DKG package");
+            (
+                hyper::StatusCode::BAD_REQUEST,
+                "the DKG package did not verify",
+            )
+        })
+    }
+
+    /// Keep a tenant's wallet key on its pool, which must be attached.
+    async fn keep(
+        &self,
+        tenant: [u8; 16],
+        key: &crate::signer::WalletKey,
+    ) -> Result<(), (hyper::StatusCode, &'static str)> {
+        match crate::signer::store(&self.zfs, tenant, key).await {
+            Ok(crate::signer::Stored::New) => {
+                tracing::info!(tenant = %hex::encode(tenant), "kept a wallet key");
+                Ok(())
+            }
+            Ok(crate::signer::Stored::Same) => Ok(()),
+            Ok(crate::signer::Stored::Different) => {
+                tracing::warn!(tenant = %hex::encode(tenant), "refused a second wallet key");
+                Err((
+                    hyper::StatusCode::CONFLICT,
+                    "this tenant already has another wallet key",
+                ))
+            }
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "keeping a wallet key");
+                Err((hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable"))
+            }
+        }
+    }
+
+    /// The operator master, or why there is none to derive from.
+    async fn master(&self) -> Result<&[u8; 32], (hyper::StatusCode, &'static str)> {
+        let Some(master) = &self.operator_master else {
+            return Err((
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                "this enclave makes no wallet keys",
+            ));
+        };
+        master.get().await.map_err(|e| {
+            tracing::warn!(error = format!("{e:#}"), "reading the operator master");
+            (
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                "the operator master is not provisioned yet",
+            )
+        })
     }
 
     async fn credentials_lookup(
@@ -594,18 +824,20 @@ mod tests {
     use crate::auth::challenge::{ChallengeStore, DEFAULT_CAPACITY, DEFAULT_TTL};
     use crate::auth::testing::{Relying, ORIGIN, RP_ID};
     use crate::auth::SoftwareAuthenticator;
-    use crate::zfs::Zfs;
+    use crate::store::zfs::Zfs;
     use http_body_util::BodyExt;
+
+    const MASTER: [u8; 32] = [7; 32];
 
     struct Fixture {
         endpoints: AuthEndpoints,
         fs: Arc<Zfs>,
-        credentials: Arc<CatalogCredentials>,
+        credentials: Arc<RegistryCredentials>,
     }
 
     async fn fixture() -> Fixture {
         let fs = Zfs::scratch().await;
-        let credentials = Arc::new(CatalogCredentials::new(fs.catalog().clone()));
+        let credentials = Arc::new(RegistryCredentials::new(fs.registry().clone()));
         let gate = Arc::new(Gate::new(
             Relying::new().webauthn,
             ChallengeStore::new(DEFAULT_TTL, DEFAULT_CAPACITY),
@@ -616,7 +848,13 @@ mod tests {
             ),
         ));
         let entropy: Arc<dyn nitro_nsm::Nsm> = Arc::new(nitro_nsm::fake::FakeNsm::new());
-        let endpoints = AuthEndpoints::new(gate, credentials.clone(), fs.clone(), entropy);
+        let endpoints = AuthEndpoints::new(
+            gate,
+            credentials.clone(),
+            fs.clone(),
+            entropy,
+            Some(Arc::new(OperatorMaster::fixed(MASTER))),
+        );
         Fixture {
             endpoints,
             fs,
@@ -638,25 +876,63 @@ mod tests {
         )
     }
 
-    /// Register a passkey the way a client does, and get its tenant back.
+    /// Register a passkey the way the app does, and get its tenant back.
     async fn register(f: &Fixture, auth: &SoftwareAuthenticator) -> (u16, serde_json::Value) {
+        let (status, body, _) = register_with(f, auth, |_| {}).await;
+        (status, body)
+    }
+
+    /// Register as the app does: on an enclave that makes wallet keys, the
+    /// cosigner's opening is checked and dealt to, and the wallet's round one
+    /// and share go with the credential and the tenant key. `edit` changes the
+    /// request first. Back: the answer, and the wallet when it dealt.
+    async fn register_with(
+        f: &Fixture,
+        auth: &SoftwareAuthenticator,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> (
+        u16,
+        serde_json::Value,
+        Option<crate::signer::testing::Wallet>,
+    ) {
         let (status, options) = post(f, "/auth/register/options", serde_json::json!({})).await;
         if status != 200 {
-            return (status, options);
+            return (status, options, None);
         }
         let challenge = options["options"]["publicKey"]["challenge"]
             .as_str()
             .expect("a challenge")
             .to_string();
-        post(
-            f,
-            "/auth/register/verify",
-            serde_json::json!({
-                "registration_id": options["registration_id"],
-                "credential": auth.register(&challenge, ORIGIN),
-            }),
-        )
-        .await
+        let mut body = serde_json::json!({
+            "registration_id": options["registration_id"],
+            "credential": auth.register(&challenge, ORIGIN),
+            "tenant_key": key_of(auth),
+        });
+        let mut wallet = None;
+        if let Some(opening) = options.get("dkg") {
+            let mut w = crate::signer::testing::Wallet::random();
+            let to_cosigner = w.deal(&opening_of(opening)).expect("the opening verifies");
+            body["dkg"] = serde_json::json!({
+                "round1_package": w.package.to_json(),
+                "round2_package": to_cosigner.to_json(),
+            });
+            wallet = Some(w);
+        }
+        edit(&mut body);
+        let (status, answer) = post(f, "/auth/register/verify", body).await;
+        (status, answer, wallet)
+    }
+
+    /// The cosigner's opening, off the wire.
+    fn opening_of(json: &serde_json::Value) -> crate::signer::dkg::Opening {
+        let mut vk = [0u8; 33];
+        hex::decode_to_slice(json["verifying_key"].as_str().unwrap(), &mut vk).unwrap();
+        crate::signer::dkg::Opening {
+            identifier: json["identifier"].as_str().unwrap().parse().unwrap(),
+            verifying_key: threshold::keys::VerifyingKey::deserialize(&vk).unwrap(),
+            proof: threshold::dkg::DkgSignature::from_json_value(&json["proof_of_knowledge"])
+                .unwrap(),
+        }
     }
 
     /// Options ask for a passkey sign-in can find. With webauthn-rs's defaults,
@@ -677,9 +953,10 @@ mod tests {
         assert_eq!(selection["userVerification"], "required", "{selection}");
     }
 
-    /// The whole registration path: options, response, tenant.
+    /// The whole registration path: options, response, a tenant, and its pool
+    /// created with the key the passkey's PRF gave.
     #[tokio::test]
-    async fn registration_creates_a_tenant() {
+    async fn registration_creates_a_tenant_and_its_pool() {
         let f = fixture().await;
         let auth = SoftwareAuthenticator::new(RP_ID);
         let (status, body) = register(&f, &auth).await;
@@ -702,8 +979,6 @@ mod tests {
             .expect("the credential was stored");
         assert_eq!(hex::encode(record.tenant_id), tenant_hex);
 
-        // A place for its pool, but no pool: that needs the tenant's key,
-        // which comes with its first assertion.
         let mut tenant = [0u8; 16];
         hex::decode_to_slice(tenant_hex, &mut tenant).unwrap();
         assert!(f
@@ -712,8 +987,15 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        assert!(!f.fs.is_attached(tenant));
-        assert!(!f.fs.tenant_path(tenant).is_dir());
+        assert!(f.fs.is_attached(tenant));
+        assert!(f.fs.attached_dir(tenant).unwrap().is_dir());
+
+        // Approvals find it open with the same key.
+        for _ in 0..2 {
+            let (status, body) = verify(&f, &auth, key_of(&auth), |_| {}).await;
+            assert_eq!(status, 200, "{body}");
+            assert!(body["token"].is_string());
+        }
     }
 
     /// One interaction's approval: options, an assertion, and verify with
@@ -723,6 +1005,17 @@ mod tests {
         auth: &SoftwareAuthenticator,
         tenant_key: Option<String>,
         tamper: impl FnOnce(&mut serde_json::Value),
+    ) -> (u16, serde_json::Value) {
+        approve(f, auth, tenant_key, tamper, None).await
+    }
+
+    /// The same, carrying `dkg` when given.
+    async fn approve(
+        f: &Fixture,
+        auth: &SoftwareAuthenticator,
+        tenant_key: Option<String>,
+        tamper: impl FnOnce(&mut serde_json::Value),
+        dkg: Option<serde_json::Value>,
     ) -> (u16, serde_json::Value) {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let (status, options) = post(
@@ -748,31 +1041,157 @@ mod tests {
         if let Some(key) = tenant_key {
             body["tenant_key"] = key.into();
         }
+        if let Some(dkg) = dkg {
+            body["dkg"] = dkg;
+        }
         post(f, "/auth/request/verify", body).await
+    }
+
+    /// The whole DKG rides registration: the wallet finishes against the
+    /// cosigner's round one, which opens with what the opening committed to,
+    /// both sides agree on the key, and it is kept on the new pool with the
+    /// handle its dealt share is recomputed from.
+    #[tokio::test]
+    async fn the_whole_dkg_rides_registration() {
+        use threshold::dkg::{Round1Package, Round2Package};
+        let f = fixture().await;
+        let auth = SoftwareAuthenticator::new(RP_ID);
+        let tenant = tenant_of(auth.credential_id());
+        let (status, body, wallet) = register_with(&f, &auth, |_| {}).await;
+        assert_eq!(status, 200, "{body}");
+        let wallet = wallet.expect("this enclave makes wallet keys");
+
+        let dkg = &body["dkg"];
+        let cosigner = Round1Package::from_json(dkg["round1_package"].as_str().unwrap()).unwrap();
+        let dealt = Round2Package::from_json(dkg["round2_package"].as_str().unwrap()).unwrap();
+        let key = wallet
+            .finish(&cosigner, &dealt)
+            .expect("the cosigner's round one is the one it opened with");
+        assert_eq!(dkg["group_key"], hex::encode(key.verifying_key.serialize()));
+
+        let kept = crate::signer::load(&f.fs, tenant)
+            .await
+            .unwrap()
+            .expect("a key");
+        assert_eq!(kept.group_key(), key.verifying_key.serialize());
+        assert_eq!(
+            *crate::signer::dkg::dealt_share(&MASTER, kept.handle(), wallet.id()).unwrap(),
+            threshold::scalar::scalar_to_bytes(&dealt.secret_share)
+        );
+    }
+
+    /// A registration whose wallet key cannot be made is refused whole: no
+    /// passkey is kept and no pool is made.
+    #[tokio::test]
+    async fn a_registration_whose_dkg_fails_is_refused_whole() {
+        use threshold::dkg::{Round1Package, Round2Package};
+        fn edit_package(
+            b: &mut serde_json::Value,
+            which: &str,
+            forge: impl FnOnce(&str) -> String,
+        ) {
+            let edited = forge(b["dkg"][which].as_str().unwrap());
+            b["dkg"][which] = edited.into();
+        }
+        type Edit = Box<dyn FnOnce(&mut serde_json::Value)>;
+        let f = fixture().await;
+        let edits: Vec<Edit> = vec![
+            Box::new(|b| {
+                b.as_object_mut().unwrap().remove("dkg");
+            }),
+            Box::new(|b| {
+                b.as_object_mut().unwrap().remove("tenant_key");
+            }),
+            Box::new(|b| b["dkg"]["round1_package"] = "not a package".into()),
+            Box::new(|b| {
+                edit_package(b, "round2_package", |json| {
+                    let mut forged = Round2Package::from_json(json).unwrap();
+                    forged.secret_share += k256::Scalar::ONE;
+                    forged.to_json()
+                })
+            }),
+            Box::new(|b| {
+                edit_package(b, "round1_package", |json| {
+                    let mut forged = Round1Package::from_json(json).unwrap();
+                    forged.proof_of_knowledge.z += k256::Scalar::ONE;
+                    forged.to_json()
+                })
+            }),
+        ];
+        for (i, edit) in edits.into_iter().enumerate() {
+            let auth = SoftwareAuthenticator::new(RP_ID);
+            let (status, body, _) = register_with(&f, &auth, edit).await;
+            assert_eq!(status, 400, "case {i}: {body}");
+            use crate::auth::gate::CredentialStore;
+            assert!(f
+                .credentials
+                .lookup(auth.credential_id())
+                .await
+                .unwrap()
+                .is_none());
+            assert!(!f.fs.is_attached(tenant_of(auth.credential_id())));
+        }
+    }
+
+    /// With no operator master there is nothing to derive from: registration
+    /// offers no opening and makes no wallet key, and one that brings a DKG
+    /// anyway is refused.
+    #[tokio::test]
+    async fn without_an_operator_master_registration_makes_no_wallet_key() {
+        let mut f = fixture().await;
+        f.endpoints.operator_master = None;
+        let (_, options) = post(&f, "/auth/register/options", serde_json::json!({})).await;
+        assert!(options.get("dkg").is_none(), "{options}");
+
+        let auth = SoftwareAuthenticator::new(RP_ID);
+        let (status, body, wallet) = register_with(&f, &auth, |_| {}).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(wallet.is_none() && body.get("dkg").is_none());
+
+        let mut w = crate::signer::testing::Wallet::random();
+        let share = w
+            .deal(&crate::signer::dkg::opening(&MASTER, &[0; 16]).unwrap())
+            .unwrap();
+        let dkg = serde_json::json!({
+            "round1_package": w.package.to_json(),
+            "round2_package": share.to_json(),
+        });
+        let auth = SoftwareAuthenticator::new(RP_ID);
+        let (status, body, _) = register_with(&f, &auth, |b| b["dkg"] = dkg).await;
+        assert_eq!(status, 503, "{body}");
+    }
+
+    /// The PRF output is refused at registration too: with it and the share
+    /// the cosigner deals, an enclave would hold the whole wallet key.
+    #[tokio::test]
+    async fn a_credential_carrying_a_prf_result_is_refused() {
+        let f = fixture().await;
+        let auth = SoftwareAuthenticator::new(RP_ID);
+        let (status, body, _) = register_with(&f, &auth, |b| {
+            b["credential"]["clientExtensionResults"] =
+                serde_json::json!({ "prf": { "results": { "first": "AAAA" } } });
+        })
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert!(!f.fs.is_attached(tenant_of(auth.credential_id())));
+    }
+
+    /// An approval makes no wallet key: a `dkg` field there means nothing now,
+    /// and is refused rather than ignored.
+    #[tokio::test]
+    async fn an_approval_carries_no_dkg() {
+        let f = fixture().await;
+        let auth = SoftwareAuthenticator::new(RP_ID);
+        assert_eq!(register(&f, &auth).await.0, 200);
+        let dkg = serde_json::json!({ "round1_package": "{}", "round2_package": "{}" });
+        let (status, body) = approve(&f, &auth, key_of(&auth), |_| {}, Some(dkg)).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.get("token").is_none());
     }
 
     fn key_of(auth: &SoftwareAuthenticator) -> Option<String> {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         Some(b64.encode(auth.tenant_key().expose_secret()))
-    }
-
-    /// The first approval creates the tenant's pool with the key it carries;
-    /// later ones find it open.
-    #[tokio::test]
-    async fn the_first_approval_creates_the_pool_with_its_key() {
-        let f = fixture().await;
-        let auth = SoftwareAuthenticator::new(RP_ID);
-        assert_eq!(register(&f, &auth).await.0, 200);
-        let tenant = tenant_of(auth.credential_id());
-
-        let (status, body) = verify(&f, &auth, key_of(&auth), |_| {}).await;
-        assert_eq!(status, 200, "{body}");
-        assert!(body["token"].is_string());
-        assert!(f.fs.is_attached(tenant));
-        assert!(f.fs.attached_dir(tenant).unwrap().is_dir());
-
-        let (again, body) = verify(&f, &auth, key_of(&auth), |_| {}).await;
-        assert_eq!(again, 200, "{body}");
     }
 
     /// A key that does not open the pool earns no token, though the assertion
@@ -803,7 +1222,6 @@ mod tests {
             verify(&f, &auth, Some(b64.encode([1; 16])), |_| {}).await.0,
             400
         );
-        assert!(!f.fs.is_attached(tenant_of(auth.credential_id())));
     }
 
     /// The PRF output itself is refused wherever an assertion carries it, so a
@@ -833,7 +1251,6 @@ mod tests {
             .await;
             assert_eq!(status, 400, "{field}: {body}");
         }
-        assert!(!f.fs.is_attached(tenant_of(auth.credential_id())));
     }
 
     /// Registration is open, and each one stands alone: a second, unrelated

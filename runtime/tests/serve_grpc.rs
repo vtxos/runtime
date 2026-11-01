@@ -143,7 +143,7 @@ async fn grpc_handle() -> ServeHandle {
     let fs = enclave_runtime::Zfs::scratch().await;
 
     let (logs, _collector) =
-        enclave_runtime::guest_io::start(Arc::new(enclave_runtime::TracingLogSink));
+        enclave_runtime::telemetry::logs::start(Arc::new(enclave_runtime::TracingLogSink));
     let guest = GuestEnvironment::new(
         fs,
         Arc::new(HostClock),

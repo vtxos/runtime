@@ -259,7 +259,7 @@ async fn a_new_release_reads_a_tenants_data_once_its_owner_sends_the_key() {
 
     // Release A: the tenant signs in, writes, and has background work.
     let a = store.boot(&TestNsm::running(0xaa, GUEST_A)).await.unwrap();
-    let place = a.zfs.catalog().claim_place(ALICE).await.unwrap();
+    let place = a.zfs.registry().claim_place(ALICE).await.unwrap();
     a.zfs.attach(ALICE, place, &key).await.unwrap();
     std::fs::write(a.zfs.attached_dir(ALICE).unwrap().join("ledger"), b"42").unwrap();
     a.zfs.anchor_tenant(ALICE).await.unwrap();

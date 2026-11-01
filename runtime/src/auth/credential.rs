@@ -1,6 +1,6 @@
 //! Registered passkeys, and the tenants they speak for.
 //!
-//! Each tenant's record is in the roots bucket ([`crate::catalog`]), written
+//! Each tenant's record is in the roots bucket ([`crate::store::registry`]), written
 //! once under Object Lock and read back as the version that write created —
 //! outside every pool and every release, so a new release recognises every
 //! passkey the last one did. No guest can name it.
@@ -37,18 +37,18 @@ use anyhow::{Context, Result};
 use webauthn_rs::prelude::Passkey;
 
 use crate::auth::gate::{CredentialRecord, CredentialStore};
-use crate::catalog::{Catalog, TenantRecord};
+use crate::store::registry::{Registry, TenantRecord};
 
-/// Credentials in the catalog, with the counters in memory.
-pub struct CatalogCredentials {
-    catalog: Arc<Catalog>,
+/// Credentials in the registry, with the counters in memory.
+pub struct RegistryCredentials {
+    registry: Arc<Registry>,
     counters: Mutex<HashMap<Vec<u8>, u32>>,
 }
 
-impl CatalogCredentials {
-    pub fn new(catalog: Arc<Catalog>) -> Self {
-        CatalogCredentials {
-            catalog,
+impl RegistryCredentials {
+    pub fn new(registry: Arc<Registry>) -> Self {
+        RegistryCredentials {
+            registry,
             counters: Mutex::new(HashMap::new()),
         }
     }
@@ -59,7 +59,7 @@ impl CatalogCredentials {
     /// would look like. Durable before it returns.
     pub async fn register(&self, passkey: Passkey) -> Result<TenantRecord> {
         let tenant = tenant_of(passkey.cred_id().as_ref());
-        self.catalog
+        self.registry
             .register(tenant, passkey)
             .await
             .context("registering a passkey")
@@ -67,13 +67,16 @@ impl CatalogCredentials {
 
     /// Mark a credential unusable, for good.
     pub async fn revoke(&self, credential_id: &[u8]) -> Result<()> {
-        self.catalog.revoke(tenant_of(credential_id)).await
+        self.registry.revoke(tenant_of(credential_id)).await
     }
 
     /// Where the credential's tenant's pool is.
-    pub async fn place(&self, credential_id: &[u8]) -> Result<Option<crate::catalog::Place>> {
+    pub async fn place(
+        &self,
+        credential_id: &[u8],
+    ) -> Result<Option<crate::store::registry::Place>> {
         Ok(self
-            .catalog
+            .registry
             .tenant(tenant_of(credential_id))
             .await?
             .map(|r| r.place))
@@ -81,10 +84,10 @@ impl CatalogCredentials {
 }
 
 #[async_trait::async_trait]
-impl CredentialStore for CatalogCredentials {
+impl CredentialStore for RegistryCredentials {
     async fn lookup(&self, credential_id: &[u8]) -> Result<Option<CredentialRecord>> {
         let tenant = tenant_of(credential_id);
-        let Some(record) = self.catalog.tenant(tenant).await? else {
+        let Some(record) = self.registry.tenant(tenant).await? else {
             return Ok(None);
         };
         // A different credential whose id happens to hash to this tenant is
@@ -92,7 +95,7 @@ impl CredentialStore for CatalogCredentials {
         if record.passkey.cred_id().as_ref() != credential_id {
             return Ok(None);
         }
-        let active = !self.catalog.revoked(tenant).await?;
+        let active = !self.registry.revoked(tenant).await?;
         let counter = self
             .counters
             .lock()
@@ -147,17 +150,17 @@ mod tests {
     use crate::auth::SoftwareAuthenticator;
     use crate::store::backend::memory::MemoryBackend;
     use crate::store::backend::Backend;
-    use crate::zfs::{Disk, Zfs};
+    use crate::store::zfs::{Disk, Zfs};
 
     async fn registered() -> (
         Arc<dyn Backend>,
-        CatalogCredentials,
+        RegistryCredentials,
         SoftwareAuthenticator,
         [u8; 16],
     ) {
         let roots: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let fs = Zfs::scratch_on(&Disk::scratch().unwrap(), roots.clone()).await;
-        let store = CatalogCredentials::new(fs.catalog().clone());
+        let store = RegistryCredentials::new(fs.registry().clone());
         let auth = SoftwareAuthenticator::new(RP_ID);
         store
             .register(Relying::new().register(&auth))
@@ -168,9 +171,9 @@ mod tests {
     }
 
     /// A fresh enclave over the same bucket — a restart, or a new release.
-    async fn after(roots: Arc<dyn Backend>) -> CatalogCredentials {
+    async fn after(roots: Arc<dyn Backend>) -> RegistryCredentials {
         let fs = Zfs::scratch_on(&Disk::scratch().unwrap(), roots).await;
-        CatalogCredentials::new(fs.catalog().clone())
+        RegistryCredentials::new(fs.registry().clone())
     }
 
     /// A record written by one enclave is readable by the next: the point of

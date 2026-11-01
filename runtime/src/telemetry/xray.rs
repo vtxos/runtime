@@ -1,7 +1,7 @@
 //! Guest spans as AWS X-Ray traces: the segment tree for one invocation, and the forwarder that
 //! ships finished ones with `PutTraceSegments`.
 //!
-//! The forwarder is the guest-log forwarder in miniature (see [`crate::guest_io::cloudwatch`]): a
+//! The forwarder is the guest-log forwarder in miniature (see [`crate::telemetry::cloudwatch`]): a
 //! bounded queue a guest call never waits on, batches sealed by size or by a linger timer, a few
 //! backed-off retries for what may heal, and drops counted and reported in aggregate rather than
 //! one line each.
@@ -382,7 +382,7 @@ fn clip_fields(fields: Vec<Field>) -> Vec<(String, String)> {
 /// An id X-Ray only needs to be unique within a trace — not a secret.
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    if getrandom::fill(&mut buf).is_err() {
+    if crate::random::try_fill(&mut buf).is_err() {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let n = NEXT.fetch_add(1, Ordering::Relaxed).to_le_bytes();
         for (i, b) in buf.iter_mut().enumerate() {
@@ -607,7 +607,7 @@ pub struct XrayDestination {
 
 impl XrayDestination {
     /// Built the way the guest-log client is (see
-    /// [`crate::guest_io::cloudwatch::CloudWatchDestination::connect`]): the default credential
+    /// [`crate::telemetry::cloudwatch::CloudWatchDestination::connect`]): the default credential
     /// chain through gvproxy to the parent's role, the region given to the chain as well as the
     /// client, the SDK's own retries off in favour of the forwarder's, and short timeouts.
     pub async fn connect(config: &XrayConfig) -> Self {
@@ -732,7 +732,7 @@ mod tests {
 
     #[test]
     fn closing_twice_is_once_and_finishing_closes_what_was_left_open() {
-        let mut trace = Trace::new("aa".into(), Invocation::Message);
+        let mut trace = Trace::new("aa".into(), Invocation::Task);
         let span = trace.open(Level::Info, "s".into(), vec![]).unwrap();
         assert!(trace.close(span).is_some());
         assert!(trace.close(span).is_none());
