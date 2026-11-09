@@ -12,8 +12,8 @@ use enclave_runtime::boot::{sealed_key_key, BootConfig, BootMode, Pair};
 use enclave_runtime::store::backend::{
     memory::MemoryBackend, Backend, ListBlobsInput, PutBlobInput,
 };
-use enclave_runtime::store::crypto::TenantKey;
 use enclave_runtime::store::MasterSecret;
+use enclave_runtime::tenant::TenantKey;
 use enclave_runtime::{AttachError, Disk, MountConfig, Release, StaticKey};
 use nitro_nsm::{AttestationRequest, Nsm, Pcr, PCR_ZERO};
 

@@ -37,7 +37,6 @@ pub mod challenge;
 pub mod credential;
 pub mod gate;
 pub mod routes;
-pub mod tenant_key;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 mod token;
@@ -45,7 +44,7 @@ mod token;
 #[cfg(any(test, feature = "testing"))]
 pub use authenticator::SoftwareAuthenticator;
 pub use challenge::{ChallengeError, ChallengeStore, DEFAULT_CAPACITY, DEFAULT_TTL};
-pub use credential::{tenant_of, RegistryCredentials};
+pub use credential::RegistryCredentials;
 pub use gate::{
     Authenticated, CredentialRecord, CredentialStore, Denied, Gate, Verified, AUTHORIZATION_HEADER,
     AUTH_HEADERS,

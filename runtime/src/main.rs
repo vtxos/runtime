@@ -297,6 +297,25 @@ struct Cli {
     #[arg(long, env = "ENCLAVE_METRICS_NAMESPACE")]
     metrics_namespace: Option<String>,
 
+    /// The DynamoDB table background tasks are recorded in. With the queue, the schedule group
+    /// and the scheduler role, it is where a guest's tasks are scheduled: all four, or none.
+    /// None leaves a testing build's tasks in memory and turns a production build's off.
+    #[arg(long, env = "ENCLAVE_TASK_TABLE")]
+    task_table: Option<String>,
+
+    /// The SQS queue due tasks are delivered on.
+    #[arg(long, env = "ENCLAVE_TASK_QUEUE_URL")]
+    task_queue_url: Option<String>,
+
+    /// The EventBridge Scheduler group tasks are scheduled in.
+    #[arg(long, env = "ENCLAVE_TASK_SCHEDULE_GROUP")]
+    task_schedule_group: Option<String>,
+
+    /// The role EventBridge Scheduler takes to send to the queue. The instance role needs
+    /// `iam:PassRole` on it.
+    #[arg(long, env = "ENCLAVE_TASK_SCHEDULER_ROLE_ARN")]
+    task_scheduler_role_arn: Option<String>,
+
     /// Report on the clock and entropy source and exit, without mounting or
     /// running anything. For diagnosing a deployment.
     #[arg(long, alias = "clock-check")]
@@ -403,6 +422,11 @@ struct Testing {
     #[arg(long, env = "ENCLAVE_METRICS_ENDPOINT")]
     metrics_endpoint: Option<String>,
 
+    /// Point the task clients — DynamoDB, EventBridge Scheduler, SQS — at one local endpoint.
+    /// An `http://` endpoint hands task metadata to whatever is listening, in clear.
+    #[arg(long, env = "ENCLAVE_TASK_ENDPOINT")]
+    task_endpoint: Option<String>,
+
     /// Point the push client at a stub: an `http://` endpoint hands wake signals to
     /// whatever is listening, and requests to it are signed with a placeholder
     /// rather than the instance's role.
@@ -450,6 +474,7 @@ impl Testing {
             guest_log_endpoint: None,
             xray_endpoint: None,
             metrics_endpoint: None,
+            task_endpoint: None,
             push_endpoint: None,
             cosign_attestations: false,
         }
@@ -494,6 +519,53 @@ impl Cli {
             region: self.region.clone(),
             endpoint: self.testing.guest_log_endpoint.clone(),
         })
+    }
+
+    /// Where background tasks are scheduled: all four settings, or none.
+    fn background_tasks(&self) -> Result<Option<enclave_runtime::tasks::BackgroundTasks>> {
+        let settings = [
+            ("ENCLAVE_TASK_TABLE", nonempty(&self.task_table)),
+            ("ENCLAVE_TASK_QUEUE_URL", nonempty(&self.task_queue_url)),
+            (
+                "ENCLAVE_TASK_SCHEDULE_GROUP",
+                nonempty(&self.task_schedule_group),
+            ),
+            (
+                "ENCLAVE_TASK_SCHEDULER_ROLE_ARN",
+                nonempty(&self.task_scheduler_role_arn),
+            ),
+        ];
+        let missing: Vec<&str> = settings
+            .iter()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| *name)
+            .collect();
+        if missing.len() == settings.len() {
+            #[cfg(any(test, feature = "testing"))]
+            return Ok(Some(Default::default()));
+            #[cfg(not(any(test, feature = "testing")))]
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            missing.is_empty(),
+            "background tasks need {}",
+            missing.join(", ")
+        );
+        let [table, queue_url, schedule_group, scheduler_role_arn] =
+            settings.map(|(_, value)| value.expect("checked above"));
+        Ok(Some(enclave_runtime::tasks::BackgroundTasks {
+            limits: Default::default(),
+            backend: enclave_runtime::tasks::TaskBackend::Aws(
+                enclave_runtime::tasks::TasksConfig {
+                    table,
+                    queue_url,
+                    schedule_group,
+                    scheduler_role_arn,
+                    region: self.region.clone(),
+                    endpoint: self.testing.task_endpoint.clone(),
+                },
+            ),
+        }))
     }
 
     fn mount_config(&self) -> Result<MountConfig> {
@@ -999,7 +1071,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
             notify,
             telemetry,
             // Whether tasks run is the guest's to say, by exporting `run-task`.
-            background_tasks: Some(Default::default()),
+            background_tasks: cli.background_tasks()?,
             addr: HTTP_LISTEN,
             certificate: None,
             acme,
@@ -1206,6 +1278,7 @@ mod tests {
         assert!(production.endpoint.is_none() && production.access_key_id.is_none());
         assert!(production.acme_directory.is_none() && production.acme_ca.is_none());
         assert!(production.push_endpoint.is_none() && production.guest_log_endpoint.is_none());
+        assert!(production.task_endpoint.is_none());
         assert!(!production.cosign_attestations);
 
         // And a testing build's defaults are the same, so an emulator departs

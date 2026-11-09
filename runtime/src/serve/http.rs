@@ -40,9 +40,9 @@ use nitro_nsm::Nsm;
 /// How the guest is served.
 #[derive(Debug)]
 pub struct ServeConfig {
-    /// Limits for tenant-bound durable tasks, which run when the guest exports `run-task`.
-    /// `None` turns them off whatever the guest exports.
-    pub background_tasks: Option<crate::tasks::TaskLimits>,
+    /// Tenant-bound durable tasks, which run when the guest exports `run-task`: their limits,
+    /// and where they are scheduled. `None` turns them off whatever the guest exports.
+    pub background_tasks: Option<crate::tasks::BackgroundTasks>,
     /// Opt-in push notifications. The registry and the forwarder are opened
     /// here rather than by the caller, because both need the mounted
     /// filesystem and the trusted clock, and this is where those exist.
@@ -358,25 +358,14 @@ impl ServeHandle {
         self
     }
 
-    /// One task run: a fresh instance, under the same tenant lock as requests.
-    pub(crate) async fn run_background(
+    /// One task attempt: a fresh instance, its `run-task`, and then whatever it wrote anchored.
+    async fn run_task(
         &self,
         queue: &Arc<crate::tasks::TaskQueue>,
-        task: &crate::tasks::Task,
-    ) -> Result<Option<Vec<u8>>> {
-        let tenancy = self
-            .tenancy
-            .as_ref()
-            .context("background tasks require tenants")?;
-        let checkout = tenancy.pool.checkout(&task.tenant);
-        let Ok(_guard) = checkout.slot().lock().clone().try_lock_owned() else {
-            return Ok(None);
-        };
-        if !queue.begin(task).await? {
-            return Ok(Some(Vec::new()));
-        }
+        job: &crate::tasks::Job,
+    ) -> Result<Vec<u8>> {
         let work = async {
-            let state = self.tenant_state(task.tenant).await?;
+            let state = self.tenant_state(job.tenant).await?;
             let mut store = Store::new(self.pre.engine(), state);
             // Yield every tick, even in CPU-only loops, so the wall deadline
             // can cancel both guest code and async host calls.
@@ -385,7 +374,7 @@ impl ServeHandle {
             let instance = self.background_pre.instantiate_async(&mut store).await?;
             store.data_mut().tasks = Some(crate::tasks::TaskContext {
                 queue: queue.clone(),
-                tenant: task.tenant,
+                tenant: job.tenant,
                 interactive: false,
             });
             store.data_mut().notify =
@@ -393,41 +382,49 @@ impl ServeHandle {
                     .as_ref()
                     .map(|notifier| crate::notify::NotifyContext {
                         notifier: notifier.clone(),
-                        tenant: task.tenant,
+                        tenant: job.tenant,
                         interactive: false,
                     });
             store.data_mut().telemetry = Some(
                 self.telemetry
-                    .context(task.tenant, crate::telemetry::Invocation::Task),
+                    .context(job.tenant, crate::telemetry::Invocation::Task),
             );
             let run = instance
                 .get_typed_func::<(String, Vec<u8>), (std::result::Result<Vec<u8>, String>,)>(
                     &mut store, "run-task",
                 )?;
             let (result,) = run
-                .call_async(&mut store, (task.run_id(), task.payload.clone()))
+                .call_async(&mut store, (job.run_id(), job.payload.clone()))
                 .await?;
             let bytes = result.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(bytes.len() <= 64 * 1024, "task result exceeds 64 KiB");
-            // Anchored with the outcome, by the queue's `finish`.
-            Ok(Some(bytes))
+            Ok(bytes)
         };
-        tokio::time::timeout(queue.limits.timeout, work)
+        let outcome = tokio::time::timeout(queue.limits.timeout, work)
             .await
-            .context("background task deadline exceeded")?
+            .context("background task deadline exceeded")
+            .and_then(|outcome| outcome);
+        // Whatever the guest wrote reaches the anchor before its outcome is recorded or anyone
+        // is woken, failed attempts included: they may have written too.
+        self.guest
+            .zfs()
+            .anchor_tenant(job.tenant)
+            .await
+            .context("anchoring a task's writes")?;
+        outcome
     }
 
-    /// Deliver a tenant's staged wakes — for the task worker, once `finish` has
-    /// anchored the outcome the wake announces.
-    pub(crate) fn deliver_wakes(&self, tenant: [u8; 16]) {
+    /// Deliver a tenant's staged wakes — for the task worker, once the outcome the
+    /// wake announces is recorded.
+    fn deliver_wakes(&self, tenant: [u8; 16]) {
         if let Some(notify) = &self.notify {
             notify.deliver_staged(tenant);
         }
     }
 
     /// Drop a tenant's staged wakes unsent — if the outcome could not be
-    /// anchored.
-    pub(crate) fn drop_wakes(&self, tenant: [u8; 16]) {
+    /// recorded.
+    fn drop_wakes(&self, tenant: [u8; 16]) {
         if let Some(notify) = &self.notify {
             notify.drop_staged(tenant);
         }
@@ -795,6 +792,41 @@ impl ServeHandle {
     }
 }
 
+/// A tenant's turn: its lock, and the checkout that keeps its slot from being reused while the
+/// lock is held. Dropped in that order.
+struct TenantTurn {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _checkout: crate::serve::pool::Checkout,
+}
+
+#[async_trait::async_trait]
+impl crate::tasks::Runner for ServeHandle {
+    fn turn(&self, tenant: [u8; 16]) -> Option<Box<dyn Send>> {
+        let checkout = self.tenancy.as_ref()?.pool.checkout(&tenant);
+        let guard = checkout.slot().lock().clone().try_lock_owned().ok()?;
+        Some(Box::new(TenantTurn {
+            _guard: guard,
+            _checkout: checkout,
+        }))
+    }
+
+    async fn run(
+        &self,
+        queue: &Arc<crate::tasks::TaskQueue>,
+        job: &crate::tasks::Job,
+    ) -> Result<Vec<u8>> {
+        self.run_task(queue, job).await
+    }
+
+    fn wakes(&self, tenant: [u8; 16], deliver: bool) {
+        if deliver {
+            self.deliver_wakes(tenant);
+        } else {
+            self.drop_wakes(tenant);
+        }
+    }
+}
+
 /// Wait for the response head, and leave the guest task to finish the body.
 ///
 /// Returns as soon as the guest has set a response. Deliberately: the body may
@@ -920,7 +952,7 @@ fn resumed<S>(stream: &tokio_rustls::server::TlsStream<S>, peer: SocketAddr) -> 
 
 /// The tenant callers without a gate share. A tenant id is a hash of a
 /// credential id, so none is ever all zeroes.
-use crate::store::registry::ANONYMOUS;
+use crate::tenant::ANONYMOUS;
 
 /// Hold a response's end until what produced it is anchored, so no client can
 /// see it finish before the writes it may describe would survive the host.
@@ -1387,15 +1419,16 @@ impl Server {
 
     /// Accept connections until the process is stopped.
     pub async fn run(self) -> Result<()> {
-        // Dropping the server cancels the scheduler and its owned worker set.
-        // A scheduler storage error stops serving instead of losing wakeups.
+        // Dropping the server cancels the task consumer and its owned worker set. The
+        // consumer only ends if it cannot go on, and then serving stops with it.
         let mut scheduler = tokio::task::JoinSet::new();
         if let Some(queue) = &self.guest.tasks {
             anyhow::ensure!(
                 self.gate.is_some(),
                 "background tasks require authentication"
             );
-            scheduler.spawn(queue.clone().run(self.guest.clone()));
+            let runner: Arc<dyn crate::tasks::Runner> = self.guest.clone();
+            scheduler.spawn(queue.clone().run(runner));
         }
         let listener = TcpListener::bind(self.addr)
             .await
@@ -1558,17 +1591,17 @@ pub async fn serve_component(
         .component()
         .get_export_index(None, "run-task")
         .is_some();
-    if let Some(limits) = config.background_tasks.take().filter(|_| runs_tasks) {
+    if let Some(tasks) = config.background_tasks.take().filter(|_| runs_tasks) {
         anyhow::ensure!(
             config.authentication.is_some(),
             "the guest exports run-task, and background tasks require authentication"
         );
-        let queue = crate::tasks::TaskQueue::open(
-            handle.environment().zfs().clone(),
-            handle.environment().clock().clone(),
-            limits,
-        )
-        .await?;
+        let queue = tasks
+            .open(
+                handle.environment().zfs().clone(),
+                handle.environment().clock().clone(),
+            )
+            .await?;
         handle = handle.with_tasks(queue)?;
     }
     let mut notify_forwarder = None;

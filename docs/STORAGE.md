@@ -10,7 +10,7 @@ This replaced the runtime's original storage engine, s3fs: a copy-on-write files
 
 ```text
   /pools/<pool_id>/data          a tenant's pool, mounted here: the guest's only preopen
-  /pools/<pool_id>/runtime       the tenant's tasks and devices
+  /pools/<pool_id>/runtime       the tenant's devices
   pool "p<pool_id>" (region N)   a tenant's pool
   /dev/mapper/zcrypt-<id>        per-region plain dm-crypt, aes-xts-plain64, a key per pool
   /dev/nbd0                      the parent's disk, cut into equal regions: NBD over vsock 10809
@@ -18,7 +18,7 @@ This replaced the runtime's original storage engine, s3fs: a copy-on-write files
 
 ### A pool per tenant
 
-The disk is divided into fixed, 4 KiB-aligned regions (`region_bounds` in [`zfs.rs`](../runtime/src/store/zfs.rs)). Each tenant is given one when it registers. A region is mapped as its own `dm-crypt` device, `zcrypt-<pool_id>`. On it sits one pool, `p<pool_id>`, with a `data` dataset the guest sees as `/` and a `runtime` dataset for the tenant's tasks and devices.
+The disk is divided into fixed, 4 KiB-aligned regions (`region_bounds` in [`zfs.rs`](../runtime/src/store/zfs.rs)). Each tenant is given one when it registers. A region is mapped as its own `dm-crypt` device, `zcrypt-<pool_id>`. On it sits one pool, `p<pool_id>`, with a `data` dataset the guest sees as `/` and a `runtime` dataset for the tenant's devices. Its background tasks are recorded in DynamoDB, signed and sealed with its key ([BACKGROUND_TASKS.md](BACKGROUND_TASKS.md)).
 
 **Keyed by the tenant.** A pool's dm-crypt key is `HKDF(K_t, fs_uuid, "aegira/pool/dmcrypt/v1" ‖ pool_id)` and its anchor-signing key `HKDF(K_t, fs_uuid, "aegira/pool/anchor-sign/v1" ‖ pool_id)`. `K_t` is the **tenant key**: the owner's app derives it from its passkey's PRF output and sends it with an approval ([client integration](CLIENT_INTEGRATION.md#the-tenant-key)), only to a release whose PCR0 and PCR16 it approves. So a pool is **attached** the first time its owner signs in to a release, and not before. Anchor 0 is written once and locked, so it pins `K_t` for good: a wrong key fails "signed by an unexpected key" before anything is mapped. Every release opens the pool with the right key, so nothing is migrated when the runtime or the guest changes.
 
@@ -95,7 +95,7 @@ Anchors are found by their retained versions, by galloping then bisecting, becau
 | Write made by | Anchored before |
 |---|---|
 | A request | The response ends. A streamed body streams as written, and only its end (with any trailers, such as gRPC's status) waits. A body with `Content-Length` is held whole, because a client counting bytes would otherwise act on it first. So is a response that cannot have a body (to a HEAD, or a 1xx, 204 or 304), which would otherwise be complete when its head went out. |
-| A background task | Its outcome is recorded. Its attempt is also anchored before it runs, so a task that crashes the enclave still spends the attempt rather than looping on it for ever. |
+| A background task | Whatever its run wrote is anchored before its outcome is recorded in the task table, or anyone is woken. Its attempts are counted in the table, so a task that crashes the enclave fails after five rather than looping on it for ever. |
 | A wake | The invocation that raised it is anchored. A `wake` the guest raises during a request or a task is held and delivered only once that invocation's writes are durable — never before, since a wake tells an owner to come and look. If the anchor fails, the wake is dropped. |
 | A passkey registration | The response. The region claim and the tenant record are written once to the bucket, under Object Lock, before the user is told they are registered. The pool is created with the first approval, which brings the tenant key. |
 | A passkey revocation | The response; a marker written once to the bucket. |
@@ -107,7 +107,7 @@ After a crash, the next attach goes on from whatever reached the disk. Writes no
 | Path | What |
 |---|---|
 | `/pools/<pool_id>/data` | A tenant's pool, mounted here once attached. A tenant id is the first 16 bytes of a SHA-256 of the passkey's credential id; a guest without a gate (development only) gets the all-zero id, and a pool keyed by the release. The pool id is random, in the registry. |
-| `/pools/<pool_id>/runtime/{tasks,devices}` | The tenant's records: JSON, each written to a temporary file and renamed over the record. Loaded when the pool is attached. |
+| `/pools/<pool_id>/runtime/devices` | The tenant's device records: JSON, each written to a temporary file and renamed over the record. Loaded when the pool is attached. |
 | `tenants/<tid>`, `regions/<r>`, `revoked/<tid>` | The registry, in the roots bucket: written once, read as the retained version. |
 | `versions/<vid>/sealed-key`, `versions/<vid>/tenant-keys/<tid>`, `versions/<vid>/acme/` | One release's own: its KMS pointer, the tenant keys it keeps for background work, its certificate. `vid` is `sha256(pcr0 ‖ pcr16)`. |
 

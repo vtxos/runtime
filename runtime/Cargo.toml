@@ -186,6 +186,11 @@ aws-sdk-cloudwatchlogs = { version = "1.131.0", default-features = false, featur
 # Telemetry: guest spans to X-Ray and guest metrics to CloudWatch (see src/telemetry).
 aws-sdk-xray       = { version = "1.109.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
 aws-sdk-cloudwatch = { version = "1.127.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+# Background tasks (see src/tasks): EventBridge Scheduler fires them, SQS delivers them, and
+# DynamoDB records them where an operator can see them.
+aws-sdk-scheduler = { version = "1.119.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-sdk-sqs       = { version = "1.119.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-sdk-dynamodb  = { version = "1.136.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
 # The default credential chain, which resolves through gvproxy to the parent
 # instance's IMDS. Named explicitly rather than relied on as a fallback, so it
 # is obvious *which* identity guest logs are written with.

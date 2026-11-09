@@ -105,6 +105,21 @@
   xray = false;
   metricsNamespace = "";
 
+  # Background tasks, for a guest that exports `run-task`: the DynamoDB table
+  # they are recorded in, the SQS queue they are delivered on, the EventBridge
+  # Scheduler group they are scheduled in, and the role the scheduler takes to
+  # send to the queue. All four, or all "" for none — a production enclave then
+  # runs no background tasks.
+  #
+  # `deploy/tofu` creates them and prints these four values as its `task_*`
+  # outputs. Measured by PCR0 like everything here, so a client can tell from
+  # an attestation where an enclave schedules its tasks. What the table holds
+  # is signed and sealed with each tenant's own key; see runtime/src/tasks.
+  taskTable = "";
+  taskQueueUrl = "";
+  taskScheduleGroup = "";
+  taskSchedulerRoleArn = "";
+
   # The guest is not here either. The runtime fetches it from
   # `guest/guest.wasm` in `rootsBucket` (`bucketPrefix` is not applied) and
   # measures it into PCR16 before it asks KMS for a key, so changing the guest

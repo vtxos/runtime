@@ -1,43 +1,33 @@
-//! Key hierarchy.
+//! The release's key hierarchy: what one release keeps for itself.
 //!
-//! Two roots, because two parties hold the state.
-//!
-//! A tenant's pool is keyed from its [`TenantKey`], which the owner's app
-//! derives from its passkey's PRF output and sends with each assertion. It is
-//! the same on every release, so a tenant's data survives every release, and
-//! nothing the enclave or its operator holds can produce it.
-//!
-//! What belongs to one release — its TLS certificate, its cache of tenant keys
-//! for background work — hangs off a [`MasterSecret`] that KMS releases only
-//! to that release's PCR0 and PCR16, through [`VersionKeys`]. A new release
-//! gets a new one and inherits none of it.
+//! Two roots, because two parties hold the state. A tenant's data is keyed from its own key,
+//! which only its owner's app holds ([`crate::tenant`]). What belongs to one release — its TLS
+//! certificate, its cache of tenant keys for background work — hangs off a [`MasterSecret`] that
+//! KMS releases only to that release's PCR0 and PCR16, through [`VersionKeys`]. A new release gets
+//! a new one and inherits none of it.
 //!
 //! ```text
-//!   TenantKey (client)                       MasterSecret (KMS, one release)
-//!        │                                         │
-//!   HKDF-SHA384(salt = fs_uuid,              HKDF-SHA384(salt = fs_uuid ‖ vid,
-//!               info = purpose ‖ pool_id)                info = purpose)
-//!     ┌──┴───────────────┐               ┌─────────┼──────────────┐
-//!     ▼                  ▼               ▼         ▼              ▼
-//!  Ed25519 seed     pool dm-crypt     ACME seal  tenant-key   anonymous
-//!  (the pool's      key (AES-XTS)     key        cache key    tenant key
-//!   anchors)
+//!   MasterSecret (KMS, one release)
+//!        │
+//!   HKDF-SHA384(salt = fs_uuid ‖ vid, info = purpose)
+//!   ┌────┼──────────────┐
+//!   ▼    ▼              ▼
+//!  ACME  tenant-key     anonymous
+//!  seal  cache key      tenant key
 //! ```
 //!
-//! Separate keys per purpose so that a weakness in one use cannot be pivoted
-//! into another.
+//! Separate keys per purpose so that a weakness in one use cannot be pivoted into another.
 
 use aws_lc_rs::aead::{LessSafeKey, UnboundKey, AES_256_GCM};
 use aws_lc_rs::hkdf::{KeyType, Salt, HKDF_SHA384};
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::tenant::TenantKey;
 
 use crate::store::error::{StoreError, StoreResult};
 
 /// HKDF info strings. Versioned so a future format revision can rotate
 /// derived keys without changing the secret they come from.
-const INFO_POOL_SIGN: &[u8] = b"aegira/pool/anchor-sign/v1";
-const INFO_POOL_DMCRYPT: &[u8] = b"aegira/pool/dmcrypt/v1";
 /// Seals the runtime's own secrets — the ACME account key and the TLS
 /// certificate's private key — which live in the roots bucket.
 ///
@@ -69,7 +59,7 @@ impl MasterSecret {
     /// Named to be conspicuous at the call site. There is exactly one
     /// legitimate reason to reach in here — sealing the secret so it can be
     /// stored — and everything else should take a `&MasterSecret` and derive
-    /// what it needs through [`KeyMaterial`], which is why no plain `as_bytes`
+    /// what it needs through [`VersionKeys`], which is why no plain `as_bytes`
     /// exists.
     pub fn expose_secret(&self) -> &[u8; 32] {
         &self.0
@@ -129,56 +119,7 @@ pub fn hkdf(secret: &MasterSecret, salt: &[u8], info: &[u8], out: &mut [u8]) -> 
     hkdf_raw(&secret.0, salt, info, out)
 }
 
-/// One tenant's key: the root of its pool, and of nothing else. Scrubbed on
-/// drop, never printed.
-///
-/// The owner's app derives it from its passkey's PRF output
-/// ([`crate::auth::tenant_key`]) and sends it with an assertion, and only
-/// after checking this enclave's PCR0 and PCR16. A release the app does not
-/// approve is never sent it, and so can open none of that tenant's data.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-pub struct TenantKey([u8; 32]);
-
-impl TenantKey {
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        TenantKey(bytes)
-    }
-
-    /// The raw bytes, for sealing the key into this release's cache.
-    pub fn expose_secret(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    /// Constant-time equality, for checking a presented key against the one
-    /// a tenant's pool was attached with.
-    pub fn ct_eq(&self, other: &TenantKey) -> bool {
-        aws_lc_rs::constant_time::verify_slices_are_equal(&self.0, &other.0).is_ok()
-    }
-}
-
-impl std::fmt::Debug for TenantKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("TenantKey(<redacted>)")
-    }
-}
-
-/// A pool's dm-crypt key: two AES-256 keys, for XTS.
-pub fn pool_dmcrypt_key(
-    key: &TenantKey,
-    fs_uuid: &[u8; 16],
-    pool_id: &[u8; 16],
-) -> StoreResult<zeroize::Zeroizing<[u8; 64]>> {
-    let mut out = zeroize::Zeroizing::new([0u8; 64]);
-    hkdf_raw(
-        &key.0,
-        fs_uuid,
-        &[INFO_POOL_DMCRYPT, pool_id.as_slice()].concat(),
-        out.as_mut(),
-    )?;
-    Ok(out)
-}
-
-fn aes_key(bytes: &[u8; 32]) -> StoreResult<LessSafeKey> {
+pub(crate) fn aes_key(bytes: &[u8; 32]) -> StoreResult<LessSafeKey> {
     Ok(LessSafeKey::new(
         UnboundKey::new(&AES_256_GCM, bytes)
             .map_err(|_| StoreError::Io("AES key setup failed".to_string()))?,
@@ -204,7 +145,7 @@ impl VersionKeys {
         hkdf(master, salt, INFO_TENANT_CACHE, &mut bytes)?;
         let tenant_cache_key = aes_key(&bytes)?;
         hkdf(master, salt, INFO_ANONYMOUS, &mut bytes)?;
-        let anonymous = TenantKey(bytes);
+        let anonymous = TenantKey::from_bytes(bytes);
         bytes.zeroize();
         Ok(VersionKeys {
             runtime_seal_key,
@@ -237,127 +178,9 @@ impl std::fmt::Debug for VersionKeys {
     }
 }
 
-/// One pool's anchor-signing key.
-pub struct KeyMaterial {
-    signing_key: Ed25519KeyPair,
-    public_key: [u8; ED25519_PUBLIC_KEY_LEN],
-    fs_uuid: [u8; 16],
-}
-
-impl KeyMaterial {
-    /// The signing key of one tenant's pool, from that tenant's key.
-    ///
-    /// `fs_uuid` is the HKDF salt and the pool id is in the info, so one
-    /// tenant key never signs for two pools or two filesystems. Both are in
-    /// every anchor, and neither is a secret.
-    pub fn for_pool(key: &TenantKey, fs_uuid: [u8; 16], pool_id: &[u8; 16]) -> StoreResult<Self> {
-        let mut seed = [0u8; 32];
-        hkdf_raw(
-            &key.0,
-            &fs_uuid,
-            &[INFO_POOL_SIGN, pool_id.as_slice()].concat(),
-            &mut seed,
-        )?;
-        let signing_key = Ed25519KeyPair::from_seed_unchecked(&seed)
-            .map_err(|_| StoreError::Io("Ed25519 key derivation failed".to_string()))?;
-        seed.zeroize();
-
-        let mut public_key = [0u8; ED25519_PUBLIC_KEY_LEN];
-        public_key.copy_from_slice(signing_key.public_key().as_ref());
-
-        Ok(KeyMaterial {
-            signing_key,
-            public_key,
-            fs_uuid,
-        })
-    }
-
-    pub fn signing_key(&self) -> &Ed25519KeyPair {
-        &self.signing_key
-    }
-
-    /// Public half of the anchor-signing key. Written into each anchor so an
-    /// external auditor can verify the chain without the master secret.
-    pub fn public_key(&self) -> &[u8; ED25519_PUBLIC_KEY_LEN] {
-        &self.public_key
-    }
-
-    pub fn fs_uuid(&self) -> &[u8; 16] {
-        &self.fs_uuid
-    }
-}
-
-impl std::fmt::Debug for KeyMaterial {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KeyMaterial")
-            .field("fs_uuid", &hex16(&self.fs_uuid))
-            .field("public_key", &hex16(&self.public_key[..8]))
-            .finish_non_exhaustive()
-    }
-}
-
-fn hex16(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tenant() -> TenantKey {
-        TenantKey::from_bytes([0x5a; 32])
-    }
-
-    #[test]
-    fn derivation_is_deterministic() {
-        let a = KeyMaterial::for_pool(&tenant(), [1u8; 16], &[3u8; 16]).unwrap();
-        let b = KeyMaterial::for_pool(&tenant(), [1u8; 16], &[3u8; 16]).unwrap();
-        assert_eq!(a.public_key(), b.public_key());
-    }
-
-    /// The salt is what keeps two filesystems apart under one tenant key.
-    #[test]
-    fn different_fs_uuid_gives_different_keys() {
-        let a = KeyMaterial::for_pool(&tenant(), [1u8; 16], &[3u8; 16]).unwrap();
-        let b = KeyMaterial::for_pool(&tenant(), [2u8; 16], &[3u8; 16]).unwrap();
-        assert_ne!(a.public_key(), b.public_key());
-    }
-
-    /// And the pool id two pools, so a tenant key never signs for another pool.
-    #[test]
-    fn different_pools_get_different_keys() {
-        let a = KeyMaterial::for_pool(&tenant(), [1u8; 16], &[3u8; 16]).unwrap();
-        let b = KeyMaterial::for_pool(&tenant(), [1u8; 16], &[4u8; 16]).unwrap();
-        assert_ne!(a.public_key(), b.public_key());
-        let (x, y) = (
-            pool_dmcrypt_key(&tenant(), &[1u8; 16], &[3u8; 16]).unwrap(),
-            pool_dmcrypt_key(&tenant(), &[1u8; 16], &[4u8; 16]).unwrap(),
-        );
-        assert_ne!(*x, *y);
-    }
-
-    #[test]
-    fn different_tenant_keys_give_different_keys() {
-        let a = KeyMaterial::for_pool(&TenantKey::from_bytes([1; 32]), [0; 16], &[3; 16]).unwrap();
-        let b = KeyMaterial::for_pool(&TenantKey::from_bytes([2; 32]), [0; 16], &[3; 16]).unwrap();
-        assert_ne!(a.public_key(), b.public_key());
-    }
-
-    /// Purpose separation: the signing seed and the dm-crypt key of one pool,
-    /// from one tenant key, must not overlap.
-    #[test]
-    fn purposes_are_separated() {
-        let mut seed = [0u8; 32];
-        hkdf_raw(
-            &tenant().0,
-            &[0u8; 16],
-            &[INFO_POOL_SIGN, &[3u8; 16]].concat(),
-            &mut seed,
-        )
-        .unwrap();
-        let dm = pool_dmcrypt_key(&tenant(), &[0u8; 16], &[3u8; 16]).unwrap();
-        assert_ne!(seed[..], dm[..32]);
-    }
 
     /// Two releases under one master secret — a static development key — must
     /// not share a cache key or an anonymous tenant.
@@ -367,12 +190,6 @@ mod tests {
         let a = VersionKeys::derive(&master, b"release-a").unwrap();
         let b = VersionKeys::derive(&master, b"release-b").unwrap();
         assert!(!a.anonymous().ct_eq(b.anonymous()));
-    }
-
-    #[test]
-    fn tenant_keys_compare_by_value() {
-        assert!(tenant().ct_eq(&tenant()));
-        assert!(!tenant().ct_eq(&TenantKey::from_bytes([0x5b; 32])));
     }
 
     #[test]
@@ -408,14 +225,7 @@ mod tests {
         assert_eq!(s, "MasterSecret(<redacted>)");
         assert!(!s.contains("ab"));
 
-        let t = TenantKey::from_bytes([0xab; 32]);
-        assert_eq!(format!("{t:?}"), "TenantKey(<redacted>)");
-
         let v = VersionKeys::derive(&m, b"salt").unwrap();
         assert!(!format!("{v:?}").contains("abab"));
-
-        let km = KeyMaterial::for_pool(&t, [0u8; 16], &[0u8; 16]).unwrap();
-        let s = format!("{km:?}");
-        assert!(!s.contains("abab"));
     }
 }

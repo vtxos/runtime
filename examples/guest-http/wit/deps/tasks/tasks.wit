@@ -4,7 +4,8 @@ package enclave:tasks@0.1.0;
 /// an interactive invocation; a background invocation cannot grant itself work.
 interface queue {
     /// id is a tenant-local idempotency key (ASCII letters, digits, '-' or '_').
-    /// run-at is Unix milliseconds. interval-ms, when present, is >= 1000.
+    /// run-at is Unix milliseconds. interval-ms, when present, is a whole
+    /// number of minutes, at least one.
     enqueue: func(id: string, payload: list<u8>, run-at: u64, interval-ms: option<u64>) -> result<_, string>;
     /// A JSON task record, including state, attempt count and result bytes.
     status: func(id: string) -> result<string, string>;
@@ -17,8 +18,8 @@ world background {
     import queue;
     /// task-id is a run id, not the id the task was enqueued under. Its form
     /// is `<id>:<generation>:<occurrence>`: the enqueued id, 32 lowercase hex
-    /// digits minted at enqueue, and a decimal count of recurring occurrences
-    /// starting at 0. An id cannot contain ':', so the enqueued id is
+    /// digits minted at enqueue, and when the occurrence was due, in decimal
+    /// Unix milliseconds. An id cannot contain ':', so the enqueued id is
     /// everything before the first one.
     ///
     /// It remains stable across retries of the same occurrence, and changes

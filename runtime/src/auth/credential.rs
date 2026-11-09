@@ -6,18 +6,11 @@
 //! passkey the last one did. No guest can name it.
 //!
 //! A record is not what opens a tenant's data, and need not be secret: that
-//! takes the tenant's key, which only its owner's app has
-//! ([`crate::auth::tenant_key`]). A host that substituted a passkey would
-//! earn a token, and then be refused when it presented a key that does not
-//! open the pool.
-//!
-//! ## The tenant id is derived from the credential id
-//!
-//! [`tenant_of`]: nothing to mint and nothing to store. A credential id is
-//! registered once and kept when revoked, so it names one tenant forever. The
-//! cost is that a passkey *is* its tenant: a replacement passkey starts with
-//! an empty pool. A synced passkey is the same credential on every device, so
-//! a new phone is not a new passkey.
+//! takes the tenant's key, which only its owner's app has ([`crate::tenant`]).
+//! A host that substituted a passkey would earn a token, and then be refused
+//! when it presented a key that does not open the pool. A record is named by
+//! its tenant id, which is derived from the credential id
+//! ([`crate::tenant::tenant_of`]).
 //!
 //! ## Why the sign counter is not persisted
 //!
@@ -38,6 +31,7 @@ use webauthn_rs::prelude::Passkey;
 
 use crate::auth::gate::{CredentialRecord, CredentialStore};
 use crate::store::registry::{Registry, TenantRecord};
+use crate::tenant::tenant_of;
 
 /// Credentials in the registry, with the counters in memory.
 pub struct RegistryCredentials {
@@ -130,17 +124,6 @@ impl CredentialStore for RegistryCredentials {
         *stored = (*stored).max(counter);
         Ok(())
     }
-}
-
-/// The tenant a credential speaks for: the first sixteen bytes of
-/// `sha256("enclave/tenant/v1" || credential_id)`.
-///
-/// Every tenant's record and pool is named by this, so changing it strands
-/// them all; `tenant_of_is_pinned` is what notices.
-pub fn tenant_of(credential_id: &[u8]) -> [u8; 16] {
-    let digest =
-        nitro_attestation::sha256(&[b"enclave/tenant/v1".as_slice(), credential_id].concat());
-    digest[..16].try_into().expect("16 bytes")
 }
 
 #[cfg(test)]
@@ -249,16 +232,6 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .active
-        );
-    }
-
-    /// Every tenant's record and pool is named by this value. A change here is
-    /// every tenant waking up to an empty pool, so it has to be deliberate.
-    #[test]
-    fn tenant_of_is_pinned() {
-        assert_eq!(
-            hex::encode(tenant_of(b"credential")),
-            "a0e215ab9e6d4fc553fe89c4d78b844f"
         );
     }
 

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //!   /pools/<id>/data       a tenant's pool, mounted here: the guest's preopen
-//!   /pools/<id>/runtime    the tenant's tasks and devices
+//!   /pools/<id>/runtime    the tenant's devices
 //!   pool "p<id>"           region N: a tenant's pool
 //!   /dev/mapper/zcrypt-*   plain dm-crypt per region, a key per pool
 //!   /dev/nbd0              the parent's disk, cut into equal regions, over vsock
@@ -80,12 +80,11 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::store::backend::{put_once, Backend, Once};
-use crate::store::crypto::keys::pool_dmcrypt_key;
-use crate::store::crypto::{
-    sign, Hash256, KeyMaterial, TenantKey, ED25519_PUBLIC_KEY_LEN, ED25519_SIGNATURE_LEN,
-};
+use crate::store::crypto::{sign, Hash256, ED25519_PUBLIC_KEY_LEN, ED25519_SIGNATURE_LEN};
 use crate::store::error::{StoreError, StoreResult};
-use crate::store::registry::{Place, Registry, ANONYMOUS};
+use crate::store::registry::{Place, Registry};
+use crate::tenant::pool_dmcrypt_key;
+use crate::tenant::{KeyMaterial, TaskKeys, TenantKey, ANONYMOUS};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::Bytes;
 use rustix::ioctl::{self, opcode, IntegerSetter, NoArg};
@@ -570,8 +569,8 @@ impl std::fmt::Debug for Pool {
 }
 
 /// The datasets every pool holds, each mounted at `root`/`name`: `data` (the
-/// guest's only preopen) and `runtime` (the tenant's tasks and
-/// devices, out of the guest's reach).
+/// guest's only preopen) and `runtime` (the tenant's devices, out of the
+/// guest's reach).
 const DATASETS: &[&str] = &["data", "runtime"];
 
 impl Pool {
@@ -982,12 +981,12 @@ impl From<anyhow::Error> for AttachError {
     }
 }
 
-/// Something that keeps per-tenant records in memory — tasks and devices
-/// — and loads a tenant's when its pool is attached.
+/// Something that acts on a tenant once its pool is attached: loads its device
+/// records, and runs the tasks that waited for it.
 #[async_trait::async_trait]
 pub trait TenantLoader: Send + Sync {
-    /// Load the tenant's records from its pool. Idempotent. Returns whether
-    /// the tenant has background work, so its key is kept for the next boot.
+    /// The tenant was just attached. Idempotent. Returns whether the tenant
+    /// has background work, so its key is kept for the next boot.
     async fn load_tenant(&self, tenant: [u8; 16]) -> Result<bool>;
 }
 
@@ -1363,6 +1362,14 @@ impl Zfs {
         Ok(self.require(tenant)?.pool.data_dir())
     }
 
+    /// What a tenant's scheduled tasks are signed and sealed with. Refused, as its data is, for
+    /// a tenant whose owner has not signed in to this release and whose key it did not keep.
+    pub fn task_keys(&self, tenant: [u8; 16]) -> Result<TaskKeys> {
+        let attached = self.require(tenant)?;
+        TaskKeys::for_pool(&attached.key, self.fs_uuid, &attached.place.pool_id)
+            .map_err(|e| anyhow!("deriving the task keys: {e}"))
+    }
+
     fn require(&self, tenant: [u8; 16]) -> Result<Arc<Attached>> {
         self.attached(tenant).with_context(|| {
             format!(
@@ -1389,8 +1396,8 @@ impl Zfs {
             })
     }
 
-    /// A directory for a tenant's own runtime records (its tasks and
-    /// devices), on the tenant's pool, out of the guest's reach.
+    /// A directory for a tenant's own runtime records (its devices), on the
+    /// tenant's pool, out of the guest's reach.
     pub async fn tenant_runtime_dir(&self, tenant_id: [u8; 16], name: &str) -> Result<PathBuf> {
         self.require(tenant_id)?.pool.runtime_dir(name).await
     }
@@ -1496,7 +1503,7 @@ impl Zfs {
 /// Tests: the key [`Zfs::tenant_dir`] attaches a tenant with.
 #[cfg(any(test, feature = "testing"))]
 pub fn test_key(tenant: [u8; 16]) -> TenantKey {
-    crate::auth::tenant_key::derive(b"a test tenant's PRF output", &tenant)
+    crate::tenant::TenantKey::derive(b"a test tenant's PRF output", &tenant)
 }
 
 /// A region mapped as a dm-crypt device, unmapped again if the attach that

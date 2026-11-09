@@ -39,7 +39,7 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::crypto::keys::{KeyMaterial, TenantKey};
+    use crate::tenant::{KeyMaterial, TenantKey};
 
     fn material(b: u8) -> KeyMaterial {
         KeyMaterial::for_pool(&TenantKey::from_bytes([b; 32]), [0u8; 16], &[0u8; 16]).unwrap()

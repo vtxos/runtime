@@ -39,6 +39,7 @@ pub mod state;
 pub mod store;
 pub mod tasks;
 pub mod telemetry;
+pub mod tenant;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

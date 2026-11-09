@@ -4,7 +4,7 @@
 
 Write the guest with plain `std`. `SystemTime::now()` reads the Nitro PTP hardware clock, `getrandom` reads the Nitro Security Module, `std::fs` writes to a store that is encrypted before anything reaches S3, and requests arrive over TLS terminated inside the enclave. The guest never touches a device path, a key or a certificate.
 
-WASI has no way to reach a person between requests, so the runtime adds [WIT capabilities](#capabilities-beyond-wasi): **`enclave:notify`** wakes the owner's phone without revealing why, and **`enclave:tasks`** runs durable work on the enclave's clock while no client is connected.
+WASI has no way to reach a person between requests, so the runtime adds [WIT capabilities](#capabilities-beyond-wasi): **`enclave:notify`** wakes the owner's phone without revealing why, and **`enclave:tasks`** runs durable work while no client is connected, scheduled through AWS and run inside the enclave.
 
 Every party that relies on the enclave checks the same two measurements: PCR0 for the runtime image and its configuration, PCR16 for the guest. KMS checks them before releasing a release's own key, and a native app before sending a passkey-approved request and the key that opens its tenant's data.
 
@@ -49,7 +49,7 @@ There is no enclave SDK. The [example guest](examples/guest-http/src/main.rs) is
 
 ## One clock, one entropy source, one identity
 
-The runtime opens each trusted device once at boot and hands that one handle to everything that needs it, the guest's WASI imports and the runtime's own subsystems alike. A timestamp the guest reads is the one the scheduler acted on, and every secret in the system comes from the same device.
+The runtime opens each trusted device once at boot and hands that one handle to everything that needs it, the guest's WASI imports and the runtime's own subsystems alike. A timestamp the guest reads is the one a task's delivery is checked against, and every secret in the system comes from the same device.
 
 ### One clock
 
@@ -59,7 +59,7 @@ An enclave has no NTP. The hypervisor sets its system clock, and the parent inst
 |---|---|
 | Guest `wasi:clocks/wall-clock` | Every `SystemTime::now()`, including expiry checks in guest code |
 | Filesystem `set-times` with "now" | File timestamps agree with the guest's clock |
-| Task scheduler | `run-at` deadlines and recurring intervals |
+| Task consumer | Refusing a task delivered before its time |
 | Push signing | The SigV4 date on every call to the push service. AWS checks it, which makes this the one place an outside party checks the enclave's clock; skew shows up as a refused signature, retried |
 | Notification queue | Device enrollment times and retry backoff |
 
@@ -148,7 +148,7 @@ forget:  func(id: string) -> result<_, string>;
 export run-task: func(task-id: string, payload: list<u8>) -> result<list<u8>, string>;
 ```
 
-An approved request can schedule work for later, optionally recurring at intervals of one second or more. `run-at` is Unix milliseconds on the PTP clock. Task records live in the encrypted store and survive restarts. Each run gets a fresh instance, holds the tenant's lock and has a deadline. Failed runs are retried a bounded number of times, and results are kept for `status`. Execution is at least once, so deduplicate by the run ID (`<id>:<generation>:<occurrence>`). Payloads and results are capped at 64 KiB. They run when the guest exports `run-task`; see [docs/BACKGROUND_TASKS.md](docs/BACKGROUND_TASKS.md).
+An approved request can schedule work for later, optionally recurring in whole minutes. `run-at` is Unix milliseconds. Tasks are scheduled outside the enclave: DynamoDB records each one where an operator can see it, EventBridge Scheduler fires it, and SQS delivers it to the enclave. The runtime keeps no clock for them. The parent holds the same AWS role, so each task is signed with a key derived from its tenant's key and its payload is sealed to it: the parent can delete or delay a task, but not forge one, read one or run one early. Each run gets a fresh instance, holds the tenant's lock and has a deadline. Failed runs are retried a bounded number of times, and results are kept for `status`. Execution is at least once, so deduplicate by the run ID (`<id>:<generation>:<occurrence>`). Payloads and results are capped at 64 KiB. They run when the guest exports `run-task`; see [docs/BACKGROUND_TASKS.md](docs/BACKGROUND_TASKS.md).
 
 ### `enclave:signer` — sign with a wallet key the guest never holds
 
@@ -280,7 +280,7 @@ flowchart TB
     subgraph Enclave["Measured enclave · PCR0 runtime · PCR16 guest"]
         TLS["TLS + attested /auth"] --> Gate["Passkey gate"]
         Gate --> Guest["WASI component"]
-        Sched["Task scheduler"] --> Guest
+        Tasks["Task consumer"] --> Guest
         Held["Held connections"] --> Guest
         Dev["PTP clock + NSM"] -.-> Guest
         Guest --> FS["ZFS pool on dm-crypt"]
@@ -288,6 +288,7 @@ flowchart TB
     end
     FS -->|ciphertext blocks over vsock| Disk[("Parent's disk")]
     FS -->|signed anchors| S3[("S3, Object Lock")]
+    AWS[("DynamoDB · EventBridge · SQS")] -->|signed tasks| Tasks
     Dev -.->|recipient attestation| KMS["KMS + SSM"]
     Held <-->|attested SSE + POST| Svc["Public services"]
     Notify -->|data-only wake| Push["AWS push → FCM"]
@@ -341,7 +342,7 @@ The approval binds method, path and query, not the body or each message of a str
 
 ## Storage
 
-Each tenant has its own ZFS pool, on its own region of a disk the parent serves over vsock and cannot read: dm-crypt sits underneath, under a key derived from the tenant's key, which only its owner's app holds. The guest sees the pool's `data` dataset as `/`, through `wasmtime-wasi`'s filesystem, and nothing above it is reachable. The tenant's runtime records (tasks, devices) are on the same pool, outside `data`. Passkeys and which region is whose are in the roots bucket, written once. SQLite runs unmodified in rollback-journal mode ([`guest-sqlite`](examples/guest-sqlite/)).
+Each tenant has its own ZFS pool, on its own region of a disk the parent serves over vsock and cannot read: dm-crypt sits underneath, under a key derived from the tenant's key, which only its owner's app holds. The guest sees the pool's `data` dataset as `/`, through `wasmtime-wasi`'s filesystem, and nothing above it is reachable. The tenant's device records are on the same pool, outside `data`; its background tasks are in DynamoDB, signed and sealed with its key. Passkeys and which region is whose are in the roots bucket, written once. SQLite runs unmodified in rollback-journal mode ([`guest-sqlite`](examples/guest-sqlite/)).
 
 Rollback is what ZFS alone cannot stop, since the parent holds the disk. So before anything is acknowledged — a response's end, a registration, a task's outcome — the pool is synced and its state anchored. A random value written into the pool is signed, chained and published to an Object-Locked bucket. Attaching a pool imports it as of the newest anchor and refuses one that does not hold its value. The anchor, the boot checks, the parent side and the limits are in [docs/STORAGE.md](docs/STORAGE.md); WASI differences are in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
@@ -361,6 +362,7 @@ Every setting is baked into the image and measured into PCR0, so changing one me
 | `ENCLAVE_WEBAUTHN_RP_ID`, `ENCLAVE_WEBAUTHN_ALLOWED_ORIGINS` | The relying party, whose origin is `https://<rp id>`, and further origins such as `android:apk-key-hash:…` |
 | `ENCLAVE_PUSH_APP_ID` | An AWS End User Messaging Push application, or empty for none |
 | `ENCLAVE_GUEST_LOG_GROUP` | A CloudWatch group for guest output, written to its `guest` stream, or empty for the console only |
+| `ENCLAVE_TASK_TABLE`, `ENCLAVE_TASK_QUEUE_URL`, `ENCLAVE_TASK_SCHEDULE_GROUP`, `ENCLAVE_TASK_SCHEDULER_ROLE_ARN` | Where background tasks are recorded, delivered and scheduled, and the role the scheduler sends with: all four, or none for no background tasks. `deploy/tofu` creates them |
 | `AWS_REGION` | The region |
 
 Everything else is fixed:
@@ -369,11 +371,11 @@ Everything else is fixed:
 - The network is gvproxy.
 - The server listens on :443 with an ACME certificate.
 - The guest is `guest/guest.wasm` in the roots bucket.
-- Background tasks run when the guest exports `run-task`.
+- Background tasks run when the guest exports `run-task`, scheduled where the task settings say.
 - A guest's environment is exactly the settings its file carries ([`guest-env.py`](deploy/qemu-nitro/guest-env.py) writes them), measured into PCR16 with its code. Nothing from the runtime's environment reaches it.
 - `RUST_LOG` sets the runtime's own logging; `guest=warn` filters guest output.
 
-The emulator's alternatives exist only in the `testing` build, which the emulator image uses: a static master key, the host clock, MinIO, Pebble, and stubs for push and logs. A production binary has none of these settings and none of that code.
+The emulator's alternatives exist only in the `testing` build, which the emulator image uses: a static master key, the host clock, MinIO, Pebble, stubs for push and logs, and background tasks held in memory. A production binary has none of these settings and none of that code.
 
 | Runtime limit | Default |
 |---|---:|
@@ -381,8 +383,8 @@ The emulator's alternatives exist only in the `testing` build, which the emulato
 | Maximum interaction lifetime | 300 s |
 | Request progress timeout | 30 s |
 | Tenant locks held / idle timeout | 64 / 900 s |
-| Background concurrency / attempt timeout | 1 / 600 s |
-| Background records, global / per tenant | 1,024 / 64 |
+| Background concurrency / attempt timeout | 8 / 600 s |
+| Background tasks per tenant / attempts per occurrence | 64 / 5 |
 | Held connections per tenant / message size | 8 / 256 KiB |
 | Enrolled devices per tenant | 8 |
 
@@ -429,6 +431,7 @@ Reproducibility, and which inputs remain pinned AWS prebuilt artifacts, are cove
 |---|---|
 | Nitro validation | Real recipient key release, refusal of substituted measurements, AWS-root attestation, PTP and NSM availability, IMDSv2 networking and CloudWatch delivery need hardware evidence |
 | Notifications | The push path is exercised against a stub, not yet against the real service |
+| Background tasks | DynamoDB, EventBridge Scheduler and SQS are exercised against LocalEmu and the emulator's in-memory stand-in, not yet against the real services |
 | Upgrades | Nothing is migrated: a tenant's data opens with the key its owner's app sends, on any release the app approves. Until the owner's next approval, a new release runs none of that tenant's background work |
 | Delivery | Tasks, notifications and logs each have their own retry and durability contract; none gives exactly-once side effects |
 | Authorization scope | A passkey approves one interaction on one route, not every payload byte or stream message. Per-message approval needs a host import that is not built yet |

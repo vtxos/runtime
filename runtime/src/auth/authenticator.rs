@@ -113,12 +113,12 @@ impl SoftwareAuthenticator {
         tag.as_ref().try_into().expect("32 bytes")
     }
 
-    /// This passkey's tenant key ([`crate::auth::tenant_key`]): what its app
+    /// This passkey's tenant key ([`crate::tenant`]): what its app
     /// sends with each assertion.
-    pub fn tenant_key(&self) -> crate::store::crypto::TenantKey {
-        crate::auth::tenant_key::derive(
+    pub fn tenant_key(&self) -> crate::tenant::TenantKey {
+        crate::tenant::TenantKey::derive(
             &self.prf(b"aegira"),
-            &crate::auth::tenant_of(&self.credential_id),
+            &crate::tenant::tenant_of(&self.credential_id),
         )
     }
 

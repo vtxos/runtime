@@ -449,6 +449,14 @@
           ENCLAVE_XRAY = lib.boolToString (deployment.xray or false);
           ENCLAVE_METRICS_NAMESPACE = deployment.metricsNamespace or "";
 
+          # Where background tasks are recorded, scheduled and delivered
+          # (runtime/src/tasks): all four, or none. Defaulted, so a
+          # deployment.nix written before them still builds, with tasks off.
+          ENCLAVE_TASK_TABLE = deployment.taskTable or "";
+          ENCLAVE_TASK_QUEUE_URL = deployment.taskQueueUrl or "";
+          ENCLAVE_TASK_SCHEDULE_GROUP = deployment.taskScheduleGroup or "";
+          ENCLAVE_TASK_SCHEDULER_ROLE_ARN = deployment.taskSchedulerRoleArn or "";
+
           # Every request that could reach the guest needs a fresh WebAuthn
           # assertion bound to exactly that request. Without an RP id the
           # runtime serves the guest to anyone who can open a connection and
@@ -514,6 +522,11 @@
           "ENCLAVE_KMS_KEY_ALIAS"
           "ENCLAVE_MASTER_KEY_PARAMETER"
           "ENCLAVE_OPERATOR_MASTER_PARAMETER"
+          # The emulator reaches no AWS, so its tasks are held in memory.
+          "ENCLAVE_TASK_TABLE"
+          "ENCLAVE_TASK_QUEUE_URL"
+          "ENCLAVE_TASK_SCHEDULE_GROUP"
+          "ENCLAVE_TASK_SCHEDULER_ROLE_ARN"
         ] // {
           ENCLAVE_CLOCK_SOURCE = "host";
 

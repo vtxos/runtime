@@ -72,7 +72,7 @@ const MAX_TOKEN_CHARS: usize = 128;
 #[derive(Debug, Clone)]
 pub struct Verified {
     /// Sixteen bytes, derived from the credential id by
-    /// [`crate::auth::credential::tenant_of`] and naming the tenant's dataset.
+    /// [`crate::tenant::tenant_of`] and naming the tenant's dataset.
     /// It is not a secret and nothing derives a key from it.
     pub tenant_id: [u8; 16],
 }

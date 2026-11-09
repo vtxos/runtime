@@ -37,10 +37,8 @@ use webauthn_rs::prelude::Passkey;
 use crate::clock::TrustedClock;
 use crate::store::backend::{get_once, put_once, Backend, ListBlobsInput, Once};
 use crate::store::crypto::seal::{seal, unseal};
-use crate::store::crypto::{TenantKey, VersionKeys};
-
-/// The tenant of a deployment with no gate.
-pub const ANONYMOUS: [u8; 16] = [0; 16];
+use crate::store::crypto::VersionKeys;
+use crate::tenant::{TenantKey, ANONYMOUS};
 
 const TENANT_VERSION: u32 = 3;
 const CLAIM_VERSION: u32 = 1;
@@ -244,7 +242,7 @@ impl Registry {
             record.version
         );
         ensure!(
-            crate::auth::tenant_of(record.passkey.cred_id().as_ref()) == tenant,
+            crate::tenant::tenant_of(record.passkey.cred_id().as_ref()) == tenant,
             "the record for tenant {} names a credential of another tenant",
             hex::encode(tenant)
         );
@@ -271,7 +269,7 @@ impl Registry {
     /// first assertion.
     pub async fn register(&self, tenant: [u8; 16], passkey: Passkey) -> Result<TenantRecord> {
         ensure!(
-            crate::auth::tenant_of(passkey.cred_id().as_ref()) == tenant,
+            crate::tenant::tenant_of(passkey.cred_id().as_ref()) == tenant,
             "a passkey can only register its own tenant"
         );
         if self.tenant(tenant).await?.is_some() {

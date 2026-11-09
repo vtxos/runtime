@@ -34,10 +34,11 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
 
-use super::credential::{tenant_of, RegistryCredentials};
+use super::credential::RegistryCredentials;
 use super::gate::Gate;
 use super::token::InteractionScope;
 use crate::keys::OperatorMaster;
+use crate::tenant::tenant_of;
 
 /// The prefix the guest can never see.
 pub const AUTH_PREFIX: &str = "/auth/";
@@ -157,7 +158,7 @@ struct RequestVerifyRequest {
     /// Base64url of the `PublicKeyCredential` JSON `navigator.credentials.get()`
     /// produced, **with its PRF results removed**.
     assertion: String,
-    /// Base64url of the tenant key, 32 bytes ([`super::tenant_key`]): what
+    /// Base64url of the tenant key, 32 bytes ([`crate::tenant::TenantKey`]): what
     /// opens this tenant's pool. Required: a release opens a tenant's data
     /// only with the key its owner sends it.
     tenant_key: String,
@@ -183,10 +184,10 @@ fn carries_prf(assertion: &serde_json::Value) -> bool {
 }
 
 /// A tenant key as the app sends it: base64url of 32 bytes.
-fn tenant_key_of(encoded: &str) -> Option<crate::store::crypto::TenantKey> {
+fn tenant_key_of(encoded: &str) -> Option<crate::tenant::TenantKey> {
     decode(encoded)
         .and_then(|k| <[u8; 32]>::try_from(k).ok())
-        .map(crate::store::crypto::TenantKey::from_bytes)
+        .map(crate::tenant::TenantKey::from_bytes)
 }
 
 /// The token, and how long it has to be spent.
@@ -644,7 +645,7 @@ impl AuthEndpoints {
     async fn attach(
         &self,
         tenant: [u8; 16],
-        key: &crate::store::crypto::TenantKey,
+        key: &crate::tenant::TenantKey,
     ) -> Result<(), (hyper::StatusCode, &'static str)> {
         let place = match self.zfs.registry().tenant(tenant).await {
             Ok(Some(record)) => record.place,
