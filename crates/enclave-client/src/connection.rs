@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 /// The register the runtime measures its guest component into.
 pub const PCR_GUEST: u32 = 16;
 
-/// What a client pins. The same three values `passkey-client` and `nitro-attest` take.
+/// What a client pins. The same three values `wallet-client` and `nitro-attest` take.
 #[derive(Debug, Clone)]
 pub struct Pins {
     /// DER or PEM of the root the chain must reach. [`crate::AWS_NITRO_ROOT_G1_PEM`] in
@@ -32,7 +32,8 @@ pub struct Attested {
     pub document: AttestationDocument,
     /// SHA-256 of the leaf certificate the document is bound to — equal, by the time this exists,
     /// to the one the connection served. Later connections compare against it rather than being
-    /// attested again: the runtime only attaches documents to `/auth/*` responses.
+    /// attested again: the runtime attaches documents only to `register/options` and
+    /// `request/options`.
     pub certificate_sha256: [u8; 32],
     /// SHA-256 of the guest component the enclave is serving.
     pub guest_sha256: [u8; 32],

@@ -44,11 +44,8 @@ pub mod tenant;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-#[cfg(any(test, feature = "testing"))]
-pub use auth::SoftwareAuthenticator;
 pub use auth::{
-    build_relying_party, AuthEndpoints, ChallengeStore, Gate, InteractionScope,
-    RegistryCredentials, TokenStore, AUTH_PREFIX, DEFAULT_CAPACITY, DEFAULT_TOKEN_CAPACITY,
+    AuthEndpoints, Gate, InteractionScope, TokenStore, AUTH_PREFIX, DEFAULT_TOKEN_CAPACITY,
 };
 pub use boot::{boot, BootConfig, BootMode, Booted, Pair};
 pub use clock::{open_clock, ClockSource, HostClock, PtpClock, TrustedClock, DEFAULT_PTP_DEVICE};
@@ -70,9 +67,8 @@ pub use notify::{
 pub use random::{open_entropy, GuestRandom, HostEntropy, RandomSource};
 pub use run::{read_component, GuestEnvironment, GuestOutcome, EXIT_RUNTIME_FAILURE};
 pub use serve::{
-    apply_tenant, serve_component, AcmeConfig, CertificateSlot, GuestEgress, PoolLimits,
-    SealedAcmeCache, ServeConfig, ServeHandle, Server, Tenancy, TenantPool, TlsIdentity, TlsMode,
-    X_ENCLAVE_TENANT,
+    apply_tenant, serve_component, GuestEgress, PoolLimits, ServeConfig, ServeHandle, Server,
+    Tenancy, TenantPool, TlsIdentity, X_ENCLAVE_TENANT,
 };
 pub use state::State;
 pub use store::mount::{connect, parse_fs_id, MountConfig, DEFAULT_ROOT_RETENTION};

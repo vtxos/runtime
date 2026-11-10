@@ -7,6 +7,8 @@ pub mod auth;
 pub mod binding;
 pub mod commitment;
 pub mod dkg;
+#[cfg(feature = "ecdh")]
+pub mod ecdh;
 pub mod error;
 pub mod hash;
 pub mod identifier;

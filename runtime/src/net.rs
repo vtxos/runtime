@@ -2,7 +2,7 @@
 //!
 //! A Nitro enclave has no network interface. Its only channel to the outside
 //! is `AF_VSOCK` to the parent instance, which means nothing that speaks TCP
-//! — not the AWS SDK, not an ACME client, not a TLS listener — works until
+//! — not the AWS SDK, not a TLS listener — works until
 //! something turns that channel into an interface.
 //!
 //! ```text
@@ -19,12 +19,12 @@
 //! gateway, DHCP and DNS at `192.168.127.1`. This is what nitriding and
 //! ArkLabs both do, and the reason is worth stating: with a real interface,
 //! ordinary networking code works unmodified. The alternative — a vsock
-//! connector threaded through the AWS SDK and the ACME client — means two
-//! bespoke transports to write and maintain, and neither library expects it.
+//! connector threaded through the AWS SDK and every other client — means
+//! bespoke transports to write and maintain, and no library expects one.
 //!
 //! ## What this does and does not give away
 //!
-//! The parent sees ciphertext. Traffic to S3, KMS and an ACME provider is TLS
+//! The parent sees ciphertext. Traffic to S3, KMS and the other AWS services is TLS
 //! from inside the enclave, terminated at the far end, so gvproxy carries
 //! bytes it cannot read. What the parent *does* learn is metadata — who the
 //! enclave talks to, when, and how much — and it can of course refuse to carry

@@ -1,68 +1,52 @@
-//! `passkey-client` — drive the enclave's WebAuthn gate from a script.
+//! `wallet-client` — drive the enclave's gate from a script, as a wallet would.
 //!
 //! ```console
-//! $ passkey-client --url https://127.0.0.1:8443 enrol
-//! $ passkey-client --url https://127.0.0.1:8443 get --path /counter
+//! $ wallet-client --url https://127.0.0.1:8443 enrol
+//! $ wallet-client --url https://127.0.0.1:8443 get --path /counter
 //! ```
 //!
-//! A phone cannot be driven from a shell script, and the QEMU harness serves a
-//! self-signed certificate that no platform authenticator would attest against
-//! anyway. So this is the client half in software: it registers a P-256 passkey
-//! and then, for each request, asks for a challenge bound to that exact request
-//! and signs it — the same two round trips a real app makes, producing the same
-//! bytes.
+//! A phone cannot be driven from a shell script, so this is the client half in software: it
+//! registers a wallet key with the runtime (the DKG, in two calls) and then signs each request
+//! with its share, the same exchanges a real app makes, producing the same bytes
+//! (`docs/CLIENT_INTEGRATION.md`).
 //!
-//! It is a *client*, not a bypass. Everything it sends goes through the same
-//! gate as anything else, and the enclave cannot tell the difference — which is
-//! the point: if the harness can reach the guest with this, the gate is wired
-//! up, and if it cannot without it, the gate is doing its job.
+//! It is a *client*, not a bypass. Everything it sends goes through the same gate as anything
+//! else, and the enclave cannot tell the difference — which is the point: if the harness can
+//! reach the guest with this, the gate is wired up, and if it cannot without it, the gate is
+//! doing its job.
 //!
-//! # The order of a signed request
+//! # Registration
 //!
 //! ```text
-//!   1. POST /auth/request/options   ── carries the body hash, no approval
-//!   2. check that response's document against this connection   ◀── refuse here
-//!      and remember the certificate it was served under
-//!   3. ask the authenticator to sign            (a person is prompted)
-//!   4. open the operation's connection, complete the handshake, and check it
-//!      presents that same certificate          ◀── refuse *before* sending
-//!   5. only then send the operation
+//!   1. POST /auth/register/options   the wallet's commitment: nothing secret
+//!   2. check that answer's document against its connection   ◀── refuse here
+//!      and pin the certificate it was served under
+//!   3. POST /auth/register/verify    the share dealt to the runtime, a signature, the partial:
+//!                                    only to the pinned certificate
 //! ```
 //!
-//! Step 2 is why there is no separate probe route. Verifying a connection means
-//! receiving a response on it, so *something* has to go first on a connection
-//! nothing has vouched for — and the challenge request is the right thing to
-//! send: it carries the operation's hash but no approval, so a party that
-//! intercepted it learns what is intended and holds nothing it can act on. The
-//! round trip was needed anyway.
+//! # A signed request
 //!
-//! Step 2 comes before step 3 deliberately. A person should not be asked to
-//! approve an operation for a party nobody has identified yet.
+//! ```text
+//!   1. POST /auth/request/options    a challenge for this exact interaction: nothing secret
+//!   2. check that answer's document against its connection   ◀── refuse here
+//!      and pin the certificate it was served under
+//!   3. POST /auth/request/verify     the signature and the ECDH partial: only to the pinned
+//!                                    certificate
+//!   4. the interaction, to the pinned certificate
+//! ```
 //!
-//! Step 4 needs no second attestation document, and that is the point. The
-//! document from step 2 binds a certificate; TLS proves the peer holds that
-//! certificate's *private key*, which the certificate itself — being public —
-//! does not. So "the same certificate" and "the same enclave" are the same
-//! statement, and checking it costs a comparison rather than a signature.
+//! The partial is what this client must never send to an enclave it has not identified: with
+//! the runtime's share it gives the tenant's pool key. So both operations start with an attested
+//! options call, and nothing secret is sent until its answer has been checked.
 //!
-//! It is checked after the handshake and before a byte is written, so a changed
-//! far end means the operation is never sent. Nothing is retried on a fresh
-//! connection: the assertion is bound to this exact body and is single-use, so
-//! a retry would risk executing twice for the sake of reaching a party that has
-//! just failed to be the one approved.
+//! A pinned connection is checked after the handshake and before a byte is written, so a
+//! changed far end means the request is never sent. TLS proves the peer holds the private key
+//! of the certificate it shows, so "the same certificate" and "the same enclave" are one
+//! statement. This rests on the runtime refusing session resumption — see `serve::tls`.
 //!
-//! This rests on the runtime refusing session resumption — see `serve::tls`. A
-//! resumed session need present no certificate at all, and pinning against one
-//! the client had cached would be checking its own memory.
-//!
-//! What none of this establishes: the document is generated before the request
-//! is routed, so it says nothing about the response body and does not show the
-//! guest ran. Signature and chain are `nitro-attest`'s to check, and need a
-//! trust root this client is not given.
-//!
-//! The credential is kept in a file between invocations so a script can enrol
-//! once and then make several signed requests, the way a session on a phone
-//! would.
+//! The wallet's share is kept in a file between invocations, so a script can enrol once and
+//! then make several signed requests, the way a session on a phone would.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -72,35 +56,28 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
-use enclave_runtime::SoftwareAuthenticator;
+use enclave_runtime::auth::client::{Client, Registering};
+use enclave_runtime::auth::ATTESTED_CALLS;
 
 #[derive(Parser, Debug)]
-#[command(
-    about = "Register a software passkey and make signed requests",
-    version
-)]
+#[command(about = "Register a wallet key and make signed requests", version)]
 struct Cli {
     /// Base URL, e.g. `https://127.0.0.1:8443`.
     #[arg(long)]
     url: String,
 
-    /// Where the passkey is kept between invocations.
-    #[arg(long, default_value = "/tmp/passkey-client.json")]
+    /// Where the wallet's share is kept between invocations.
+    #[arg(long, default_value = "/tmp/wallet-client.json")]
     state: PathBuf,
 
-    /// The relying-party id the enclave was configured with.
+    /// The name to ask for in the handshake and the Host header.
     #[arg(long, default_value = "enclave.test")]
-    rp_id: String,
+    domain: String,
 
-    /// The origin assertions must claim. Defaults to `https://<rp-id>`.
-    #[arg(long)]
-    origin: Option<String>,
-
-    /// Write each response's proof into this directory: `document.b64`, the
-    /// `certificate.der` this connection was served, and the `nonce.hex` the
-    /// request sent. Three files is what `nitro-attest --document
-    /// --peer-certificate --nonce` needs to check the binding for a request
-    /// this client signed — which it cannot make for itself.
+    /// Write the attested answer's proof into this directory: `document.b64`, the
+    /// `certificate.der` its connection was served, and the `nonce.hex` the request sent. Three
+    /// files is what `nitro-attest --document --peer-certificate --nonce` needs to check the
+    /// binding, for an exchange it cannot make itself: a POST of the client's own.
     #[arg(long)]
     dump_proof: Option<PathBuf>,
 
@@ -155,18 +132,13 @@ struct Cli {
     #[arg(long)]
     unsigned_emulator: bool,
 
-    /// Send a tenant key that is not this passkey's, to show the enclave
-    /// refuses to open the tenant's pool with it.
-    #[arg(long)]
-    wrong_tenant_key: bool,
-
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Register a new passkey, which creates a new tenant.
+    /// Register a new wallet key, which creates a new tenant.
     Enrol,
     /// A signed GET.
     Get {
@@ -186,9 +158,9 @@ enum Command {
     /// cannot be moved off it — one no ordinary client can exercise, because a
     /// client has no reason to build a request its own approval does not match.
     ///
-    /// Note what this deliberately no longer demonstrates: a substituted
-    /// *body*. A token commits to no bytes, so sending different ones at the
-    /// approved route is not a refusal and there would be nothing to show.
+    /// Note what this deliberately does not demonstrate: a substituted *body*.
+    /// A token commits to no bytes, so sending different ones at the approved
+    /// route is not a refusal and there would be nothing to show.
     Substitute {
         /// The route the token is issued for.
         #[arg(long)]
@@ -201,36 +173,23 @@ enum Command {
     },
 }
 
-fn b64() -> base64::engine::general_purpose::GeneralPurpose {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let origin = cli
-        .origin
-        .clone()
-        .unwrap_or_else(|| format!("https://{}", cli.rp_id));
-
     match &cli.command {
         Command::Enrol => {
-            let authenticator = SoftwareAuthenticator::new(&cli.rp_id);
-            enrol(&cli, &origin, &authenticator)?;
-            save(&cli, &authenticator)?;
-            println!("enrolled");
+            let client = enrol(&cli)?;
+            save(&cli, &client)?;
+            println!("enrolled {}", hex::encode(client.tenant()));
         }
         Command::Get { path } => {
-            let authenticator = load(&cli)?;
-            let (status, body) = signed(&cli, &origin, &authenticator, "GET", path, "", None)?;
-            save(&cli, &authenticator)?;
+            let client = load(&cli)?;
+            let (status, body) = signed(&cli, &client, "GET", path, "", None)?;
             print!("{body}");
             std::process::exit(if (200..300).contains(&status) { 0 } else { 1 });
         }
         Command::Post { path, body } => {
-            let authenticator = load(&cli)?;
-            let (status, response) =
-                signed(&cli, &origin, &authenticator, "POST", path, body, None)?;
-            save(&cli, &authenticator)?;
+            let client = load(&cli)?;
+            let (status, response) = signed(&cli, &client, "POST", path, body, None)?;
             print!("{response}");
             std::process::exit(if (200..300).contains(&status) { 0 } else { 1 });
         }
@@ -239,17 +198,8 @@ fn main() -> Result<()> {
             sent,
             body,
         } => {
-            let authenticator = load(&cli)?;
-            let (status, response) = signed(
-                &cli,
-                &origin,
-                &authenticator,
-                "POST",
-                sent,
-                body,
-                Some(approved),
-            )?;
-            save(&cli, &authenticator)?;
+            let client = load(&cli)?;
+            let (status, response) = signed(&cli, &client, "POST", sent, body, Some(approved))?;
             println!("{status}");
             print!("{response}");
         }
@@ -257,213 +207,160 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Just enough of the authenticator to rebuild it next time.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Saved {
-    credential_id: String,
-    key_pkcs8: String,
-    /// Carried between invocations so the counter keeps rising. A real
-    /// authenticator holds this in its own hardware; a shell script invoking a
-    /// fresh process per request has to write it down.
-    counter: u32,
-}
-
-impl Saved {
-    fn of(a: &SoftwareAuthenticator) -> Self {
-        Saved {
-            credential_id: b64().encode(a.credential_id()),
-            key_pkcs8: b64().encode(a.private_key_pkcs8()),
-            counter: a.counter(),
-        }
-    }
-}
-
-fn load(cli: &Cli) -> Result<SoftwareAuthenticator> {
+fn load(cli: &Cli) -> Result<Client> {
     let raw = std::fs::read(&cli.state)
         .with_context(|| format!("reading {} — run `enrol` first", cli.state.display()))?;
-    let saved: Saved = serde_json::from_slice(&raw).context("parsing saved passkey")?;
-    SoftwareAuthenticator::restore(
-        &cli.rp_id,
-        &b64().decode(saved.credential_id)?,
-        &b64().decode(saved.key_pkcs8)?,
-        saved.counter,
-    )
+    let saved: serde_json::Value =
+        serde_json::from_slice(&raw).context("parsing the saved wallet")?;
+    Client::load(&saved).map_err(anyhow::Error::msg)
 }
 
-/// Write the passkey back, so the next invocation continues its counter.
-fn save(cli: &Cli, a: &SoftwareAuthenticator) -> Result<()> {
-    std::fs::write(&cli.state, serde_json::to_vec(&Saved::of(a))?)
+fn save(cli: &Cli, client: &Client) -> Result<()> {
+    std::fs::write(&cli.state, serde_json::to_vec(&client.save())?)
         .with_context(|| format!("writing {}", cli.state.display()))
 }
 
-fn enrol(cli: &Cli, origin: &str, a: &SoftwareAuthenticator) -> Result<()> {
-    let (options, opened_on) =
-        post_json(cli, "/auth/register/options", &serde_json::json!({}), None)?;
-    let opened_on = opened_on.expect("an unpinned exchange is always checked");
-    let challenge = options["options"]["publicKey"]["challenge"]
-        .as_str()
-        .context("registration options carry no challenge")?;
-    let (verified, _) = post_json(
-        cli,
-        "/auth/register/verify",
-        &serde_json::json!({
-            "registration_id": options["registration_id"],
-            "credential": a.register(challenge, origin),
-        }),
-        // The credential being registered is as worth protecting as an
-        // assertion, and for the same reason.
-        Some(&opened_on.certificate),
-    )?;
-    if verified["tenant_id"].as_str().is_none() {
-        bail!("registration was refused: {verified}");
-    }
-    Ok(())
+/// Registration: the wallet's commitment to an enclave nobody has vouched for yet, whose
+/// attested answer is checked before anything secret goes to it.
+fn enrol(cli: &Cli) -> Result<Client> {
+    let registering = Registering::new();
+    let options =
+        connect(cli, None)?.post(cli, "/auth/register/options", &registering.options_body())?;
+    anyhow::ensure!(
+        options.status == 200,
+        "registration was refused: {}",
+        options.body
+    );
+    let pin = attested(cli, &options)?.certificate;
+
+    let connection = connect(cli, Some(&pin))?;
+    let (body, pending) = registering
+        .verify_body(&options.json()?, &connection.served())
+        .map_err(anyhow::Error::msg)?;
+    let answer = connection.post(cli, "/auth/register/verify", &body)?;
+    anyhow::ensure!(
+        answer.status == 200,
+        "registration was refused: {}",
+        answer.body
+    );
+    let (client, _) = pending
+        .finish(&answer.json()?)
+        .map_err(anyhow::Error::msg)?;
+    Ok(client)
 }
 
-/// Ask for a challenge bound to a request, sign it, and send the request.
+/// Sign in for one interaction and make it.
 ///
-/// `approved_route` exists only so the harness can take a token for one route
-/// and spend it on another.
+/// `approved_route` exists only so the harness can take a token for one route and spend it on
+/// another.
 fn signed(
     cli: &Cli,
-    origin: &str,
-    a: &SoftwareAuthenticator,
+    client: &Client,
     method: &str,
     path: &str,
     body: &str,
     approved_route: Option<&str>,
 ) -> Result<(u16, String)> {
-    // The route the approval is *for*, which is normally the one being asked.
     let approved = approved_route.unwrap_or(path);
-    let (approved_path, approved_query) = match approved.split_once('?') {
+    let (approved_path, query) = match approved.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (approved, None),
     };
-    // The challenge request is the one that goes first on a connection nothing
-    // has vouched for yet, and it is chosen for that: it carries the operation's
-    // hash but no approval, so a party that intercepted it would learn what is
-    // intended and hold nothing it could act on.
-    //
-    // Its response is attested like any other, which is what makes a separate
-    // probe route unnecessary — the round trip was going to happen anyway.
-    let (options, opened_on) = post_json(
-        cli,
-        "/auth/request/options",
-        &serde_json::json!({
-            "credential_id": b64().encode(a.credential_id()),
-            "method": method,
-            "path": approved_path,
-            "query": approved_query,
-        }),
-        // Nothing to pin to yet: this is the exchange that establishes it, and
-        // it is chosen to go first precisely because it carries no approval.
-        None,
-    )?;
-    let opened_on = opened_on.expect("an unpinned exchange is always checked");
 
-    // Only now, with the far end identified, is it reasonable to ask a person
-    // to approve anything. `post_json` has already refused if the exchange
-    // could not be tied to this connection, so reaching here means it was.
-    let challenge = options["options"]["publicKey"]["challenge"]
-        .as_str()
-        .with_context(|| format!("challenge options carry no challenge: {options}"))?;
-    let assertion = a.assert(challenge, origin);
+    // The challenge's answer is attested, and checked, before anything is signed: the signature
+    // and the partial go only to the certificate it named.
+    let (options, pin) = challenge(cli, client, method, approved_path, query)?;
+    let connection = connect(cli, Some(&pin))?;
+    let (verify, sign_in) = client
+        .verify_body(&options, method, approved_path, query, &connection.served())
+        .map_err(anyhow::Error::msg)?;
+    let answer = connection.post(cli, "/auth/request/verify", &verify)?;
+    anyhow::ensure!(
+        answer.status == 200,
+        "the sign-in was refused: {} {}",
+        answer.status,
+        answer.body
+    );
+    sign_in
+        .finish(&answer.json()?)
+        .map_err(anyhow::Error::msg)?;
+    let token = token_of(&answer)?;
 
-    // Trip two: hand the assertion back and take a token for the interaction.
-    // The token is what the interaction presents, so this is where the passkey
-    // ceremony ends and nothing after it needs the authenticator again — which
-    // is the whole point when the interaction is a stream with no single
-    // request to hang an assertion on.
-    let (granted, _) = post_json(
-        cli,
-        "/auth/request/verify",
-        &serde_json::json!({
-            "challenge_id": options["challenge_id"]
-                .as_str()
-                .context("no challenge id")?,
-            "assertion": b64().encode(assertion.to_string()),
-            // What opens this tenant's pool. Sent only here, on a connection
-            // whose PCR0 and PCR16 were just checked, and never the PRF
-            // output it is derived from.
-            "tenant_key": b64().encode(if cli.wrong_tenant_key {
-                [0x42; 32]
-            } else {
-                *a.tenant_key().expose_secret()
-            }),
-        }),
-        // Checked after the handshake and *before* the assertion and the key
-        // are written, so a changed far end is sent neither.
-        Some(&opened_on.certificate),
-    )?;
-    let token = granted["token"]
-        .as_str()
-        .context("the runtime issued no token")?;
-
-    // Trip three, pinned to the certificate the challenge exchange identified.
-    // The pin is checked after the handshake and *before* a byte goes out, so a
-    // changed far end means the interaction is never sent rather than sent and
-    // regretted.
-    //
-    // Nothing is retried on a fresh connection. The token is good once, so a
-    // retry would reach a party that has just failed to be the one approved,
-    // holding an approval that may already have been spent.
-    let (status, response, _) = request(
+    // The interaction, pinned to the certificate the challenge's answer named. Nothing is retried
+    // on a fresh connection: the token is good once.
+    let response = connect(cli, Some(&pin))?.send(
         cli,
         method,
         path,
         &[("authorization", format!("Bearer {token}"))],
         body,
-        Some(&opened_on.certificate),
     )?;
-
-    Ok((status, response))
+    Ok((response.status, response.body))
 }
 
-/// A JSON POST, optionally to a connection that must present `pinned`.
-///
-/// The pin matters most on the exchange that carries the assertion. That
-/// exchange used to open an unpinned connection, which meant the credential
-/// went out to whoever answered: an interceptor could take it, redeem it at the
-/// real enclave, and keep the token. Checking the response afterwards proves
-/// only that the theft succeeded.
-fn post_json(
+/// A challenge for one interaction, from an enclave nobody has vouched for yet. The request
+/// carries nothing secret, and the answer is attested: checked against its connection before
+/// anything is signed. Back: the challenge, and the certificate to pin.
+fn challenge(
     cli: &Cli,
-    path: &str,
-    value: &serde_json::Value,
-    pinned: Option<&[u8]>,
-) -> Result<(serde_json::Value, Option<ConnectionProof>)> {
-    let (_, body, proof) = request(
-        cli,
-        "POST",
-        path,
-        &[("content-type", "application/json".to_string())],
-        &value.to_string(),
-        pinned,
-    )?;
-    let value = serde_json::from_str(&body)
-        .with_context(|| format!("{path} did not answer JSON: {body}"))?;
-    Ok((value, proof))
-}
-
-/// One HTTPS request, accepting whatever certificate is presented.
-///
-/// The certificate is not what establishes trust — nothing vouches for it, and
-/// nothing needs to. The attestation does, by naming the certificate this
-/// connection presented, which is checked here before the response is returned.
-/// What is *not* checked here is the signature and the chain: that needs a
-/// trust root and expected measurements this client is not given, and
-/// `nitro-attest` is the tool for it.
-fn request(
-    cli: &Cli,
+    client: &Client,
     method: &str,
     path: &str,
-    headers: &[(&str, String)],
-    body: &str,
-    // The certificate this connection must present, once one is known. `None`
-    // on the exchange that establishes it — there is nothing to pin to yet,
-    // which is why that exchange carries no approval.
-    pinned: Option<&[u8]>,
-) -> Result<(u16, String, Option<ConnectionProof>)> {
+    query: Option<&str>,
+) -> Result<(serde_json::Value, Vec<u8>)> {
+    let options = connect(cli, None)?.post(
+        cli,
+        "/auth/request/options",
+        &client.options_body(method, path, query),
+    )?;
+    anyhow::ensure!(
+        options.status == 200,
+        "no challenge was issued: {}",
+        options.body
+    );
+    let pin = attested(cli, &options)?.certificate;
+    Ok((options.json()?, pin))
+}
+
+fn token_of(answer: &Exchange) -> Result<String> {
+    answer.json()?["token"]
+        .as_str()
+        .map(str::to_string)
+        .context("the runtime issued no token")
+}
+
+/// One TLS connection with its handshake finished: what the far end presented is known before
+/// anything is sent to it.
+struct Connection {
+    tls: rustls::ClientConnection,
+    socket: TcpStream,
+    presented: Vec<u8>,
+}
+
+/// One request and its whole response.
+struct Exchange {
+    status: u16,
+    head: String,
+    body: String,
+    /// The nonce sent, on an options call.
+    nonce: Option<[u8; 20]>,
+    presented: Vec<u8>,
+}
+
+impl Exchange {
+    fn json(&self) -> Result<serde_json::Value> {
+        serde_json::from_str(&self.body).with_context(|| format!("not JSON: {}", self.body))
+    }
+}
+
+/// Open a connection, accepting whatever certificate is presented, and refuse it unless it is
+/// `pinned` when one is given.
+///
+/// The certificate is not what establishes trust — nothing vouches for it, and nothing needs to.
+/// An attestation does, by naming the certificate a connection presented ([`attested`]). After
+/// that the certificate is pinned, and checked here, after the handshake and before a byte is
+/// written.
+fn connect(cli: &Cli, pinned: Option<&[u8]>) -> Result<Connection> {
     let authority = cli
         .url
         .trim_start_matches("https://")
@@ -477,132 +374,148 @@ fn request(
     .with_custom_certificate_verifier(Arc::new(AcceptAny))
     .with_no_client_auth();
 
-    let name = rustls::pki_types::ServerName::try_from(cli.rp_id.clone())?;
-    let mut connection = rustls::ClientConnection::new(Arc::new(config), name)?;
+    let name = rustls::pki_types::ServerName::try_from(cli.domain.clone())?;
+    let mut tls = rustls::ClientConnection::new(Arc::new(config), name)?;
     let mut socket =
         TcpStream::connect(&authority).with_context(|| format!("connecting to {authority}"))?;
-
-    // Driven to completion here rather than left to the first write, because
-    // what the far end presents has to be known *before* anything is sent to
-    // it. TLS proves the peer holds the private key for the certificate it
-    // shows; the certificate itself is public and proves nothing on its own.
-    while connection.is_handshaking() {
-        connection
-            .complete_io(&mut socket)
+    while tls.is_handshaking() {
+        tls.complete_io(&mut socket)
             .context("completing the TLS handshake")?;
     }
-    let presented = connection
+    let presented = tls
         .peer_certificates()
         .and_then(|c| c.first())
         .context("the server presented no certificate")?
         .to_vec();
-
-    // The operation goes nowhere if this is not the enclave the approval was
-    // given to. Checked before a byte is written, so a changed far end means
-    // the request is never sent rather than sent and regretted.
     if let Some(expected) = pinned {
         anyhow::ensure!(
             presented == expected,
-            "this connection presents a different certificate than the one the \
-             approval was given to; the operation was not sent"
+            "this connection presents a different certificate than the enclave this client \
+             identified; nothing was sent"
         );
     }
+    Ok(Connection {
+        tls,
+        socket,
+        presented,
+    })
+}
 
-    let mut tls = rustls::Stream::new(&mut connection, &mut socket);
-
-    // Every request carries a nonce. The runtime refuses without one whether or
-    // not it attests, so a client that omits it reaches nothing.
-    let nonce = fresh_nonce();
-    let mut request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
-         x-enclave-nonce: {}\r\nContent-Length: {}\r\n",
-        cli.rp_id,
-        encode_nonce(&nonce),
-        body.len()
-    );
-    for (name, value) in headers {
-        request.push_str(&format!("{name}: {value}\r\n"));
-    }
-    request.push_str("\r\n");
-    request.push_str(body);
-    tls.write_all(request.as_bytes())?;
-
-    let mut raw = Vec::new();
-    let _ = tls.read_to_end(&mut raw);
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .context("no response headers")?;
-    let head = String::from_utf8_lossy(&raw[..split]).to_string();
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .context("no status line")?
-        .parse()?;
-
-    // On a pinned connection there is nothing left to establish: the far end
-    // presented the certificate the approval was given to, and TLS proved it
-    // holds the private key. The runtime does not attest these responses for
-    // exactly that reason, so there is no document here to read.
-    //
-    // On an unpinned one there is everything to establish, and it is checked
-    // before the body is even looked at. A response this client cannot tie to
-    // the enclave on the other end is not a response it will act on, and a
-    // deployment with attestation off is one it will not talk to — nothing to
-    // check means nothing it can promise.
-    let proof = match pinned {
-        // A pinned response carries no document by design — the runtime attests
-        // the `/auth/` exchange and leaves the rest alone — so there is nothing
-        // here to check and nothing to dump. Dumping unconditionally used to
-        // fail *after* the interaction had already run.
-        Some(_) => None,
-        None => Some(
-            connection_proof(&head, &nonce, &presented, &TrustConfig::from(cli)?)
-                .with_context(|| format!("{method} {path} could not be tied to this connection"))?,
-        ),
-    };
-
-    // Only the attested exchange has a proof worth keeping, and it is the one a
-    // verifier needs: the document, the certificate it binds, and the nonce it
-    // quotes. The interaction that follows is covered by the pin.
-    if proof.is_some() {
-        if let Some(dir) = &cli.dump_proof {
-            dump_proof(dir, &head, &nonce, &connection)?;
-        }
+impl Connection {
+    /// The SHA-256 of the certificate this connection was served: what a signature binds.
+    fn served(&self) -> [u8; 32] {
+        nitro_attestation::sha256(&self.presented)
     }
 
-    // A response counts only once it is complete. The runtime streams a body
-    // as the guest writes it and holds back only its end until the guest's
-    // writes are anchored, so a body that stops short — the enclave died, or
-    // the connection was cut — reports an operation that may be rolled back.
-    let rest = &raw[split + 4..];
-    let lower = head.to_ascii_lowercase();
-    let cut_off = || {
-        anyhow::anyhow!(
-            "{method} {path}: the response was cut off before it ended, so what it reports \
-             may not have happened"
+    fn post(self, cli: &Cli, path: &str, body: &serde_json::Value) -> Result<Exchange> {
+        self.send(
+            cli,
+            "POST",
+            path,
+            &[("content-type", "application/json".to_string())],
+            &body.to_string(),
         )
-    };
-    let body = if lower.contains("transfer-encoding: chunked") {
-        dechunk(rest).ok_or_else(cut_off)?
-    } else if let Some(length) = lower
-        .lines()
-        .find_map(|l| l.strip_prefix("content-length:"))
-        .and_then(|v| v.trim().parse::<usize>().ok())
-    {
-        rest.get(..length).ok_or_else(cut_off)?.to_vec()
-    } else {
-        rest.to_vec()
-    };
-    Ok((status, String::from_utf8_lossy(&body).to_string(), proof))
+    }
+
+    fn send(
+        mut self,
+        cli: &Cli,
+        method: &str,
+        path: &str,
+        headers: &[(&str, String)],
+        body: &str,
+    ) -> Result<Exchange> {
+        let mut tls = rustls::Stream::new(&mut self.tls, &mut self.socket);
+
+        // A nonce on the options calls, whose answers carry a document that must quote it. The
+        // runtime refuses one without it. No other answer carries one, so no other call sends it.
+        let nonce = ATTESTED_CALLS.contains(&path).then(fresh_nonce);
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n",
+            cli.domain,
+            body.len()
+        );
+        if let Some(nonce) = &nonce {
+            request.push_str(&format!("x-enclave-nonce: {}\r\n", encode_nonce(nonce)));
+        }
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        request.push_str(body);
+        tls.write_all(request.as_bytes())?;
+
+        let mut raw = Vec::new();
+        let _ = tls.read_to_end(&mut raw);
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .context("no response headers")?;
+        let head = String::from_utf8_lossy(&raw[..split]).to_string();
+        let status: u16 = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .context("no status line")?
+            .parse()?;
+
+        // A response counts only once it is complete. The runtime streams a body as the guest
+        // writes it and holds back only its end until the guest's writes are anchored, so a body
+        // that stops short reports an operation that may be rolled back.
+        let rest = &raw[split + 4..];
+        let lower = head.to_ascii_lowercase();
+        let cut_off = || {
+            anyhow::anyhow!(
+                "{method} {path}: the response was cut off before it ended, so what it reports \
+                 may not have happened"
+            )
+        };
+        let body = if lower.contains("transfer-encoding: chunked") {
+            dechunk(rest).ok_or_else(cut_off)?
+        } else if let Some(length) = lower
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            rest.get(..length).ok_or_else(cut_off)?.to_vec()
+        } else {
+            rest.to_vec()
+        };
+        Ok(Exchange {
+            status,
+            head,
+            body: String::from_utf8_lossy(&body).to_string(),
+            nonce,
+            presented: self.presented,
+        })
+    }
+}
+
+/// Check an attested answer against the connection it arrived on, before acting on it.
+/// Refused if it carries no document: a deployment that does not attest is one this client will
+/// not talk to. The proof is kept first, when asked for, so an answer that is refused can still
+/// be examined.
+fn attested(cli: &Cli, exchange: &Exchange) -> Result<ConnectionProof> {
+    let nonce = exchange
+        .nonce
+        .context("only an options call sends a nonce, so only its answer can be attested")?;
+    if let Some(dir) = &cli.dump_proof {
+        dump_proof(dir, &exchange.head, &nonce, &exchange.presented)?;
+    }
+    connection_proof(
+        &exchange.head,
+        &nonce,
+        &exchange.presented,
+        &TrustConfig::from(cli)?,
+    )
+    .context("the answer could not be tied to its connection")
 }
 
 /// A fresh nonce for one request.
 ///
-/// From the OS, because a nonce a third party can predict is not a nonce — and
-/// this one is checked: the document that comes back must quote it, or the
-/// response is refused before its body is read.
+/// From the OS, because a nonce a third party can predict is not a nonce — and this one is
+/// checked: the document that comes back must quote it, or the answer is refused before its
+/// body is read.
 fn fresh_nonce() -> [u8; 20] {
     let mut nonce = [0u8; 20];
     getrandom::fill(&mut nonce).expect("the OS has entropy");
@@ -610,7 +523,6 @@ fn fresh_nonce() -> [u8; 20] {
 }
 
 fn encode_nonce(nonce: &[u8]) -> String {
-    use base64::Engine as _;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce)
 }
 
@@ -827,26 +739,16 @@ impl TrustConfig {
     }
 }
 
-fn dump_proof(
-    dir: &Path,
-    head: &str,
-    nonce: &[u8],
-    connection: &rustls::ClientConnection,
-) -> Result<()> {
+fn dump_proof(dir: &Path, head: &str, nonce: &[u8], certificate: &[u8]) -> Result<()> {
     let document = head
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("x-enclave-attestation:"))
         .and_then(|l| l.split_once(':'))
         .map(|(_, v)| v.trim())
         .context("the response carried no x-enclave-attestation header")?;
-    let certificate = connection
-        .peer_certificates()
-        .and_then(|c| c.first())
-        .context("the server presented no certificate")?;
-
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     std::fs::write(dir.join("document.b64"), document)?;
-    std::fs::write(dir.join("certificate.der"), certificate.as_ref())?;
+    std::fs::write(dir.join("certificate.der"), certificate)?;
     std::fs::write(dir.join("nonce.hex"), hex::encode(nonce))?;
     Ok(())
 }
@@ -1143,7 +1045,7 @@ mod tests {
     #[test]
     fn a_client_refuses_to_run_without_expected_measurements() {
         let cli = Cli::parse_from([
-            "passkey-client",
+            "wallet-client",
             "--url",
             "https://e.test",
             "get",
@@ -1161,7 +1063,7 @@ mod tests {
     }
 
     fn cli_with(flags: &[&str]) -> Cli {
-        let mut args = vec!["passkey-client", "--url", "https://e.test"];
+        let mut args = vec!["wallet-client", "--url", "https://e.test"];
         args.extend_from_slice(flags);
         args.extend_from_slice(&["get", "--path", "/"]);
         Cli::parse_from(args)
@@ -1169,7 +1071,7 @@ mod tests {
 
     fn guest_file(name: &str, bytes: &[u8]) -> PathBuf {
         let path =
-            std::env::temp_dir().join(format!("passkey-client-{}-{name}.wasm", std::process::id()));
+            std::env::temp_dir().join(format!("wallet-client-{}-{name}.wasm", std::process::id()));
         std::fs::write(&path, bytes).expect("writing a guest file");
         path
     }

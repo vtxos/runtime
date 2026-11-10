@@ -2,16 +2,17 @@
 //!
 //! A **release** is a runtime image and a guest: the pair of PCR0 and PCR16 a
 //! KMS key policy names. Each release has a master secret of its own, minted by
-//! its first boot and released by KMS to that pair alone, and with it keeps two
-//! things: its TLS certificate, and the keys of the tenants whose background
-//! work it runs ([`crate::store::registry`]). Neither is any other release's business.
+//! its first boot and released by KMS to that pair alone, and with it keeps the
+//! keys of the tenants whose background work it runs ([`crate::store::registry`]).
+//! That is no other release's business.
 //!
 //! What every release shares is the tenants' data, and that is not keyed by any
-//! release. Each tenant's pool opens with the key its owner's app sends with an
-//! assertion — sent only to a release whose PCR0 and PCR16 the app approves —
-//! and is pinned to that key by its own anchor 0 ([`crate::store::zfs`]). So a new
-//! release reads every tenant's data exactly as the last one did, from the
-//! moment that tenant's owner signs in to it, and **nothing is migrated**.
+//! release. Each tenant's pool opens with the key its owner's share and the
+//! runtime's derive together at sign-in — the owner's half sent only to a release
+//! whose PCR0 and PCR16 its app approves — and is pinned to that key by its own
+//! anchor 0 ([`crate::store::zfs`]). So a new release reads every tenant's data
+//! exactly as the last one did, from the moment that tenant's owner signs in to
+//! it, and **nothing is migrated**.
 //!
 //! Booting is therefore small:
 //!

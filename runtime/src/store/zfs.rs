@@ -16,7 +16,8 @@
 //! ## Opened by the tenant's key
 //!
 //! A pool's dm-crypt key and its anchor-signing key both derive from its
-//! tenant's [`TenantKey`], which the owner's app sends with an assertion. So
+//! tenant's [`TenantKey`], which the owner's share and the runtime's derive
+//! together by threshold ECDH when the owner signs in ([`crate::tenant`]). So
 //! a pool is opened — **attached** — the first time its owner signs in to a
 //! release, and not before; and anchor 0, written once and locked, pins that
 //! key for good. A wrong key fails the chain before anything is mapped. Any
@@ -174,9 +175,19 @@ impl std::fmt::Display for Release {
 /// region is 4 KiB-aligned so its dm-crypt mapping starts on a block boundary.
 const SECTORS_PER_MIB: u64 = (1024 * 1024) / 512;
 
-/// The default region size until a deployment sets one with `--region-mib`. A
-/// ZFS pool needs only tens of MiB, so this is deliberately small.
-const DEFAULT_REGION_MIB: u64 = 200;
+/// Each tenant's region: 64 MiB, the smallest device ZFS will make a pool on
+/// (plain dm-crypt adds no header, so the mapped device is exactly this).
+///
+/// Every user is given one, fixed, when they register, because each has a pool
+/// of their own. That is about 16,384 users per TiB of disk, and the space is
+/// committed at registration whether or not the user stays active. Capacity
+/// grows only by growing the one disk: region `i` always starts at `i` times
+/// this, so a bigger disk adds regions at its end and moves none. Growing the
+/// disk adds room for users, and nothing else.
+///
+/// Fixed for the life of a store (see `docs/STORAGE.md`): changing it moves
+/// every region out from under its pool.
+const DEFAULT_REGION_MIB: u64 = 64;
 
 /// A nominal disk size, in regions, for a directory-backed manager: enough for
 /// the tests' tenants without a real disk behind it.
@@ -1048,7 +1059,7 @@ pub struct ReleaseContext {
 
 impl Zfs {
     /// Bring up the disk. No pool is attached: each waits for its tenant's key,
-    /// from an assertion or from this release's cache
+    /// from its owner's sign-in or from this release's cache
     /// ([`Zfs::resume_from_cache`]).
     #[allow(clippy::too_many_arguments)]
     pub async fn open(
@@ -1503,7 +1514,9 @@ impl Zfs {
 /// Tests: the key [`Zfs::tenant_dir`] attaches a tenant with.
 #[cfg(any(test, feature = "testing"))]
 pub fn test_key(tenant: [u8; 16]) -> TenantKey {
-    crate::tenant::TenantKey::derive(b"a test tenant's PRF output", &tenant)
+    crate::tenant::TenantKey::from_bytes(nitro_attestation::sha256(
+        &[b"a test tenant's key".as_slice(), tenant.as_slice()].concat(),
+    ))
 }
 
 /// A region mapped as a dm-crypt device, unmapped again if the attach that

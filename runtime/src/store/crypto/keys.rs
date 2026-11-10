@@ -1,8 +1,8 @@
 //! The release's key hierarchy: what one release keeps for itself.
 //!
 //! Two roots, because two parties hold the state. A tenant's data is keyed from its own key,
-//! which only its owner's app holds ([`crate::tenant`]). What belongs to one release — its TLS
-//! certificate, its cache of tenant keys for background work — hangs off a [`MasterSecret`] that
+//! which its owner's share and the runtime's derive together ([`crate::tenant`]). What belongs to
+//! one release — its cache of tenant keys for background work — hangs off a [`MasterSecret`] that
 //! KMS releases only to that release's PCR0 and PCR16, through [`VersionKeys`]. A new release gets
 //! a new one and inherits none of it.
 //!
@@ -10,10 +10,10 @@
 //!   MasterSecret (KMS, one release)
 //!        │
 //!   HKDF-SHA384(salt = fs_uuid ‖ vid, info = purpose)
-//!   ┌────┼──────────────┐
-//!   ▼    ▼              ▼
-//!  ACME  tenant-key     anonymous
-//!  seal  cache key      tenant key
+//!   ┌────┴─────────┐
+//!   ▼              ▼
+//!  tenant-key     anonymous
+//!  cache key      tenant key
 //! ```
 //!
 //! Separate keys per purpose so that a weakness in one use cannot be pivoted into another.
@@ -28,13 +28,7 @@ use crate::store::error::{StoreError, StoreResult};
 
 /// HKDF info strings. Versioned so a future format revision can rotate
 /// derived keys without changing the secret they come from.
-/// Seals the runtime's own secrets — the ACME account key and the TLS
-/// certificate's private key — which live in the roots bucket.
 ///
-/// In the bucket rather than on a pool, because a certificate has to be
-/// served before anything else is, and a separate label keeps it
-/// cryptographically distinct from everything else derived here.
-const INFO_RUNTIME_SEAL: &[u8] = b"enclave/runtime-seal/v1";
 /// Seals each tenant key this release keeps for background work.
 const INFO_TENANT_CACHE: &[u8] = b"aegira/version/tenant-key-cache/v1";
 /// The key of the anonymous tenant a deployment with no gate serves.
@@ -129,7 +123,6 @@ pub(crate) fn aes_key(bytes: &[u8; 32]) -> StoreResult<LessSafeKey> {
 /// What one release keeps for itself, from the master secret KMS releases to
 /// it alone.
 pub struct VersionKeys {
-    runtime_seal_key: LessSafeKey,
     tenant_cache_key: LessSafeKey,
     anonymous: TenantKey,
 }
@@ -140,24 +133,15 @@ impl VersionKeys {
     /// apart.
     pub fn derive(master: &MasterSecret, salt: &[u8]) -> StoreResult<Self> {
         let mut bytes = [0u8; 32];
-        hkdf(master, salt, INFO_RUNTIME_SEAL, &mut bytes)?;
-        let runtime_seal_key = aes_key(&bytes)?;
         hkdf(master, salt, INFO_TENANT_CACHE, &mut bytes)?;
         let tenant_cache_key = aes_key(&bytes)?;
         hkdf(master, salt, INFO_ANONYMOUS, &mut bytes)?;
         let anonymous = TenantKey::from_bytes(bytes);
         bytes.zeroize();
         Ok(VersionKeys {
-            runtime_seal_key,
             tenant_cache_key,
             anonymous,
         })
-    }
-
-    /// Seals runtime secrets stored outside every pool. See
-    /// [`INFO_RUNTIME_SEAL`].
-    pub fn runtime_seal_key(&self) -> &LessSafeKey {
-        &self.runtime_seal_key
     }
 
     /// Seals the tenant keys this release keeps for background work.

@@ -20,6 +20,9 @@ pub enum Error {
     InvalidMaxSigners,
     IncorrectNumberOfPackages,
     IncorrectPackageMapping,
+    // Threshold ECDH errors
+    InvalidProof,
+    DuplicateIdentifier,
 }
 
 impl fmt::Display for Error {
@@ -52,6 +55,8 @@ impl fmt::Display for Error {
             Error::IncorrectPackageMapping => {
                 write!(f, "incorrect package mapping")
             }
+            Error::InvalidProof => write!(f, "invalid proof"),
+            Error::DuplicateIdentifier => write!(f, "duplicate identifier"),
         }
     }
 }

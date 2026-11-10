@@ -86,16 +86,6 @@
       nativeArgs = {
         strictDeps = true;
         nativeBuildInputs = with pkgs; [ cmake pkg-config perl ];
-        # OpenSSL, for `openssl-sys` under `webauthn-rs`. It is here reluctantly
-        # and the reluctance is the point: this is a second crypto stack, with a
-        # native library, entering the closure that PCR0 measures — alongside
-        # aws-lc-rs, which already provides every primitive it is used for.
-        #
-        # It is also load-bearing rather than cosmetic. Without it the enclave
-        # image does not build at all, which is how the cost first showed up:
-        # a host cargo build succeeded against the system OpenSSL and the
-        # reproducible build did not.
-        buildInputs = [ pkgs.openssl ];
         # aws-lc-sys drives cmake itself; letting Nix's cmake hook configure
         # the crate's own build tree makes it fail confusingly.
         dontUseCmakeConfigure = true;
@@ -343,15 +333,14 @@
       # environment differs between them.
       # The same runtime, built with `testing`, for the QEMU emulator only.
       #
-      # It exists for one reason: the emulator has no domain and no CA it can
-      # reach, so it cannot obtain an ACME certificate — and the production
-      # binary refuses to serve anything else. `testing` restores
-      # `--tls self-signed` and, with it, `rcgen`.
+      # It exists because the emulator reaches no AWS: `testing` adds the static
+      # master key, the host clock, local endpoints for the store and the push
+      # service, a fixed operator master, and re-signed attestations, none of
+      # which a production binary can be configured with.
       #
       # This is a **different binary with a different PCR0**, which is the point:
       # nothing here can be mistaken for the production image, and the e2e
-      # asserts its PCR0 against its own build rather than a published one. The
-      # production image contains no certificate generator at all.
+      # asserts its PCR0 against its own build rather than a published one.
       enclave-runtime-testing = craneLib.buildPackage (runtimeArgs // {
         pname = "enclave-runtime-testing";
         cargoArtifacts = runtimeDeps;
@@ -373,8 +362,9 @@
         closureRoots = [ enclave-runtime busybox pkgs.cacert ] ++ zfsTools;
         command = "/enclave-runtime";
         # Only what differs between deployments. Everything else — KMS, PTP, the
-        # NSM, gvproxy, ACME on :443 — is a constant in the runtime, and the
-        # emulator's alternatives exist only in its `testing` build.
+        # NSM, gvproxy, a certificate self-signed at boot on :443 — is a
+        # constant in the runtime, and the emulator's alternatives exist only in
+        # its `testing` build.
         env = {
           # Without a trust store the AWS SDK panics with "no CA certificates
           # found" before it makes a single request — including against a
@@ -408,9 +398,6 @@
           ENCLAVE_BUCKET_PREFIX = deployment.bucketPrefix;
           ENCLAVE_ID = deployment.fsId;
           AWS_REGION = deployment.region;
-          # ACME, which a platform authenticator needs: it will not attest
-          # against a certificate a browser does not trust.
-          ENCLAVE_TLS_DOMAINS = lib.concatStringsSep "," deployment.tlsDomains;
 
           # Each release's master secret is minted by KMS inside the enclave
           # and released only against an attestation whose PCR0 and PCR16
@@ -420,8 +407,11 @@
           # deployment, since they name resources this repository does not own.
           ENCLAVE_KMS_KEY_ALIAS = deployment.kmsKeyAlias;
           ENCLAVE_MASTER_KEY_PARAMETER = deployment.masterKeyParameter;
-          # What each wallet key's cosigner half is derived from, written by
-          # the operator after boot and read on the first DKG.
+          # What each wallet key's runtime half is derived from and its share
+          # sealed under, written by the operator after boot and read on the
+          # first registration or sign-in. Setting it is what turns
+          # authentication on: every request that could reach the guest then
+          # needs a fresh approval signed with its tenant's wallet share.
           ENCLAVE_OPERATOR_MASTER_PARAMETER = deployment.operatorMasterParameter;
 
           # This runtime release's number, written into every anchor. Bump it
@@ -457,15 +447,6 @@
           ENCLAVE_TASK_SCHEDULE_GROUP = deployment.taskScheduleGroup or "";
           ENCLAVE_TASK_SCHEDULER_ROLE_ARN = deployment.taskSchedulerRoleArn or "";
 
-          # Every request that could reach the guest needs a fresh WebAuthn
-          # assertion bound to exactly that request. Without an RP id the
-          # runtime serves the guest to anyone who can open a connection and
-          # says so at startup — which is a development arrangement, not this
-          # one. The domain must be the one the app's passkeys are scoped to,
-          # and it must be browser-trusted, hence ACME rather than self-signed.
-          ENCLAVE_WEBAUTHN_RP_ID = deployment.rpId;
-          ENCLAVE_WEBAUTHN_ALLOWED_ORIGINS = lib.concatStringsSep "," deployment.webauthnAllowedOrigins;
-          #
           # Registration is open: anyone who can reach the port may create a
           # tenant of their own. There is nothing to provision, and nothing an
           # image could leak by carrying it.
@@ -482,24 +463,13 @@
       # The result is `enclave.eif` and `pcr.json`, as `packages.eif`.
       mkEif = deployment: callEif (runtimeImageFor deployment);
 
-      # The runtime configured for the emulator, as a function of the relying
-      # party so a client developer can boot one their app can sign for:
+      # The runtime configured for the emulator:
       #
       #   nix build --impure --expr '(builtins.getFlake "git+file://$PWD").lib.x86_64-linux.eifQemu
-      #     { rpId = "example.com"; allowedOrigins = [ "android:apk-key-hash:..." ]; }'
+      #     { pushAppId = "..."; }'
       #
-      # which is what `dev-enclave.sh --rp-id --allowed-origin` does. The
-      # defaults are `packages.eif-qemu`, the image the e2e boots.
+      # The defaults are `packages.eif-qemu`, the image the e2e boots.
       eifQemu = {
-        rpId ? "enclave.test",
-        allowedOrigins ? [ ],
-        # The certificate. The defaults are Pebble on the harness host, for `enclave.test`. An emulator
-        # on a public host passes its real name and a real CA instead — `dev-enclave.sh --domain` —
-        # with `acmeCa = null`, since a public CA's API needs no trust root shipped in the image.
-        tlsDomains ? [ "enclave.test" ],
-        acmeDirectory ? "https://192.168.127.254:14000/dir",
-        acmeCa ? "/pebble-ca.pem",
-        acmeContacts ? [ ],
         # Real notifications: the AWS End User Messaging Push application to send through, signed as
         # the host's instance role (gvproxy maps `.253` to its metadata service). Null keeps the
         # stub on the host. Not a secret: the application's FCM channel holds the credential.
@@ -507,12 +477,6 @@
       }: callEif (runtimeImage // {
         payload = runtimeImage.payload // {
           "enclave-runtime" = "${enclave-runtime-testing}/bin/enclave-runtime";
-          # Pebble's ACME API is served under a certificate no public root
-          # signed, so its root ships *inside* the image and is covered by
-          # PCR0 like every other piece of configuration. A test root in a
-          # test image: the production EIF has no such file, and the
-          # production binary has no flag that would read one.
-          "pebble-ca.pem" = ./deploy/qemu-nitro/pebble/ca.pem;
         };
         closureRoots = [ enclave-runtime-testing busybox pkgs.cacert ] ++ zfsTools;
         name = "enclave-qemu";
@@ -545,8 +509,8 @@
           # relaxed variant of it. The root is reported on the console at
           # startup; `deploy/qemu-nitro/lib.sh` captures it for the clients.
           #
-          # Testing-only, like `ENCLAVE_ACME_CA`: the production binary has no
-          # such flag, so no deployment can sign its own attestations.
+          # Testing-only: the production binary has no such flag, so no
+          # deployment can sign its own attestations.
           ENCLAVE_COSIGN_ATTESTATIONS = "1";
 
           # And it cannot use KMS at all, for the same reason: KMS verifies
@@ -558,22 +522,6 @@
           # The emulator reaches no SSM either, so its operator master is fixed
           # here: a test value in a test image, which PCR0 records.
           ENCLAVE_OPERATOR_MASTER = "0707070707070707070707070707070707070707070707070707070707070707";
-          # Real ACME, against a Pebble running on the host — the same code
-          # path production takes, which is the whole reason to prefer it.
-          #
-          # This image used to serve a self-signed certificate, because there
-          # is no public domain here and nothing Let's Encrypt could reach, so
-          # an order failed forever and stalled every handshake rather than
-          # failing loudly. The consequence was worse than the workaround: the
-          # e2e proved a TLS mode a production build cannot even parse. Pebble
-          # removes the reason, so the mode went with it.
-          #
-          # `enclave.test` resolves, inside the Pebble container, to the host
-          # loopback where gvproxy forwards :443 into this enclave — so the
-          # TLS-ALPN-01 challenge arrives on the same port the service uses,
-          # which is exactly the arrangement production runs.
-          ENCLAVE_TLS_DOMAINS = nixpkgs.lib.concatStringsSep "," tlsDomains;
-          ENCLAVE_ACME_DIRECTORY = acmeDirectory;
           # Notifications, against a stub on the host rather than AWS — which
           # would refuse an invented registration token anyway. What the e2e
           # checks is what the *runtime* sends, and the stub records exactly
@@ -587,16 +535,6 @@
           # `guest_log_config` treats an empty setting as unset rather than as
           # a typo.
           ENCLAVE_GUEST_LOG_GROUP = "";
-          # The gate, with a relying party the harness can drive. The e2e
-          # exercises it with the software passkey the `testing` feature
-          # provides, so the default is a name nothing else answers to.
-          #
-          # A developer testing a phone app against this passes their own: a
-          # platform authenticator creates a passkey only for an rp id whose
-          # domain publishes assetlinks.json naming the app, and the app claims
-          # `android:apk-key-hash:<hash>` rather than the web origin. The rp id
-          # is independent of the certificate's name, which stays enclave.test.
-          ENCLAVE_WEBAUTHN_RP_ID = rpId;
           ENCLAVE_ENDPOINT = "http://192.168.127.254:9000";
           ENCLAVE_FORCE_PATH_STYLE = "1";
           ENCLAVE_ROOTS_BUCKET = "e2e-roots";
@@ -605,16 +543,10 @@
           AWS_SECRET_ACCESS_KEY = "minioadmin";
           AWS_REGION = "us-east-1";
           RUST_LOG = "info";
-        } // nixpkgs.lib.optionalAttrs (acmeCa != null) {
-          ENCLAVE_ACME_CA = acmeCa;
-        } // nixpkgs.lib.optionalAttrs (acmeContacts != [ ]) {
-          ENCLAVE_ACME_CONTACTS = nixpkgs.lib.concatStringsSep "," acmeContacts;
         } // nixpkgs.lib.optionalAttrs (pushAppId == null) {
           ENCLAVE_PUSH_ENDPOINT = "http://192.168.127.254:9180";
         } // nixpkgs.lib.optionalAttrs (pushAppId != null) {
           ENCLAVE_PUSH_APP_ID = pushAppId;
-        } // nixpkgs.lib.optionalAttrs (allowedOrigins != [ ]) {
-          ENCLAVE_WEBAUTHN_ALLOWED_ORIGINS = nixpkgs.lib.concatStringsSep "," allowedOrigins;
         };
       });
 

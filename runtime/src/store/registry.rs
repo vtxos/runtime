@@ -1,7 +1,7 @@
 //! The tenant registry: what must outlive every release, in the roots bucket.
 //!
 //! ```text
-//!   tenants/<tid>                        the passkey, and the tenant's place      once
+//!   tenants/<tid>                        the tenant's wallet key and place         once
 //!   revoked/<tid>                        a marker                                  once
 //!   regions/<r>                          which tenant and pool hold region r       once
 //!   versions/<vid>/tenant-keys/<tid>     the tenant's key, sealed to this release  rewritable
@@ -14,10 +14,14 @@
 //! PUT created — so a host can neither rewrite one nor hide one and write
 //! another. A forged newer version is simply not what is read.
 //!
-//! And none of it opens anything. A tenant's pool opens only with its key,
-//! which only its owner's app holds: a host that somehow pointed a tenant at
-//! another's place, or substituted a passkey, would still have to present a
-//! key that verifies against that pool's anchors, and it has none.
+//! A tenant's record holds the public half of its wallet key, the handle the
+//! runtime's polynomial was derived from, and the runtime's share of the key,
+//! sealed under a key from the operator master (`crate::signer`). That share
+//! has to be here rather than on the pool, because the pool's key is derived
+//! with it. It is the operator's, and opens nothing alone: a tenant's pool
+//! opens only with `k`, which takes the client's share too, and a host that
+//! pointed a tenant at another's place would still have to present a key that
+//! verifies against that pool's anchors.
 //!
 //! The cache is the one rewritable thing, and the one thing that is secret:
 //! each tenant key this release keeps so its background work can run with
@@ -32,7 +36,6 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use webauthn_rs::prelude::Passkey;
 
 use crate::clock::TrustedClock;
 use crate::store::backend::{get_once, put_once, Backend, ListBlobsInput, Once};
@@ -40,16 +43,16 @@ use crate::store::crypto::seal::{seal, unseal};
 use crate::store::crypto::VersionKeys;
 use crate::tenant::{TenantKey, ANONYMOUS};
 
-const TENANT_VERSION: u32 = 3;
+const TENANT_VERSION: u32 = 4;
 const CLAIM_VERSION: u32 = 1;
 const CACHE_VERSION: u32 = 1;
 
-/// Ceiling on any one record read back. A `Passkey` is a few hundred bytes.
+/// Ceiling on any one record read back. A tenant's is a few hundred bytes.
 const MAX_RECORD: usize = 8 * 1024;
 
-/// How long an unknown tenant id is remembered as unknown. Looking one up is
-/// unauthenticated (`request/options` takes any credential id), and each miss
-/// would otherwise be a version listing and a GET against the bucket.
+/// How long an unknown tenant id is remembered as unknown. A sign-in names its
+/// tenant by a public key anyone can send, and each miss would otherwise be a
+/// version listing and a GET against the bucket.
 const ABSENT_TTL: Duration = Duration::from_secs(60);
 const MAX_ABSENT: usize = 4096;
 
@@ -61,13 +64,46 @@ pub struct Place {
     pub region: u64,
 }
 
+/// The runtime's share of a wallet key, sealed: `nonce ‖ ciphertext ‖ tag`.
+pub const SEALED_SHARE_LEN: usize = 12 + 32 + 16;
+
+/// One holder of a tenant's wallet key: its FROST identifier and verifying
+/// share, as the DKG's even-Y-normalised public package has them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Member {
+    #[serde(with = "hex_bytes")]
+    pub identifier: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub verifying_share: [u8; 33],
+}
+
+/// A tenant's wallet key as the registry keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantKeyRecord {
+    /// `X`, compressed and even-Y. The tenant id is derived from it.
+    #[serde(with = "hex_bytes")]
+    pub group_key: [u8; 33],
+    /// The runtime: its share is [`TenantKeyRecord::share`].
+    pub signer: Member,
+    /// The client: a sign-in is checked against its verifying share.
+    pub wallet: Member,
+    /// What the runtime's DKG polynomial was derived from, with the operator
+    /// master.
+    #[serde(with = "hex_bytes")]
+    pub handle: [u8; 16],
+    /// The runtime's share, sealed under a key from the operator master.
+    #[serde(with = "hex_bytes")]
+    pub share: [u8; SEALED_SHARE_LEN],
+}
+
 /// A registered tenant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantRecord {
     pub version: u32,
-    pub passkey: Passkey,
     #[serde(flatten)]
     pub place: Place,
+    #[serde(flatten)]
+    pub key: TenantKeyRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,10 +244,10 @@ impl Registry {
 
     /// A registered tenant, or `None`.
     ///
-    /// The record must name a credential whose tenant is this one. A host can
-    /// write any bytes under any name, but the retained version is the first
-    /// that was written, and this check means even that one cannot speak for
-    /// a tenant its credential does not derive.
+    /// The record must hold a wallet key whose tenant is this one, and whose
+    /// public package adds up. A host can write any bytes under any name, but
+    /// the retained version is the first that was written, and these checks
+    /// mean even that one cannot speak for a tenant its key does not derive.
     pub async fn tenant(&self, tenant: [u8; 16]) -> Result<Option<TenantRecord>> {
         if let Some(hit) = self.tenants.lock().expect("registry poisoned").get(&tenant) {
             return Ok(Some(hit.clone()));
@@ -241,11 +277,7 @@ impl Registry {
             "tenant record is version {}, this build understands {TENANT_VERSION}",
             record.version
         );
-        ensure!(
-            crate::tenant::tenant_of(record.passkey.cred_id().as_ref()) == tenant,
-            "the record for tenant {} names a credential of another tenant",
-            hex::encode(tenant)
-        );
+        check_key(tenant, &record.key)?;
         ensure!(
             record.place.region < self.regions,
             "tenant {} is placed in region {}, past the disk's {}",
@@ -265,21 +297,17 @@ impl Registry {
     ///
     /// The region is claimed first, so a crash between the two leaves a region
     /// claimed by nobody's record — a leak, never two tenants on one region.
-    /// No pool is created: that needs the tenant's key, which arrives with its
-    /// first assertion.
-    pub async fn register(&self, tenant: [u8; 16], passkey: Passkey) -> Result<TenantRecord> {
-        ensure!(
-            crate::tenant::tenant_of(passkey.cred_id().as_ref()) == tenant,
-            "a passkey can only register its own tenant"
-        );
+    /// No pool is created here: the caller creates it with `k`.
+    pub async fn register(&self, tenant: [u8; 16], key: TenantKeyRecord) -> Result<TenantRecord> {
+        check_key(tenant, &key)?;
         if self.tenant(tenant).await?.is_some() {
             bail!("tenant {} is already registered", hex::encode(tenant));
         }
         let place = self.claim_place(tenant).await?;
         let record = TenantRecord {
             version: TENANT_VERSION,
-            passkey,
             place,
+            key,
         };
         let mut body = Vec::new();
         ciborium::into_writer(&record, &mut body).context("encoding a tenant record")?;
@@ -301,8 +329,8 @@ impl Registry {
         Ok(record)
     }
 
-    /// Mark a tenant's credential unusable for good. Written once and never
-    /// removed, so no rewind un-revokes it.
+    /// Mark a tenant unusable for good. Written once and never removed, so no
+    /// rewind un-revokes it.
     pub async fn revoke(&self, tenant: [u8; 16]) -> Result<()> {
         // Won or lost, a marker is there: revoked either way.
         self.write_once(&self.revoked_key(&tenant), b"revoked".to_vec())
@@ -413,7 +441,7 @@ impl Registry {
     }
 
     /// The place of a tenant that claimed a region but has no record: the
-    /// tests' tenants, made without a passkey. Walks every claim.
+    /// tests' tenants, made without a wallet key. Walks every claim.
     #[cfg(any(test, feature = "testing"))]
     pub async fn place_claimed_by(&self, tenant: [u8; 16]) -> Result<Option<Place>> {
         for region in self.claimed_regions().await? {
@@ -542,6 +570,47 @@ impl Registry {
             key: TenantKey::from_bytes(record.key),
         })
     }
+}
+
+/// Refuse a wallet key that does not name `tenant`, or whose public package
+/// does not add up: `X` must be even-Y, its tenant must be this one, the two
+/// holders distinct, and `X` what their verifying shares interpolate to.
+fn check_key(tenant: [u8; 16], key: &TenantKeyRecord) -> Result<()> {
+    use threshold::identifier::Identifier;
+    use threshold::lagrange::lagrange_coeff_at_zero;
+    use threshold::point;
+
+    ensure!(
+        key.group_key[0] == 0x02,
+        "the wallet key of tenant {} is not even-Y",
+        hex::encode(tenant)
+    );
+    ensure!(
+        crate::tenant::tenant_of(&key.group_key) == tenant,
+        "the record for tenant {} holds the wallet key of another tenant",
+        hex::encode(tenant)
+    );
+    let decode = |m: &Member| -> Result<_> {
+        let id = Identifier::deserialize(&m.identifier)
+            .map_err(|e| anyhow::anyhow!("an identifier: {e}"))?;
+        let share = point::deserialize_compressed(&m.verifying_share)
+            .map_err(|e| anyhow::anyhow!("a verifying share: {e}"))?;
+        Ok((id, share))
+    };
+    let (signer, signer_share) = decode(&key.signer)?;
+    let (wallet, wallet_share) = decode(&key.wallet)?;
+    ensure!(signer != wallet, "the two holders are one identifier");
+    let group = point::deserialize_compressed(&key.group_key)
+        .map_err(|e| anyhow::anyhow!("the group key: {e}"))?;
+    let set = [signer.clone(), wallet.clone()];
+    let interpolated = signer_share * lagrange_coeff_at_zero(&signer, &set)
+        + wallet_share * lagrange_coeff_at_zero(&wallet, &set);
+    ensure!(
+        point::points_equal(&interpolated, &group),
+        "the verifying shares of tenant {} are not shares of its group key",
+        hex::encode(tenant)
+    );
+    Ok(())
 }
 
 mod hex_bytes {
@@ -701,6 +770,55 @@ mod tests {
             .await
             .unwrap();
         assert!(c.cached().await.unwrap().is_empty());
+    }
+
+    /// A real wallet key's record, and the tenant it names.
+    fn wallet_record() -> ([u8; 16], TenantKeyRecord) {
+        let (_, registered, _) = crate::signer::testing::enrol(&[7; 32], &[9; 16]);
+        let record = registered.key.record([0; SEALED_SHARE_LEN]);
+        (crate::tenant::tenant_of(&record.group_key), record)
+    }
+
+    #[tokio::test]
+    async fn a_tenant_is_read_back_as_registered() {
+        let r = roots();
+        let c = registry_on(r.clone(), 1, 4);
+        let (tenant, key) = wallet_record();
+        let registered = c.register(tenant, key.clone()).await.unwrap();
+        assert_eq!(registered.key, key);
+        c.check_place(tenant, &registered.place).await.unwrap();
+        // A fresh enclave reads the same record from the bucket.
+        let back = registry_on(r, 1, 4).tenant(tenant).await.unwrap().unwrap();
+        assert_eq!(back.key, key);
+        assert_eq!(back.place, registered.place);
+        assert!(c.register(tenant, key).await.is_err(), "registered twice");
+    }
+
+    /// A record names its tenant by its key, and its verifying shares must be shares of that
+    /// key: a host writing records of its own cannot make one speak for someone else.
+    #[tokio::test]
+    async fn a_record_that_does_not_add_up_is_refused() {
+        let c = registry_on(roots(), 1, 4);
+        let (tenant, key) = wallet_record();
+        assert!(
+            c.register([3; 16], key.clone()).await.is_err(),
+            "another tenant's name"
+        );
+
+        let mut forged = key.clone();
+        forged.wallet.verifying_share = forged.signer.verifying_share;
+        assert!(
+            c.register(tenant, forged).await.is_err(),
+            "shares of another key"
+        );
+
+        let mut odd = key.clone();
+        odd.group_key[0] = 0x03;
+        assert!(c.register(tenant, odd).await.is_err(), "an odd group key");
+
+        let mut one = key;
+        one.wallet.identifier = one.signer.identifier;
+        assert!(c.register(tenant, one).await.is_err(), "one holder twice");
     }
 
     #[tokio::test]

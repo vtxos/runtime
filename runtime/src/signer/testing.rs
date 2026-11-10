@@ -1,107 +1,81 @@
-//! A wallet's side of the DKG and of signing, as the app runs it, for the tests here and in the
-//! auth routes. Random, where a device derives it from the passkey's PRF: nothing on this side can
-//! tell the two apart.
+//! A wallet's side of the DKG and of signing, as the app runs it, for the tests here, the auth
+//! routes' and the harness's. Random, where a device may derive it from a PRF instead: nothing on
+//! this side can tell the two apart.
 
 use std::collections::BTreeMap;
 
-use rand_core::OsRng;
-
 use threshold::commitment::SigningPackage;
-use threshold::dkg::{
-    self, Round1Package, Round1SecretPackage, Round2Package, Round2SecretPackage,
-};
+use threshold::dkg::{self, Round1Package, Round1SecretPackage, Round2Package};
 use threshold::identifier::Identifier;
-use threshold::keys::KeyPackage;
+use threshold::keys::{KeyPackage, PublicKeyPackage};
 use threshold::nonce::{self, SigningCommitments};
 use threshold::point;
 use threshold::random::mod_n_random;
 use threshold::scalar::scalar_to_bytes;
 use threshold::signing;
 
-use super::dkg::{opening, register, Opening, Registered};
+use crate::random::Rng;
+
+use super::dkg::{deal, register, Registered};
 use super::signing::{Commitment, WalletRound};
 
 pub struct Wallet {
     pub(crate) round1: Round1SecretPackage,
-    /// Round one: what the wallet sends with `register/verify`.
+    /// Round one: what the wallet commits to with `register/options`.
     pub package: Round1Package,
-    /// The signer the wallet dealt to, and its part two, kept for part three.
-    dealt: Option<(Identifier, [u8; 33], Round2SecretPackage)>,
 }
 
 impl Wallet {
     pub fn random() -> Self {
-        let secret = mod_n_random(&mut OsRng);
-        let slope = mod_n_random(&mut OsRng);
+        let secret = mod_n_random(&mut Rng);
+        let slope = mod_n_random(&mut Rng);
         let (round1, package) =
-            dkg::dkg_part1(2, 2, &secret, &[slope], &mut OsRng).expect("dkg_part1");
-        Self {
-            round1,
-            package,
-            dealt: None,
-        }
+            dkg::dkg_part1(2, 2, &secret, &[slope], &mut Rng).expect("dkg_part1");
+        Self { round1, package }
     }
 
     pub fn id(&self) -> &Identifier {
         &self.round1.identifier
     }
 
-    /// Part two against the signer's opening, before its round one exists: its proof checked,
-    /// then the share for it.
-    pub fn deal(&mut self, opening: &Opening) -> Result<Round2Package, String> {
-        let vk = opening.verifying_key.serialize();
-        if Identifier::derive(&vk).map_err(|e| e.to_string())? != opening.identifier {
-            return Err("the opening's identifier is not its key's".into());
-        }
-        dkg::verify_proof_of_knowledge(&opening.identifier, &opening.verifying_key, &opening.proof)
-            .map_err(|e| e.to_string())?;
-        let (round2, mut out) = dkg::dkg_part2(
-            &self.round1,
-            &BTreeMap::new(),
-            std::slice::from_ref(&opening.identifier),
-        )
-        .map_err(|e| e.to_string())?;
-        let share = out
-            .remove(&opening.identifier)
-            .ok_or("no share for the signer")?;
-        self.dealt = Some((opening.identifier.clone(), vk, round2));
-        Ok(share)
-    }
-
-    /// Part three with the signer's round one and the share it dealt: the wallet's key package.
-    /// Its round one must open with the key the opening committed to.
-    pub fn finish(
+    /// Parts two and three against what `register/options` answered: the runtime's round one,
+    /// its proof checked, and the share it dealt. Returns the share for the runtime, which
+    /// `register/verify` carries, the wallet's own key package, and the key's public package.
+    pub fn respond(
         &self,
-        signer: &Round1Package,
+        runtime: &Round1Package,
         dealt: &Round2Package,
-    ) -> Result<KeyPackage, String> {
-        let (id, vk, round2) = self.dealt.as_ref().ok_or("no opening dealt to")?;
-        if signer.commitment.coeffs.len() != 2 || signer.verifying_key.serialize() != *vk {
-            return Err("the signer's round one is not what it opened with".into());
+    ) -> Result<(Round2Package, KeyPackage, PublicKeyPackage), String> {
+        if runtime.commitment.coeffs.len() != 2 {
+            return Err("the runtime's round one is not of a 2-of-2".into());
         }
-        let (key, _) = dkg::dkg_part3(
+        let id = Identifier::derive(&runtime.commitment.to_verifying_key().serialize())
+            .map_err(|e| e.to_string())?;
+        let theirs = BTreeMap::from([(id.clone(), runtime.clone())]);
+        let (round2, mut out) =
+            dkg::dkg_part2(&self.round1, &theirs, &[]).map_err(|e| e.to_string())?;
+        let to_runtime = out.remove(&id).ok_or("no share for the runtime")?;
+        let (key, public) = dkg::dkg_part3(
             &self.round1,
-            round2,
-            &BTreeMap::from([(id.clone(), signer.clone())]),
-            &BTreeMap::from([(id.clone(), dealt.clone())]),
+            &round2,
+            &theirs,
+            &BTreeMap::from([(id, dealt.clone())]),
             &[],
         )
         .map_err(|e| e.to_string())?;
-        Ok(key)
+        Ok((to_runtime, key, public))
     }
 }
 
-/// The whole registration DKG, both sides: the wallet, what the signer keeps, and the wallet's
+/// The whole registration DKG, both sides: the wallet, what the runtime keeps, and the wallet's
 /// key package.
 pub fn enrol(master: &[u8; 32], handle: &[u8; 16]) -> (Wallet, Registered, KeyPackage) {
-    let mut wallet = Wallet::random();
-    let to_signer = wallet
-        .deal(&opening(master, handle).expect("opening"))
-        .expect("deal");
-    let registered = register(master, handle, &wallet.package, &to_signer).expect("register");
-    let key = wallet
-        .finish(&registered.package, &registered.dealt)
-        .expect("finish");
+    let wallet = Wallet::random();
+    let answer = deal(master, handle, &wallet.package).expect("deal");
+    let (to_runtime, key, _) = wallet
+        .respond(&answer.package, &answer.dealt)
+        .expect("respond");
+    let registered = register(master, handle, &wallet.package, &to_runtime).expect("register");
     (wallet, registered, key)
 }
 
@@ -116,7 +90,7 @@ pub fn answer(
         .iter()
         .zip(commitments)
         .map(|(m, c)| {
-            let n = nonce::new_nonce(&mut OsRng, &wallet.secret_share);
+            let n = nonce::new_nonce(&mut Rng, &wallet.secret_share);
             let package = SigningPackage::new(
                 BTreeMap::from([
                     (

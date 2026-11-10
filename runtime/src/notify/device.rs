@@ -23,8 +23,8 @@
 //! failing. This is a cache of places a person can be reached, not a list of
 //! credentials: somebody on their ninth phone must still be able to enrol it,
 //! and the entry evicted is the one least likely to still be live. That is the
-//! deliberate opposite of [`crate::auth::credential`], where a revoked passkey
-//! is kept for ever so it can never be silently reinstated.
+//! deliberate opposite of a tenant's revocation ([`crate::store::registry`]),
+//! which is kept for ever so it can never be silently reinstated.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;

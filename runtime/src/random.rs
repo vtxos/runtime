@@ -10,7 +10,8 @@
 //! task and trace ids — come from the same source, through [`fill`] and
 //! [`Rng`], once boot has [`install`]ed it. What libraries draw
 //! inside themselves takes no source to hand them, and stays on the kernel:
-//! aws-lc's key generation and TLS handshakes, and webauthn-rs's challenges.
+//! aws-lc's key generation and TLS handshakes, including the serving
+//! certificate's key.
 //!
 //! Bytes come **straight from the device on every call**. There is no DRBG in
 //! between, so the trust argument is "the NSM produced these" with nothing

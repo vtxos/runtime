@@ -87,7 +87,7 @@ resource "aws_route_table_association" "public" {
 
 resource "aws_security_group" "enclave" {
   name        = "${local.name}-enclave"
-  description = "Inbound HTTPS to the enclave; egress for S3, KMS and ACME"
+  description = "Inbound HTTPS to the enclave; egress for the AWS services it calls"
   vpc_id      = aws_vpc.this.id
   tags        = local.tags
 
@@ -120,7 +120,7 @@ resource "aws_security_group" "enclave" {
   # machine that proxies every byte in and out of the enclave. Use SSM if a
   # session is genuinely needed.
   egress {
-    description = "Outbound for S3, KMS and the ACME provider"
+    description = "Outbound for S3, KMS and the other AWS services the enclave calls"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"

@@ -355,7 +355,7 @@ async fn a_trap_dies_with_its_request() {
 ///
 /// These tests exercise what happens *after* authentication — isolation,
 /// fresh instances, concurrency — so they take the tenant as given. That the tenant can
-/// only come from a verified assertion is the gate's own business, and
+/// only come from a verified sign-in is the gate's own business, and
 /// `auth::gate` tests it directly.
 fn identity(name: &str) -> [u8; 16] {
     let full = nitro_attestation::sha256(name.as_bytes());

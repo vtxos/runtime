@@ -1,30 +1,28 @@
-//! A tenant: one user, the passkey they registered, and every key their data is opened with.
+//! A tenant: one user, the wallet key they share with the runtime, and every key their data is
+//! opened with.
 //!
 //! ```text
-//!   passkey credential id ──sha256("enclave/tenant/v1" ‖ id)[..16]──► tenant id
-//!   passkey PRF output ──HKDF-SHA256(salt "aegira/tenant-key/v1", info tenant id)──► K_t
-//!                                     (in the owner's app, never here)
-//!   K_t ──HKDF-SHA384(salt fs_uuid, info purpose ‖ pool id)──┬─ signing:    pool anchor key
-//!                                                            │              task signing key
-//!                                                            └─ encryption: pool disk key
-//!                                                                           task seal key
+//!   group key X ──sha256("aegira/tenant/v1" ‖ X)[..16]──► tenant id
+//!   the client's share + the runtime's share ──threshold ECDH on X──► k
+//!   k ──HKDF-SHA384(salt fs_uuid, info purpose ‖ pool id)──┬─ signing:    pool anchor key
+//!                                                          │              task signing key
+//!                                                          └─ encryption: pool disk key
+//!                                                                         task seal key
 //! ```
 //!
-//! **The tenant id** is derived from the credential id ([`tenant_of`]): nothing to mint and
-//! nothing to store. A credential id is registered once and kept when revoked, so it names one
-//! tenant forever. A replacement passkey is a new tenant with an empty pool; a synced passkey is
-//! the same credential on every device.
+//! **The tenant id** is derived from the wallet's group public key ([`tenant_of`]): nothing to
+//! mint and nothing to store. Every share of that key, today's or a later recovery share, belongs
+//! to the same `X`, so losing one share never changes who the tenant is.
 //!
-//! **K_t** ([`TenantKey`]) is the root of everything the tenant owns. The owner's app derives it
-//! from its passkey's PRF output during the same ceremony that produces the assertion, at
-//! registration and at every sign-in, and sends it only after checking this enclave's PCR0 and
-//! PCR16 on that connection. It never sends the PRF output itself, which also seeds the wallet's
-//! half of the wallet key. A release the app does not approve is never sent K_t, and so can open
-//! none of the tenant's data. It is the same on every release, so the data outlives every release,
-//! and nothing the enclave or its operator holds can produce it.
+//! **k** ([`TenantKey`]) is the root of everything the tenant owns. Neither side holds it: each
+//! sign-in that needs it derives it by threshold ECDH ([`threshold::ecdh`]) between the client's
+//! share, which never leaves the client, and the runtime's ([`crate::signer`]). Any qualifying
+//! pair of shares derives the same `k`, so the data outlives every release and every device. The
+//! client sends its half only to a release whose attestation it has checked, so a release it does
+//! not approve can open none of the tenant's data.
 //!
-//! **What K_t derives** is per pool: `fs_uuid` is the HKDF salt and the pool id is in the info, so
-//! one K_t never keys two pools or two filesystems. One key per purpose, so a weakness in one use
+//! **What k derives** is per pool: `fs_uuid` is the HKDF salt and the pool id is in the info, so
+//! one `k` never keys two pools or two filesystems. One key per purpose, so a weakness in one use
 //! cannot be pivoted into another:
 //! - signing — the pool's anchor key ([`KeyMaterial`]) and its task signing key ([`TaskKeys`]);
 //! - encryption — the pool's disk key ([`pool_dmcrypt_key`]) and its task seal key ([`TaskKeys`]).
@@ -33,7 +31,6 @@
 //! hangs off the release's master secret instead ([`crate::store::crypto::keys`]).
 
 use aws_lc_rs::aead::LessSafeKey;
-use aws_lc_rs::hkdf::{KeyType, Salt, HKDF_SHA256};
 use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -44,58 +41,34 @@ use crate::store::error::{StoreError, StoreResult};
 /// The tenant of a deployment with no gate.
 pub const ANONYMOUS: [u8; 16] = [0; 16];
 
-/// The HKDF salt K_t is derived under. Changing it changes every tenant's key, and strands every
-/// pool.
-pub const KEY_SALT: &[u8] = b"aegira/tenant-key/v1";
-
-/// HKDF info strings for what K_t derives. Versioned so a future format revision can rotate a
-/// derived key without changing K_t.
+/// HKDF info strings for what `k` derives. Versioned so a future format revision can rotate a
+/// derived key without changing `k`.
 const INFO_POOL_SIGN: &[u8] = b"aegira/pool/anchor-sign/v1";
 const INFO_POOL_DMCRYPT: &[u8] = b"aegira/pool/dmcrypt/v1";
 /// Sign and seal a tenant's scheduled tasks, which live outside the enclave.
 const INFO_TASK_SIGN: &[u8] = b"aegira/pool/task-sign/v1";
 const INFO_TASK_SEAL: &[u8] = b"aegira/pool/task-seal/v1";
 
-/// The tenant a credential speaks for: the first sixteen bytes of
-/// `sha256("enclave/tenant/v1" || credential_id)`.
+/// The tenant a wallet key belongs to: the first sixteen bytes of
+/// `sha256("aegira/tenant/v1" ‖ X)`, with `X` the group key compressed.
 ///
 /// Every tenant's record and pool is named by this, so changing it strands them all;
 /// `tenant_of_is_pinned` is what notices.
-pub fn tenant_of(credential_id: &[u8]) -> [u8; 16] {
+pub fn tenant_of(group_key: &[u8; 33]) -> [u8; 16] {
     let digest =
-        nitro_attestation::sha256(&[b"enclave/tenant/v1".as_slice(), credential_id].concat());
+        nitro_attestation::sha256(&[b"aegira/tenant/v1".as_slice(), group_key.as_slice()].concat());
     digest[..16].try_into().expect("16 bytes")
 }
 
-/// One tenant's key, K_t: the root of its pool, and of nothing else. Scrubbed on drop, never
+/// One tenant's key, `k`: the root of its pool, and of nothing else. Scrubbed on drop, never
 /// printed.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct TenantKey([u8; 32]);
 
 impl TenantKey {
+    /// `k` as threshold ECDH derived it, or as this release's cache kept it.
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         TenantKey(bytes)
-    }
-
-    /// K_t for the tenant `tenant_id`, from its passkey's PRF output: what every client computes.
-    ///
-    /// SHA-256 rather than the SHA-384 the enclave's own derivations use, because this one is
-    /// computed on phones, and every platform has it. The enclave never has a PRF output to call
-    /// this with; it is here so the derivation and its pinned vector live beside the key.
-    pub fn derive(prf: &[u8], tenant_id: &[u8; 16]) -> Self {
-        struct Len32;
-        impl KeyType for Len32 {
-            fn len(&self) -> usize {
-                32
-            }
-        }
-        let mut out = [0u8; 32];
-        Salt::new(HKDF_SHA256, KEY_SALT)
-            .extract(prf)
-            .expand(&[tenant_id], Len32)
-            .and_then(|okm| okm.fill(&mut out))
-            .expect("32 bytes is within HKDF-SHA256's output limit");
-        TenantKey(out)
     }
 
     /// The raw bytes, for sealing the key into this release's cache.
@@ -257,33 +230,50 @@ mod tests {
     }
 
     /// Every tenant's record and pool is named by this value. A change here is every tenant
-    /// waking up to an empty pool, so it has to be deliberate.
+    /// waking up to an empty pool, so it has to be deliberate. `X = 7·G`; the vector is the one
+    /// `docs/CLIENT_INTEGRATION.md` publishes, checked against an independent SHA-256.
     #[test]
     fn tenant_of_is_pinned() {
+        let x = hex::decode("025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc")
+            .unwrap();
         assert_eq!(
-            hex::encode(tenant_of(b"credential")),
-            "a0e215ab9e6d4fc553fe89c4d78b844f"
+            hex::encode(tenant_of(&x.try_into().unwrap())),
+            "ecf80fb854cd261687d9881a8b6498ec"
         );
     }
 
-    /// Byte for byte, what every client computes. A change here strands every tenant's pool; the
-    /// vector is the one `docs/CLIENT_INTEGRATION.md` publishes.
+    /// From a pair of shares to the pool's anchor key, end to end: what a client's sign-in and
+    /// the runtime's half of it make together. A change here strands every pool. `f(z) = 7 + 3z`,
+    /// holders 1 and 2, and `k` as `threshold`'s known answers pin it.
     #[test]
-    fn the_key_derivation_is_pinned() {
-        let key = TenantKey::derive(&[0x11; 32], &[0x22; 16]);
-        assert_eq!(
-            hex::encode(key.expose_secret()),
-            "57c4b615bf5da47923a682fed599cc34355bf19467ea46c482f244d13bebde6c"
+    fn shares_to_anchor_key_is_pinned() {
+        use k256::Scalar;
+        use threshold::ecdh::Session;
+        use threshold::identifier::Identifier;
+        use threshold::point;
+
+        let x = point::base_mul(&Scalar::from(7u64));
+        let (one, two) = (
+            Identifier::from_u16(1).unwrap(),
+            Identifier::from_u16(2).unwrap(),
         );
+        let (x_1, x_2) = (Scalar::from(10u64), Scalar::from(13u64));
+        let mut rng = crate::random::Rng;
+        let (s_1, _) = Session::start(&x, &one, &x_1, b"t", &mut rng).unwrap();
+        let (_, p_2) = Session::start(&x, &two, &x_2, b"t", &mut rng).unwrap();
+        let k = s_1.finish(&two, &point::base_mul(&x_2), &p_2).unwrap();
+        assert_eq!(
+            hex::encode(*k),
+            "c607455d21237800381d7a93b72a0eab6fa842abf15b8cd85688eb5c2460ce74"
+        );
+        let anchor =
+            KeyMaterial::for_pool(&TenantKey::from_bytes(*k), [1u8; 16], &[3u8; 16]).unwrap();
+        assert_eq!(hex::encode(anchor.public_key()), ANCHOR_KEY);
     }
 
-    /// One PRF output, two tenants: two keys.
-    #[test]
-    fn the_tenant_id_separates_keys() {
-        let a = TenantKey::derive(&[0x11; 32], &[1; 16]);
-        let b = TenantKey::derive(&[0x11; 32], &[2; 16]);
-        assert!(!a.ct_eq(&b));
-    }
+    /// What [`shares_to_anchor_key_is_pinned`] derives, checked against an independent HKDF-SHA384
+    /// and Ed25519.
+    const ANCHOR_KEY: &str = "71dd455cc3611f79767d98ceedd82238cec63ff19173b2eb0230fe3575790d8f";
 
     #[test]
     fn tenant_keys_compare_by_value() {

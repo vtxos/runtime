@@ -1,4 +1,4 @@
-//! Interaction tokens: what a passkey approval buys, once.
+//! Interaction tokens: what a signed approval buys, once.
 //!
 //! A person approves an **interaction** — one HTTP request and its response, or
 //! one bidirectional stream until it closes or reaches its lifetime limit. The
@@ -17,8 +17,9 @@
 //! payload. Nothing here should be described as proof that a person approved
 //! particular bytes, because it is not.
 //!
-//! What it does still carry: a person authenticated with their passkey to get
-//! it, it belongs to exactly one tenant, it is good once, and it expires.
+//! What it does still carry: it was bought with a signature by the tenant's
+//! own share of the wallet key, it belongs to exactly one tenant, it is good
+//! once, and it expires.
 //!
 //! # Why the store never holds a token
 //!

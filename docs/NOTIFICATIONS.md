@@ -69,7 +69,7 @@ boot; a channel that cannot be reached only warns.
 
 Notifications require authentication and tenant isolation, for the same reason
 background tasks do: the tenant a wake belongs to comes from a verified
-assertion, and without a gate there is none.
+sign-in, and without a gate there is none.
 
 In the Nix deployment set `pushAppId` in `deploy/nix/deployment.nix`, and
 `push_app_id` in `deploy/tofu`, which lets the parent's role send through that

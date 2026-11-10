@@ -18,7 +18,7 @@ pub const DEFAULT_ROOT_RETENTION: Duration = Duration::from_secs(10 * 365 * 24 *
 /// Everything needed to reach the store.
 #[derive(Debug, Clone)]
 pub struct MountConfig {
-    /// The Object-Locked bucket: anchors, boot records, guest, ACME cache.
+    /// The Object-Locked bucket: anchors, boot records, the registry, the guest.
     pub roots_bucket: String,
     pub region: String,
     pub endpoint: Option<String>,

@@ -67,33 +67,34 @@ enclave_bring_up
 # ---------------------------------------------------------------------------
 # The assertions.
 # ---------------------------------------------------------------------------
-say "1/8  the guest is unreachable without a passkey assertion"
+say "1/8  the guest is unreachable without a signed approval"
 # The rule, at the front because everything after it depends on it holding:
-# nothing reaches the guest without a fresh assertion bound to that request.
-#
-# The nonce is sent so the *gate* is what refuses. Every request needs one,
-# and it is checked before routing — so without it these would be 400s, and
-# this leg would pass while proving nothing about the gate.
-nonce() { openssl rand 20 | basenc --base64url | tr -d '='; }
+# nothing reaches the guest without a fresh approval, signed with the tenant's
+# wallet share, bound to that request. A guest call sends no nonce.
 for path in / /counter /memory; do
     code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 \
-        -H "x-enclave-nonce: $(nonce)" \
         "https://127.0.0.1:$HTTPS_PORT$path")"
     [[ "$code" == "401" ]] \
-        || fail "$path answered $code without an assertion; the gate is not wired up"
+        || fail "$path answered $code without a token; the gate is not wired up"
 done
 echo "unauthenticated requests refused: 401"
 
-# And a request with no nonce at all never reaches the gate either.
-code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 \
-    "https://127.0.0.1:$HTTPS_PORT/counter")"
-[[ "$code" == "400" ]] \
-    || fail "a request with no nonce answered $code; it should be refused before routing"
-echo "un-nonced requests refused: 400"
+# An options call does need one: its answer is attested. A well-formed request
+# for a challenge, which with a nonce would be issued one, is refused before it
+# is routed.
+options='{"group_key":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","method":"GET","path":"/counter"}'
+answer="$(curl -sk --max-time 20 -X POST -H 'content-type: application/json' \
+    -d "$options" -w ' %{http_code}' "https://127.0.0.1:$HTTPS_PORT/auth/request/options")"
+[[ "$answer" == *x-enclave-nonce*" 400" ]] \
+    || fail "an options call with no nonce answered: $answer; it should be refused before routing"
+echo "an options call without a nonce refused: 400"
 
-say "2/8  a passkey enrols and its signed requests reach the guest"
-rm -f "$RUNDIR/alice.json" "$RUNDIR/bob.json"
-signed enrol >/dev/null || fail "registration failed"
+say "2/8  a wallet registers and its signed requests reach the guest"
+# Registration is the wallet key's DKG, in two calls, and it ends with the
+# tenant's pool created under the key the two shares derive. Its first answer
+# is attested; the proof is kept for leg 3.
+rm -rf "$RUNDIR/alice.json" "$RUNDIR/bob.json" "$RUNDIR/proof-register"
+signed --dump-proof "$RUNDIR/proof-register" enrol >/dev/null || fail "registration failed"
 
 first="$(signed get --path /counter)" || fail "no answer from the guest"
 second="$(signed get --path /counter)" || fail "no answer from the guest"
@@ -136,12 +137,18 @@ done
 echo "$FILES files written, read, overwritten and re-read through the gate"
 
 say "3/8  the attestation binds this connection's certificate, runtime and guest"
-# There is no attestation endpoint: the document rides on the `/auth/` exchange,
-# in `x-enclave-attestation`. That is where a client identifies the enclave
-# before approving anything, and it needs no credential — so this is the check a
-# client makes on the connection it then goes on to use.
+# There is no attestation endpoint: a document rides on exactly two answers, in
+# `x-enclave-attestation` — the options calls, `register/options` and
+# `request/options`, which a client checks before it sends anything secret.
+# This is the first: what the wallet checked before it dealt its share. `--dump-proof` kept the
+# three things a verifier cannot recover afterwards: the document, the
+# certificate that connection was served, and the nonce the request sent.
+[[ -s "$RUNDIR/proof-register/document.b64" ]] \
+    || fail "register/options carried no attestation document"
 "$ATTEST" \
-    --url "https://127.0.0.1:$HTTPS_PORT/auth/" \
+    --document "$RUNDIR/proof-register/document.b64" \
+    --peer-certificate "$RUNDIR/proof-register/certificate.der" \
+    --nonce "$(cat "$RUNDIR/proof-register/nonce.hex")" \
     --trust-root "$TRUST_ROOT" \
     --pcr0 "$EXPECTED_PCR0" \
     --guest "$RUNDIR/guests/guest.wasm" \
@@ -151,21 +158,17 @@ say "3/8  the attestation binds this connection's certificate, runtime and guest
 grep -q "binding    the attested certificate" "$RUNDIR/attest.log" \
     || fail "the document did not bind the certificate this connection was served"
 
-say "3b/8 a signed interaction verifies the enclave before it trusts it"
-# The proof comes from the `/auth/` exchange, not from the guest's response:
-# that exchange is where a client identifies the enclave, before it hands over
-# an assertion and before the interaction runs. Guest responses deliberately
-# carry no document — the client has pinned the certificate by then, and TLS
-# proves the peer still holds its key.
-#
-# `--dump-proof` keeps the three things a verifier cannot recover afterwards:
-# the document, the certificate that connection was served, and the nonce the
-# request sent.
+say "3b/8 a sign-in verifies the enclave before it trusts it"
+# The second: the answer to a sign-in's challenge. That is where a client
+# identifies the enclave and pins the certificate, before it signs or sends the
+# ECDH partial that opens its pool. The verify call's answer and guest responses
+# deliberately carry no document — the client has pinned the certificate by
+# then, and TLS proves the peer still holds its key.
 rm -rf "$RUNDIR/proof"
 signed --dump-proof "$RUNDIR/proof" get --path /counter >/dev/null \
     || fail "the signed interaction failed"
 [[ -s "$RUNDIR/proof/document.b64" ]] \
-    || fail "the challenge exchange carried no attestation document"
+    || fail "the challenge's answer carried no attestation document"
 
 "$ATTEST" \
     --document "$RUNDIR/proof/document.b64" \
@@ -175,7 +178,7 @@ signed --dump-proof "$RUNDIR/proof" get --path /counter >/dev/null \
     --pcr0 "$EXPECTED_PCR0" \
     --guest "$RUNDIR/guests/guest.wasm" \
     | tee "$RUNDIR/attest-guest.log" \
-    || fail "the challenge exchange's document did not verify"
+    || fail "the challenge's document did not verify"
 
 grep -q "binding    the attested certificate" "$RUNDIR/attest-guest.log" \
     || fail "the document did not bind that connection's certificate"
@@ -316,7 +319,7 @@ echo "guest output arrived framed, tagged by stream, and marked as guest"
 # ---------------------------------------------------------------------------
 # Everything above is request and response: a client signs, the guest answers,
 # and the approval is spent by the time the connection closes. Background work
-# is the one place that shape does not hold. The assertion authorises an
+# is the one place that shape does not hold. The signed approval authorises an
 # enqueue, and what it authorised runs later on the enclave's own schedule —
 # with nobody signing anything at that moment, because there is no one there to
 # sign. That is the whole of standing authority, and it is the part a
@@ -325,7 +328,7 @@ echo "guest output arrived framed, tagged by stream, and marked as guest"
 # Worth proving in an enclave rather than only in-process: the scheduler runs
 # against the mounted filesystem and the per-tenant lock, and neither of those
 # is what a unit test exercises.
-say "6/8  work approved once runs later, without a second assertion"
+say "6/8  work approved once runs later, without a second approval"
 
 # Enrolled first, or there is nobody to wake when the task finishes. This is an
 # ordinary signed interaction: enrolling is interactive-only, so it could not
@@ -339,9 +342,9 @@ signed post --path /devices --body "$DEVICE_TOKEN" >/dev/null \
 signed post --path /tasks/e2e-job --body "scheduled work" >/dev/null \
     || fail "the scheduled task was refused"
 
-# The work belongs to the passkey that asked for it. Bob holds a perfectly good
-# credential and is still told there is no such task, because a task id is
-# scoped to its tenant rather than being a name everyone shares.
+# The work belongs to the wallet that asked for it. Bob holds a perfectly good
+# wallet and is still told there is no such task, because a task id is scoped
+# to its tenant rather than being a name everyone shares.
 if signed2 get --path /tasks/e2e-job >/dev/null 2>&1; then
     fail "a second tenant could see another tenant's task"
 fi
@@ -365,7 +368,7 @@ done
 result="$(jq -r '.result | implode' <<<"$record")"
 [[ "$result" == "scheduled work" ]] \
     || fail "the task completed but produced \"$result\""
-echo "scheduled work ran for its owner alone, with no second assertion signed"
+echo "scheduled work ran for its owner alone, with no second approval signed"
 
 say "6b/8 the finished task woke its owner, and told AWS and Google nothing"
 # The wake was raised inside `run-task`, by background work, with nobody signing
@@ -473,8 +476,8 @@ echo "restart $second_version"
 # guest: the enclave measures whatever arrives into PCR16 before anything asks
 # for a key. That is shown here from both sides — the enclave boots as a new
 # release, with none of the old release's tenants attached, and a client
-# pinning the approved guest refuses to talk to it, and so never sends it a
-# tenant key.
+# pinning the approved guest refuses it on the attestation its sign-in is
+# answered with, and so never sends it the ECDH partial that opens its pool.
 #
 # What this cannot show is KMS refusing it, which is the half that keeps the
 # data out of reach. The emulator image uses the static key source, because KMS
@@ -499,18 +502,26 @@ grep -q "resumed=0" <(plain) \
     || fail "a new release attached a tenant whose owner never sent it a key"
 wait_for_https || fail "the enclave running the substitute never answered HTTPS"
 
-if "$ATTEST" --url "https://127.0.0.1:$HTTPS_PORT/auth/" --trust-root "$TRUST_ROOT" \
-        --pcr0 "$EXPECTED_PCR0" --guest "$RUNDIR/guests/guest.wasm" \
+# Alice signs in as she would anywhere. The answer to her challenge carries the
+# substitute's attestation, which the client checks before it signs anything,
+# and refuses.
+rm -rf "$RUNDIR/proof-substitute"
+if signed --dump-proof "$RUNDIR/proof-substitute" get --path /counter \
         > "$RUNDIR/attest-substitute.log" 2>&1; then
-    fail "a client pinning the approved guest accepted an enclave running another"
+    fail "a client pinning the approved guest signed in to an enclave running another"
 fi
 grep -q "PCR16 mismatch" "$RUNDIR/attest-substitute.log" \
     || fail "the client refused, but not on PCR16: $(tail -1 "$RUNDIR/attest-substitute.log")"
-echo "a client pinning the approved guest refused: PCR16 mismatch"
+echo "a client pinning the approved guest refused before sending its key: PCR16 mismatch"
 
-# And it is not hiding what it runs: pinned to the substitute, the same client
-# accepts. The enclave attests the guest it fetched, whichever that was.
-"$ATTEST" --url "https://127.0.0.1:$HTTPS_PORT/auth/" --trust-root "$TRUST_ROOT" \
+# And it is not hiding what it runs: the document it answered with verifies
+# against the substitute. The enclave attests the guest it fetched, whichever
+# that was.
+"$ATTEST" \
+    --document "$RUNDIR/proof-substitute/document.b64" \
+    --peer-certificate "$RUNDIR/proof-substitute/certificate.der" \
+    --nonce "$(cat "$RUNDIR/proof-substitute/nonce.hex")" \
+    --trust-root "$TRUST_ROOT" \
     --pcr0 "$EXPECTED_PCR0" --guest "$RUNDIR/guests/substitute.wasm" \
     > "$RUNDIR/attest-substitute-pinned.log" \
     || fail "the enclave does not attest the guest it actually fetched"
@@ -522,21 +533,22 @@ cat <<EOF
 
 == PASS ==
   the ZFS pool on the parent's disk over vsock, every write anchored in MinIO
-  the serving certificate was obtained over real ACME and chains to the CA
+  the serving certificate was made inside the enclave at boot
   TLS terminated in the enclave, certificate hash bound into the document
   every document verified by signature and certificate chain against a pinned
     root, the check a client makes against AWS's
   the document's PCR0 matches the reproducible build
   the guest was fetched from the store, measured into PCR16 and locked, and
     the attested PCR16 matches the release build
-  the guest was unreachable without a passkey assertion
-  a passkey enrolled and its signed requests were served
+  the guest was unreachable without a signed approval
+  a wallet registered — the DKG, and its pool created under the key both
+    shares derive — and its signed requests were served
   an approval for one route did not authorize another
   every request got a fresh instance, and no two tenants shared one
   one tenant could not read another's file
   guest stdout and stderr arrived framed and marked as untrusted
   work approved by one interaction ran later, for its owner alone, with no
-    second assertion signed
+    second approval signed
   that finished task woke an enrolled device with a data-only message that
     carried no title, no body and nothing a person would read
   a release minted its key once, and a restart opened it and re-attached its tenant

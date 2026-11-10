@@ -16,8 +16,8 @@
 //! trusts outbound is part of what a client attests to.
 //!
 //! There is deliberately **no custom certificate verifier** on this path.
-//! `src/bin/passkey-client.rs` has one; that binary exists to drive a
-//! self-signed harness and is behind the `testing` feature. Nothing here may
+//! `src/bin/wallet-client.rs` has one; that binary exists to drive a
+//! self-signed enclave and is behind the `testing` feature. Nothing here may
 //! acquire one, whatever a test would find convenient.
 
 use anyhow::{Context, Result};

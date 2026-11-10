@@ -1,19 +1,21 @@
-//! The signer's half of the wallet key's DKG, run inside the passkey's registration.
+//! The signer's half of the wallet key's DKG, run inside registration.
 //!
 //! A wallet key is a 2-of-2 FROST key between the owner's wallet and the signer, made by a
 //! Pedersen DKG. The signer's polynomial is not random: it is derived from the operator master
-//! and the registration's user handle, so the same passkey under the same master always rebuilds
-//! the same key. The master alone signs nothing: the signer's share is `f_c(id_c) + f_w(id_c)`,
-//! and `f_w` is the wallet's, derived from its passkey's PRF.
+//! and a handle the registration mints, so it is never stored, only its handle. The master alone
+//! signs nothing: the signer's share is `f_c(id_c) + f_w(id_c)`, and `f_w` is the wallet's.
 //!
-//! The ceremony is two messages, because the signer commits first:
+//! The ceremony is two messages, and the wallet commits first:
 //!
-//! - `register/options` sends the [`opening`]: `id_c`, `a0_c·G` and a proof of knowledge of
-//!   `a0_c`. `id_c` is a hash of `a0_c·G`, and `a0_c` comes from the handle alone, so all three
-//!   exist before the passkey does.
-//! - `register/verify` brings the wallet's round one and the share it dealt `id_c`, and
-//!   [`register`] answers with the signer's round one, the share it deals the wallet, and the
-//!   finished key.
+//! - `register/options` brings the wallet's round one: its commitment and a proof of knowledge of
+//!   its secret, nothing secret. [`deal`] answers with the signer's round one and the share it
+//!   deals the wallet, so the wallet can finish its share before the second message.
+//! - `register/verify` brings the share the wallet dealt `id_c`, and [`register`] finishes the
+//!   key. The wallet's signature and ECDH partial ride with it, made with the share it just
+//!   finished, so registration ends with the tenant's pool created.
+//!
+//! The signer reveals its commitment only after the wallet has committed to its own, and its
+//! polynomial is derived inside attested code from a fresh handle: it cannot steer the key.
 
 use std::collections::BTreeMap;
 
@@ -26,47 +28,39 @@ use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
 use threshold::dkg::{
-    self, DkgSignature, Round1Package, Round1SecretPackage, Round2Package, Round2SecretPackage,
+    self, Round1Package, Round1SecretPackage, Round2Package, Round2SecretPackage,
 };
 use threshold::identifier::Identifier;
-use threshold::keys::VerifyingKey;
+use threshold::polynomial;
 use threshold::scalar::scalar_to_bytes;
-use threshold::{point, polynomial};
 
 use super::key::WalletKey;
 
 /// The HKDF salt for the signer's polynomial.
 pub const SALT: &[u8] = b"aegira/cosigner-dkg/v1";
 
-/// The signer's opening: its commitment to its secret, sent with the registration challenge,
-/// before the wallet has made anything.
-pub struct Opening {
-    /// `id_c`, derived from `a0_c·G` as `threshold` derives every identifier.
-    pub identifier: Identifier,
-    /// `a0_c·G`.
-    pub verifying_key: VerifyingKey,
-    /// Proof of knowledge of `a0_c`, under `identifier`.
-    pub proof: DkgSignature,
+/// What [`deal`] answers the wallet's round one with.
+pub struct Deal {
+    /// The signer's round-one package: its commitment and proof of knowledge.
+    pub package: Round1Package,
+    /// `f_c(id_w)`: the share the signer deals the wallet.
+    pub dealt: Round2Package,
 }
 
-/// The opening for the registration whose user handle is `handle`.
-pub fn opening(master: &[u8; 32], handle: &[u8; 16]) -> Result<Opening, String> {
-    let a0 = derive(master, &[&handle[..], &[0]])?;
-    let verifying_key = VerifyingKey::new(point::base_mul(&a0));
-    let identifier = Identifier::derive(&verifying_key.serialize())
-        .map_err(|e| format!("the signer's identifier: {e}"))?;
-    // It reads only the constant term, so it can be made before the slope exists.
-    let proof = dkg::compute_proof_of_knowledge(
-        &identifier,
-        std::slice::from_ref(&*a0),
-        &verifying_key,
-        &mut Rng,
-    )
-    .map_err(|e| format!("proof of knowledge: {e}"))?;
-    Ok(Opening {
-        identifier,
-        verifying_key,
-        proof,
+/// The signer's answer to a wallet's round one: its own round one, and the share it deals the
+/// wallet. Nothing is kept: [`register`] derives the same polynomial again from the handle.
+///
+/// Fails if the wallet's proof of knowledge does not verify.
+pub fn deal(master: &[u8; 32], handle: &[u8; 16], wallet: &Round1Package) -> Result<Deal, String> {
+    let dealer = Dealer::new(master, handle, wallet)?;
+    let dealt = dealer
+        .shares
+        .get(&dealer.wallet)
+        .cloned()
+        .ok_or("dkg_part2 dealt the wallet nothing")?;
+    Ok(Deal {
+        package: dealer.package.clone(),
+        dealt,
     })
 }
 
@@ -126,8 +120,8 @@ pub fn dealt_share(
     Ok(Zeroizing::new(scalar_to_bytes(&share)))
 }
 
-/// The signer's polynomial for the wallet that is `wallet`: `a0_c` from the handle, so the
-/// opening can commit to it, and `a1_c` from the handle and the wallet.
+/// The signer's polynomial for the wallet that is `wallet`: `a0_c` from the handle, and `a1_c`
+/// from the handle and the wallet.
 ///
 /// `id_w` is in the slope's seed because a degree-1 polynomial is recovered from any two of its
 /// points: two wallets dealt to under one handle get points on two different lines through
@@ -171,7 +165,7 @@ impl Dealer {
         let id = Identifier::derive(&wallet.commitment.to_verifying_key().serialize())
             .map_err(|e| format!("the wallet's identifier: {e}"))?;
         let a = coefficients(master, handle, &id)?;
-        // Derives `id_c` from `a0_c·G`, as the opening did.
+        // Derives `id_c` from `a0_c·G`.
         let (round1, package) = dkg::dkg_part1(2, 2, &a[0], &a[1..], &mut Rng)
             .map_err(|e| format!("dkg_part1: {e}"))?;
         let (round2, shares) = dkg::dkg_part2(
@@ -209,17 +203,19 @@ mod tests {
     const MASTER: [u8; 32] = [7; 32];
     const HANDLE: [u8; 16] = [9; 16];
 
+    /// What `register/options` answers with is what `register/verify` finishes: the polynomial
+    /// is derived again, not kept.
     #[test]
-    fn the_opening_is_the_round_one_registration_answers_with() {
-        let o = opening(&MASTER, &HANDLE).unwrap();
-        dkg::verify_proof_of_knowledge(&o.identifier, &o.verifying_key, &o.proof)
-            .expect("the opening proves its secret");
-        let (_, registered, _) = enrol(&MASTER, &HANDLE);
-        assert_eq!(registered.key.signer(), &o.identifier);
+    fn the_deal_is_the_round_one_registration_finishes_with() {
+        let w = Wallet::random();
+        let d = deal(&MASTER, &HANDLE, &w.package).unwrap();
+        let (to_signer, _, _) = w.respond(&d.package, &d.dealt).unwrap();
+        let registered = register(&MASTER, &HANDLE, &w.package, &to_signer).unwrap();
         assert_eq!(
             registered.package.verifying_key.serialize(),
-            o.verifying_key.serialize()
+            d.package.verifying_key.serialize()
         );
+        assert_eq!(registered.dealt.secret_share, d.dealt.secret_share);
     }
 
     #[test]
@@ -231,18 +227,26 @@ mod tests {
     }
 
     #[test]
-    fn the_same_passkey_rebuilds_the_same_key() {
-        let mut w = Wallet::random();
-        let to_signer = w.deal(&opening(&MASTER, &HANDLE).unwrap()).unwrap();
+    fn the_same_handle_rebuilds_the_same_key() {
+        let w = Wallet::random();
+        let d = deal(&MASTER, &HANDLE, &w.package).unwrap();
+        let (to_signer, _, _) = w.respond(&d.package, &d.dealt).unwrap();
         let first = register(&MASTER, &HANDLE, &w.package, &to_signer).unwrap();
         let again = register(&MASTER, &HANDLE, &w.package, &to_signer).unwrap();
         assert_eq!(first.key.group_key(), again.key.group_key());
-        assert_eq!(first.key.encode(), again.key.encode());
+        assert_eq!(first.key.secret_share(), again.key.secret_share());
     }
 
     #[test]
     fn each_handle_and_master_gets_its_own_signer() {
-        let id = |master, handle| opening(master, handle).unwrap().identifier;
+        let w = Wallet::random();
+        let id = |master, handle| {
+            deal(master, handle, &w.package)
+                .unwrap()
+                .package
+                .verifying_key
+                .serialize()
+        };
         assert_ne!(id(&MASTER, &HANDLE), id(&MASTER, &[8; 16]));
         assert_ne!(id(&MASTER, &HANDLE), id(&[6; 32], &HANDLE));
     }
@@ -268,8 +272,9 @@ mod tests {
 
     #[test]
     fn a_share_off_the_wallets_commitment_is_refused() {
-        let mut w = Wallet::random();
-        let mut forged = w.deal(&opening(&MASTER, &HANDLE).unwrap()).unwrap();
+        let w = Wallet::random();
+        let d = deal(&MASTER, &HANDLE, &w.package).unwrap();
+        let (mut forged, _, _) = w.respond(&d.package, &d.dealt).unwrap();
         forged.secret_share += Scalar::ONE;
         assert!(register(&MASTER, &HANDLE, &w.package, &forged).is_err());
     }
@@ -277,8 +282,7 @@ mod tests {
     #[test]
     fn a_bad_proof_of_knowledge_is_refused() {
         let mut w = Wallet::random();
-        let to_signer = w.deal(&opening(&MASTER, &HANDLE).unwrap()).unwrap();
         w.package.proof_of_knowledge.z += Scalar::ONE;
-        assert!(register(&MASTER, &HANDLE, &w.package, &to_signer).is_err());
+        assert!(deal(&MASTER, &HANDLE, &w.package).is_err());
     }
 }

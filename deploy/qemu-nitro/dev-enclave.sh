@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # A real enclave, on this machine, for developing a client against.
 #
-# Same stack as the e2e — the same emulated Nitro machine, the same ACME
-# issuance from a real CA, the same block store, the same attested boot — but
-# it stays up, and it will run *your* guest. The e2e brings this up to assert
-# against it and then tears it down; this brings it up and gets out of the way.
+# Same stack as the e2e — the same emulated Nitro machine, the same block store,
+# the same attested boot — but it stays up, and it will run *your* guest. The e2e
+# brings this up to assert against it and then tears it down; this brings it up
+# and gets out of the way.
 #
 #   deploy/qemu-nitro/dev-enclave.sh --guest path/to/component.wasm
 #
@@ -17,11 +17,12 @@
 # Real: the enclave boots as an EIF under QEMU's nitro-enclave machine, takes
 # its address by DHCP over emulated vsock, mounts the encrypted block store over
 # that link, fetches your component from the store and measures it into PCR16
-# before it can obtain a key, orders a certificate from a CA over RFC 8555
-# TLS-ALPN-01, and gates every request on a WebAuthn assertion bound to that
-# request. A client verifies the attestation document by signature, certificate
-# chain, validity window, pinned root and both measurements — the same code path
-# with the same flags it will use against hardware.
+# before it can obtain a key, serves a certificate it made for itself at boot,
+# and gates every request on an approval signed with the tenant's wallet share
+# and bound to that request. A client verifies the attestation document by
+# signature, certificate chain, validity window, pinned root and both
+# measurements — the same code path with the same flags it will use against
+# hardware.
 #
 # Not real: the key that signs those documents. QEMU's NSM does not sign
 # anything, so this image mints a chain at boot and re-signs what the device
@@ -39,12 +40,7 @@ set -euo pipefail
 GUEST_WASM=""
 PREFIX="${PREFIX:-dev}"
 HTTPS_PORT="${HTTPS_PORT:-8443}"
-WEBAUTHN_RP_ID=""
-WEBAUTHN_ALLOWED_ORIGINS=""
 GUEST_ENV=""
-TLS_DOMAIN=""
-ACME_STAGING=""
-ACME_CONTACT=""
 PUSH_APP_ID=""
 QEMU_MEMORY="${QEMU_MEMORY:-3G}"
 STORE_BIND=""
@@ -55,10 +51,8 @@ BUNDLE=""
 usage() {
     cat >&2 <<EOF
 usage: ${0##*/} [--guest COMPONENT.wasm] [--port PORT] [--name NAME]
-                     [--rp-id DOMAIN] [--allowed-origin ORIGIN]...
                      [--keep-store [--fresh]]
                      [--guest-env NAME=VALUE]...
-                     [--domain NAME [--acme-staging] [--acme-contact EMAIL]]
                      [--push-app-id ID]
                      [--memory SIZE] [--store-bind ADDR] [--publish-hook CMD]
                      [--pack DIR | --prebuilt DIR]
@@ -69,21 +63,13 @@ usage: ${0##*/} [--guest COMPONENT.wasm] [--port PORT] [--name NAME]
   --name    names this run's containers and its directory under
             target/qemu-nitro. Default $PREFIX. It keeps runs apart on disk;
             only one can be up at a time.
-  --rp-id   the WebAuthn relying party the image is built with. Default
-            enclave.test. A phone creates a passkey only for a domain whose
-            /.well-known/assetlinks.json names the app, so testing an app means
-            passing that domain. Independent of the certificate, which stays
-            enclave.test. A different image, so a different PCR0.
-  --allowed-origin
-            an origin assertions may claim besides https://<rp id>. Repeatable.
-            An Android app claims android:apk-key-hash:<unpadded base64url
-            SHA-256 of its signing certificate>.
   --keep-store
-            keep the store — tenants, passkeys, everything guests wrote — in
+            keep the store — tenants, wallet keys, everything guests wrote — in
             target/qemu-nitro/<name>-store, so the next start with the same name
             resumes it instead of booting into genesis. A new guest is an
-            upgrade of the same store. The trust root and the attestation chain
-            are still new every boot, so clients re-read their pins.
+            upgrade of the same store. The trust root, the attestation chain and
+            the certificate are still new every boot, so clients re-read their
+            pins.
   --fresh   with --keep-store, discard the kept store first.
   --guest-env NAME=VALUE
             a setting for the guest, e.g. ASP_URL=http://192.168.127.254:7070.
@@ -98,15 +84,6 @@ usage: ${0##*/} [--guest COMPONENT.wasm] [--port PORT] [--name NAME]
   For an emulator on a public host — test infrastructure, not a trust boundary: whoever runs the
   host can read every tenant's data and sign attestation documents. See docs/DEV_ENCLAVE.md.
 
-  --domain NAME
-            serve NAME with a certificate from Let's Encrypt, validated over
-            TLS-ALPN-01 on this host's --port, which therefore has to be 443 and
-            reachable from the internet, with NAME resolving here. No Pebble.
-  --acme-staging
-            Let's Encrypt's staging CA: prove the setup before spending the
-            production CA's rate limit. Its certificates are trusted by nothing.
-  --acme-contact EMAIL
-            the address Let's Encrypt sends expiry notices to.
   --push-app-id ID
             real notifications, through that AWS End User Messaging Push
             application, instead of the stub. Signed as this host's instance
@@ -143,17 +120,9 @@ while [[ $# -gt 0 ]]; do
         --guest) need "$1" "${2:-}"; GUEST_WASM="$2"; shift 2 ;;
         --port)  need "$1" "${2:-}"; HTTPS_PORT="$2"; shift 2 ;;
         --name)  need "$1" "${2:-}"; PREFIX="$2";     shift 2 ;;
-        --rp-id) need "$1" "${2:-}"; WEBAUTHN_RP_ID="$2"; shift 2 ;;
         --keep-store) KEEP_STORE=1; shift ;;
         --guest-env) need "$1" "${2:-}"; GUEST_ENV="${GUEST_ENV:+$GUEST_ENV,}$2"; shift 2 ;;
         --fresh) FRESH_STORE=1; shift ;;
-        --allowed-origin)
-                 need "$1" "${2:-}"
-                 WEBAUTHN_ALLOWED_ORIGINS="${WEBAUTHN_ALLOWED_ORIGINS:+$WEBAUTHN_ALLOWED_ORIGINS,}$2"
-                 shift 2 ;;
-        --domain) need "$1" "${2:-}"; TLS_DOMAIN="$2"; shift 2 ;;
-        --acme-staging) ACME_STAGING=1; shift ;;
-        --acme-contact) need "$1" "${2:-}"; ACME_CONTACT="$2"; shift 2 ;;
         --push-app-id) need "$1" "${2:-}"; PUSH_APP_ID="$2"; shift 2 ;;
         --memory) need "$1" "${2:-}"; QEMU_MEMORY="$2"; shift 2 ;;
         --store-bind) need "$1" "${2:-}"; STORE_BIND="$2"; shift 2 ;;
@@ -178,14 +147,8 @@ if [[ -n "$GUEST_WASM" ]]; then
         || { echo "no such component: $GUEST_WASM" >&2; exit 1; }
 fi
 
-# Both end up inside a Nix expression, so they are held to exactly the shapes they can take.
-[[ -z "$WEBAUTHN_RP_ID" || "$WEBAUTHN_RP_ID" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
-    || { echo "--rp-id must be a domain name" >&2; exit 1; }
-IFS=, read -ra origins <<<"$WEBAUTHN_ALLOWED_ORIGINS"
-for o in "${origins[@]}"; do
-    [[ "$o" =~ ^(https://[a-z0-9.-]+(:[0-9]+)?|android:apk-key-hash:[A-Za-z0-9_-]{43})$ ]] \
-        || { echo "--allowed-origin $o: expected https://<host> or android:apk-key-hash:<43 characters>" >&2; exit 1; }
-done
+# Each ends up inside a Nix expression or the guest's file, so it is held to exactly the shapes it
+# can take.
 IFS=, read -ra guest_env <<<"$GUEST_ENV"
 for kv in "${guest_env[@]}"; do
     [[ "$kv" =~ ^[A-Z_][A-Z0-9_]*=[A-Za-z0-9:/._-]*$ ]] \
@@ -193,17 +156,6 @@ for kv in "${guest_env[@]}"; do
     [[ "$kv" != ENCLAVE_* && "$kv" != AWS_* ]] \
         || { echo "--guest-env $kv: ENCLAVE_ and AWS_ variables are withheld from guests" >&2; exit 1; }
 done
-if [[ -n "$WEBAUTHN_ALLOWED_ORIGINS" && -z "$WEBAUTHN_RP_ID" ]]; then
-    echo "--allowed-origin needs --rp-id: an app's origin is only ever vouched for by its own domain" >&2
-    exit 1
-fi
-
-[[ -z "$TLS_DOMAIN" || "$TLS_DOMAIN" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
-    || { echo "--domain must be a domain name" >&2; exit 1; }
-[[ -z "$ACME_STAGING$ACME_CONTACT" || -n "$TLS_DOMAIN$BUNDLE" ]] \
-    || { echo "--acme-staging and --acme-contact need --domain: Pebble takes neither" >&2; exit 1; }
-[[ -z "$ACME_CONTACT" || "$ACME_CONTACT" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] \
-    || { echo "--acme-contact must be an email address" >&2; exit 1; }
 [[ -z "$PUSH_APP_ID" || "$PUSH_APP_ID" =~ ^[0-9a-f]{32}$ ]] \
     || { echo "--push-app-id must be an application id: 32 hex characters" >&2; exit 1; }
 [[ "$QEMU_MEMORY" =~ ^[1-9][0-9]*[MG]$ ]] || { echo "--memory must be like 1536M or 3G" >&2; exit 1; }
@@ -216,8 +168,8 @@ if [[ -n "$PACK_DIR" ]]; then
 fi
 if [[ -n "$BUNDLE" ]]; then
     # The image is what it was packed as. An image option here would describe an enclave that is
-    # not the one about to boot, and the summary and the passkey client would believe it.
-    [[ -z "$WEBAUTHN_RP_ID$WEBAUTHN_ALLOWED_ORIGINS$TLS_DOMAIN$ACME_STAGING$ACME_CONTACT$PUSH_APP_ID" ]] \
+    # not the one about to boot, and the summary would believe it.
+    [[ -z "$PUSH_APP_ID" ]] \
         || { echo "--prebuilt fixes the image: pass image options to --pack instead" >&2; exit 1; }
     BUNDLE="$(readlink -f "$BUNDLE")" && [[ -f "$BUNDLE/image.env" ]] \
         || { echo "--prebuilt $BUNDLE: not a bundle (no image.env)" >&2; exit 1; }
@@ -230,8 +182,7 @@ if [[ -n "${FRESH_STORE:-}" && -z "${KEEP_STORE:-}" ]]; then
     exit 1
 fi
 
-export GUEST_WASM PREFIX HTTPS_PORT WEBAUTHN_RP_ID WEBAUTHN_ALLOWED_ORIGINS KEEP_STORE FRESH_STORE \
-    GUEST_ENV TLS_DOMAIN ACME_STAGING ACME_CONTACT PUSH_APP_ID \
+export GUEST_WASM PREFIX HTTPS_PORT KEEP_STORE FRESH_STORE GUEST_ENV PUSH_APP_ID \
     QEMU_MEMORY STORE_BIND PACK_DIR BUNDLE
 # shellcheck source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -243,17 +194,18 @@ fi
 
 enclave_bring_up
 
-# The passkey the summary below is written against, so the command it prints
-# works as printed. Registration is open — any passkey may enrol and gets its
+# The wallet the summary below is written against, so the command it prints
+# works as printed. Registration is open — any wallet may register and gets its
 # own tenant — so this is one identity among however many a client goes on to
 # create, not a credential the enclave holds.
 #
 # `enrol`, not a signed request to some route: this serves whichever component
 # was handed to it, and a guest of somebody else's has no route this script
-# could know to ask for. Enrolment goes to the runtime and never reaches the
-# guest, so it works against any of them.
-say "enrolling a passkey, so there is something to try"
-signed enrol >/dev/null || fail "the enclave refused to enrol a passkey"
+# could know to ask for. Registration goes to the runtime and never reaches the
+# guest, so it works against any of them. It also checks the attestation, and
+# keeps the proof for the command below.
+say "registering a wallet, so there is something to try"
+signed --dump-proof "$RUNDIR/proof" enrol >/dev/null || fail "the enclave refused to register a wallet"
 
 if [[ -n "$PUBLISH_HOOK" ]]; then
     say "publishing this boot's pins"
@@ -274,24 +226,12 @@ if [[ -n "$PUSH_APP_ID" ]]; then
 else
     wakes="$PUSH_RECORD  (every notification the guest raised, as JSON)"
 fi
-if [[ -n "$TLS_DOMAIN" ]]; then
-    certificate_note="The certificate is from Let's Encrypt."
-    [[ -z "$ACME_STAGING" ]] || certificate_note="The certificate is from Let's Encrypt's staging CA, which nothing trusts."
-else
-    certificate_note="The certificate is issued by Pebble, which no public root signs, so a client
-also needs Pebble's root — or has to pin the certificate out of the attestation
-document, which is what a real client should do anyway:
-
-  --ca          $RUNDIR/pebble-root.pem"
-fi
 
 cat <<EOF
 
 == the enclave is up ==
 
-  url      https://${TLS_DOMAIN:-127.0.0.1}:$HTTPS_PORT
-  host     ${TLS_DOMAIN:-enclave.test}   (the name on the certificate)
-  rp id    ${WEBAUTHN_RP_ID:-enclave.test}${WEBAUTHN_ALLOWED_ORIGINS:+   allowing $WEBAUTHN_ALLOWED_ORIGINS}
+  url      https://127.0.0.1:$HTTPS_PORT
   egress   the public internet, and this host on every port but the runtime's own
 
 What a client has to pin. All three, and none of them stands in for another:
@@ -303,24 +243,29 @@ root is what the documents chain to.
   --pcr16       $EXPECTED_PCR16
   --trust-root  $TRUST_ROOT
 
-$certificate_note
+The certificate is self-signed: the enclave made it at boot, and makes a new one
+every boot. No CA vouches for it, and none needs to — a client accepts whatever
+certificate is presented, checks that an attestation document binds its hash,
+and pins it from there.
 
-Try it with the client this repo builds. It signs a WebAuthn assertion for each
-request, which is the only way anything reaches the guest:
+Try it with the client this repo builds. It signs an approval with its wallet
+share for each request, which is the only way anything reaches the guest:
 
-  $PASSKEY \\
+  $WALLET \\
       --url https://127.0.0.1:$HTTPS_PORT --state $RUNDIR/alice.json \\
       --trust-root $TRUST_ROOT \\
-      --pcr0 $EXPECTED_PCR0 --pcr16 $EXPECTED_PCR16 --rp-id ${WEBAUTHN_RP_ID:-enclave.test} \\
+      --pcr0 $EXPECTED_PCR0 --pcr16 $EXPECTED_PCR16 \\
       get --path /counter
 
 The path /counter is one the example guest serves; against your own component,
 ask for one of its own. The enrol subcommand reaches only the runtime, so it
 works whichever guest is loaded.
 
-Or verify the attestation on its own, without touching the guest:
+Or verify the attestation the registration above was answered with, on its own:
 
-  $ATTEST --url https://127.0.0.1:$HTTPS_PORT/auth/ \\
+  $ATTEST --document $RUNDIR/proof/document.b64 \\
+      --peer-certificate $RUNDIR/proof/certificate.der \\
+      --nonce \$(cat $RUNDIR/proof/nonce.hex) \\
       --trust-root $TRUST_ROOT \\
       --pcr0 $EXPECTED_PCR0 --pcr16 $EXPECTED_PCR16
 
@@ -330,9 +275,9 @@ Disk:     $ZFS_IMG (the pool, served on vsock 10809)
 Wakes:    $wakes
 
 To run a new build of your guest, stop this and start it again with the new
-component. $store_note PCR16 changes either way, and the trust root is new every
-boot — a client still pinning the old ones will refuse this enclave, which is the
-point.
+component. $store_note PCR16 changes either way, and the trust root and the
+certificate are new every boot — a client still pinning the old ones will refuse
+this enclave, which is the point.
 
   $REPO/deploy/qemu-nitro/dev-enclave.sh --guest <new.wasm>${KEEP_STORE:+ --keep-store}
 

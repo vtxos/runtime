@@ -29,9 +29,9 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use enclave_runtime::{
-    open_clock, open_entropy, parse_bool_flag, serve_component, AcmeConfig, ClockSource,
-    GuestEnvironment, GuestSource, MasterKeySourceKind, MountConfig, NetworkConfig, NetworkMode,
-    RandomSource, ServeConfig, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
+    open_clock, open_entropy, parse_bool_flag, serve_component, ClockSource, GuestEnvironment,
+    GuestSource, MasterKeySourceKind, MountConfig, NetworkConfig, NetworkMode, RandomSource,
+    ServeConfig, DEFAULT_NSM_DEVICE, DEFAULT_PTP_DEVICE, EXIT_RUNTIME_FAILURE,
 };
 
 /// Where the guest is, in the roots bucket.
@@ -224,53 +224,17 @@ struct Cli {
     master_key_parameter: Option<String>,
 
     /// The SSM `SecureString` parameter the operator writes its master to: 64
-    /// hex characters, read the first time a DKG needs it. Every wallet key's
-    /// cosigner half is derived from it, so the same passkey always rebuilds
-    /// the same key. Unset, the DKG is unavailable.
-    #[arg(long, env = "ENCLAVE_OPERATOR_MASTER_PARAMETER")]
-    operator_master_parameter: Option<String>,
-
-    /// Domain to put in the certificate. Repeatable; at least one.
-    ///
-    /// Let's Encrypt issues it over TLS-ALPN-01 on the serving port. The key
-    /// is generated inside the enclave and never leaves it; what the CA signs
-    /// is what every response's attestation document binds.
-    #[arg(
-        long = "tls-domain",
-        env = "ENCLAVE_TLS_DOMAINS",
-        value_delimiter = ','
-    )]
-    tls_domains: Vec<String>,
-
-    /// The WebAuthn relying-party id — the domain passkeys are scoped to.
+    /// hex characters, read the first time a registration or sign-in needs it.
+    /// Every wallet key's runtime half is derived from it, and its share sealed
+    /// under it in the tenant's record.
     ///
     /// Setting it is what turns authentication on: **every request that could
-    /// reach the guest then needs a fresh assertion bound to exactly that
-    /// request**, and assertions must claim `https://<rp id>` or one of
-    /// `--webauthn-allowed-origin`. Left unset the runtime serves the guest to
-    /// anyone who can open a connection, which is a development arrangement and
-    /// is warned about at startup. Baked into the image, so PCR0 records which
-    /// relying party an enclave will accept assertions for.
-    #[arg(long, env = "ENCLAVE_WEBAUTHN_RP_ID")]
-    webauthn_rp_id: Option<String>,
-
-    /// A further origin assertions may claim. Repeatable.
-    ///
-    /// For native apps, which do not claim `https://<rp id>`. An Android app
-    /// claims `android:apk-key-hash:<hash>`: the unpadded base64url SHA-256 of
-    /// its signing certificate. Debug, upload and Play App Signing keys each
-    /// have their own, so a deployment usually lists the one Play signs with.
-    /// Android lets an app claim it only after the app is vouched for by
-    /// `https://<rp id>/.well-known/assetlinks.json`.
-    ///
-    /// Compared exactly. Baked into the image, so PCR0 records which apps an
-    /// enclave accepts assertions from.
-    #[arg(
-        long = "webauthn-allowed-origin",
-        env = "ENCLAVE_WEBAUTHN_ALLOWED_ORIGINS",
-        value_delimiter = ','
-    )]
-    webauthn_allowed_origins: Vec<String>,
+    /// reach the guest then needs a fresh approval signed with its tenant's
+    /// share, bound to exactly that request.** Left unset the runtime serves the
+    /// guest to anyone who can open a connection, which is a development
+    /// arrangement and is warned about at startup.
+    #[arg(long, env = "ENCLAVE_OPERATOR_MASTER_PARAMETER")]
+    operator_master_parameter: Option<String>,
 
     /// The push application wake signals go through: an AWS End User Messaging Push
     /// application, whose FCM channel holds the Firebase credential.
@@ -387,28 +351,6 @@ struct Testing {
     #[arg(long, env = "AWS_SESSION_TOKEN")]
     session_token: Option<String>,
 
-    /// An ACME directory in place of Let's Encrypt production: Pebble, or staging.
-    #[arg(long, env = "ENCLAVE_ACME_DIRECTORY")]
-    acme_directory: Option<String>,
-
-    /// PEM trust root for the ACME directory's own HTTPS certificate.
-    ///
-    /// A real CA serves its API under a publicly-trusted certificate and needs
-    /// nothing here; a test CA like Pebble does not, so the emulator supplies
-    /// its root. An enclave that took issuance orders from a CA of the
-    /// operator's choosing would be a different trust model than the one a
-    /// production image claims.
-    #[arg(long, env = "ENCLAVE_ACME_CA")]
-    acme_ca: Option<PathBuf>,
-
-    /// Contact address registered with the ACME directory.
-    #[arg(
-        long = "acme-contact",
-        env = "ENCLAVE_ACME_CONTACTS",
-        value_delimiter = ','
-    )]
-    acme_contacts: Vec<String>,
-
     /// Point the CloudWatch client somewhere else. An `http://` endpoint hands
     /// guest output to whatever is listening, in clear.
     #[arg(long, env = "ENCLAVE_GUEST_LOG_ENDPOINT")]
@@ -468,9 +410,6 @@ impl Testing {
             access_key_id: None,
             secret_access_key: None,
             session_token: None,
-            acme_directory: None,
-            acme_ca: None,
-            acme_contacts: Vec::new(),
             guest_log_endpoint: None,
             xray_endpoint: None,
             metrics_endpoint: None,
@@ -773,7 +712,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
     /// Open the emulator's host to guests, but not the runtime's own services on it.
     ///
     /// The host is where an emulator's services live — an ASP, a payout platform — and where
-    /// the runtime's own are too: its store, its CA, its push stub. A guest may reach the first
+    /// the runtime's own are too: its store, its push stub. A guest may reach the first
     /// and never the second, so the second are named by the runtime's own settings, which cannot
     /// drift from where those services are. Two definitions, as above: a production binary has
     /// no host to open.
@@ -782,7 +721,6 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         let mut own = Vec::new();
         for url in [
             &cli.testing.endpoint,
-            &cli.testing.acme_directory,
             &cli.testing.guest_log_endpoint,
             &cli.testing.push_endpoint,
         ]
@@ -811,30 +749,11 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         Ok(())
     }
 
-    // One certificate source. There is no second: a certificate the runtime
-    // minted for itself would be one an operator could mint too.
-    let directory_ca = match &cli.testing.acme_ca {
-        Some(path) => Some(std::fs::read(path).with_context(|| {
-            format!("reading the ACME directory trust root {}", path.display())
-        })?),
-        None => None,
-    };
-    let acme = Some(enclave_runtime::serve::acme::start(
-        &AcmeConfig {
-            domains: cli.tls_domains.clone(),
-            contacts: cli.testing.acme_contacts.clone(),
-            directory: cli.testing.acme_directory.clone(),
-            directory_ca,
-            // This release's own certificate, sealed under its own key.
-            prefix: format!(
-                "{}versions/{}/",
-                mount_config.bucket_prefix,
-                hex::encode(booted.vid)
-            ),
-        },
-        roots.clone(),
-        booted.version_keys.clone(),
-    )?);
+    // The certificate every connection is served: made here, at every boot,
+    // with a key that exists only in this enclave's memory. Clients trust it
+    // because an attestation binds its hash, not because a CA signed it —
+    // see `serve::tls`.
+    let certificate = std::sync::Arc::new(enclave_runtime::TlsIdentity::self_signed(&[])?);
     tracing::info!(listen = %HTTP_LISTEN, "serving guest");
 
     // Not a choice. An enclave nobody can verify is an enclave for nothing, and
@@ -854,36 +773,19 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
         enclave_runtime::PoolLimits::default(),
     )));
 
-    // WebAuthn, when the deployment named a relying party.
-    //
-    // Empty entries are dropped, not refused: an image built with no
-    // extra origins still sets the variable, to nothing.
-    let allowed_origins: Vec<String> = cli
-        .webauthn_allowed_origins
-        .iter()
-        .map(|o| o.trim())
-        .filter(|o| !o.is_empty())
-        .map(str::to_string)
-        .collect();
     // Where guests may send is no setting: the public internet, checked on every connect — see
     // `serve::egress`. Only the emulator widens it, to its host.
     open_dev_host(&cli)?;
 
-    let authentication = match nonempty(&cli.webauthn_rp_id) {
-        Some(rp_id) => {
-            // What a page on the relying party's own domain claims. Native apps
-            // claim theirs, from `--webauthn-allowed-origin`.
-            let origin = format!("https://{rp_id}");
-            let credentials = std::sync::Arc::new(enclave_runtime::RegistryCredentials::new(
+    // Signed approvals, when the deployment has an operator master: a tenant's
+    // wallet key is made with it, and sign-in is a signature with that key.
+    let authentication = match enclave_runtime::open_operator_master(&cli.master_key_config()?)? {
+        Some(master) => {
+            let keys = std::sync::Arc::new(enclave_runtime::signer::Keys::new(
                 zfs.registry().clone(),
+                std::sync::Arc::new(master),
             ));
             let gate = std::sync::Arc::new(enclave_runtime::Gate::new(
-                enclave_runtime::build_relying_party(&rp_id, &origin, &allowed_origins)?,
-                enclave_runtime::ChallengeStore::new(
-                    enclave_runtime::auth::DEFAULT_TTL,
-                    enclave_runtime::DEFAULT_CAPACITY,
-                ),
-                credentials.clone(),
                 enclave_runtime::TokenStore::new(
                     enclave_runtime::auth::DEFAULT_TOKEN_TTL,
                     enclave_runtime::DEFAULT_TOKEN_CAPACITY,
@@ -891,29 +793,21 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
             ));
             let auth = std::sync::Arc::new(enclave_runtime::AuthEndpoints::new(
                 gate.clone(),
-                credentials,
+                keys,
                 zfs.clone(),
                 entropy.clone(),
-                enclave_runtime::open_operator_master(&cli.master_key_config()?)?
-                    .map(std::sync::Arc::new),
+                enclave_runtime::auth::ChallengeStore::new(
+                    enclave_runtime::auth::DEFAULT_TTL,
+                    enclave_runtime::auth::DEFAULT_CAPACITY,
+                ),
             ));
             tracing::info!(
-                rp_id,
-                origin,
-                allowed_origins = ?allowed_origins,
-                "registration is open to anyone; requiring a passkey assertion per request"
+                "registration is open to anyone; requiring an approval signed with the \
+                 tenant's wallet share per request"
             );
             Some((auth, gate))
         }
-        None => {
-            anyhow::ensure!(
-                allowed_origins.is_empty(),
-                "--webauthn-allowed-origin was given without --webauthn-rp-id. With no \
-                 relying party, authentication is off and the origin would be silently \
-                 ignored."
-            );
-            None
-        }
+        None => None,
     };
 
     // The console always, and CloudWatch alongside it when configured.
@@ -1073,8 +967,7 @@ async fn run() -> Result<enclave_runtime::GuestOutcome> {
             // Whether tasks run is the guest's to say, by exporting `run-task`.
             background_tasks: cli.background_tasks()?,
             addr: HTTP_LISTEN,
-            certificate: None,
-            acme,
+            certificate: Some(certificate),
             attestation,
             tenancy,
             authentication,
@@ -1276,7 +1169,6 @@ mod tests {
         assert_eq!(production.clock_source, ClockSource::Ptp);
         assert_eq!(production.random_source, RandomSource::Nsm);
         assert!(production.endpoint.is_none() && production.access_key_id.is_none());
-        assert!(production.acme_directory.is_none() && production.acme_ca.is_none());
         assert!(production.push_endpoint.is_none() && production.guest_log_endpoint.is_none());
         assert!(production.task_endpoint.is_none());
         assert!(!production.cosign_attestations);

@@ -1,12 +1,13 @@
 //! Against a real document, captured from a dev enclave (`dev-enclave.sh --name merlin`) serving
-//! the cosigner component:
+//! the cosigner component, by a runtime that still attested every `/auth/` answer: fetched with
 //!
 //! ```text
-//! curl --resolve enclave.test:8443:127.0.0.1 --cacert pebble-root.pem \
-//!      -H "x-enclave-nonce: <b64url of dev-nonce.hex>" -D - https://enclave.test:8443/auth/
+//! curl -k -H "x-enclave-nonce: <b64url of dev-nonce.hex>" -D - https://127.0.0.1:8443/auth/
 //! ```
 //!
 //! with the leaf that connection served (`openssl s_client`), and that boot's `trust-root.der`.
+//! The document's format has not changed since; a client now takes one from `register/options` or
+//! a sign-in (`wallet-client --dump-proof`).
 //! Not a document this crate built for itself, which would only show the verifier agrees with its
 //! own test helper.
 //!

@@ -19,8 +19,8 @@ it has checked it. A tenant with no due work needs no running guest instance.
 The guest must export `run-task`, and may import the queue interface defined in
 [`wit/tasks/tasks.wit`](../wit/tasks/tasks.wit). There is no switch: tasks run
 when the guest exports `run-task`. The guest is measured into PCR16, so its
-exports already are the decision. A guest that exports it needs WebAuthn
-authentication, or the runtime refuses to start.
+exports already are the decision. A guest that exports it needs authentication
+(an operator master, which turns sign-in on), or the runtime refuses to start.
 
 Where tasks are scheduled comes from four image settings, measured into PCR0
 like every other setting:
@@ -110,8 +110,8 @@ missing tenant directory is a failure, never recreated.
 
 Background code can read task status, but cannot enqueue, cancel or forget: an
 authenticated interaction grants standing authority to run the work later, and
-background work cannot grant itself more. Revoking a passkey does not cancel
-its tenant's schedules; cancel them. Tasks run the currently approved guest
+background work cannot grant itself more. Revoking a tenant does not cancel
+its schedules; cancel them. Tasks run the currently approved guest
 after an upgrade, so keep payloads compatible, or cancel affected tasks before
 deploying a guest that cannot read them.
 
@@ -268,7 +268,7 @@ cargo build --manifest-path examples/guest-http/Cargo.toml --release --target wa
 # One serve_auth test drives the real client binary as a subprocess. Without it
 # that test skips with a notice instead of failing, which reports green for a
 # test that never ran.
-cargo build --release -p enclave-runtime --features testing --bin passkey-client
+cargo build --release -p enclave-runtime --features testing --bin wallet-client
 cargo test -p enclave-runtime --lib tasks::tests -- --include-ignored
 # The whole suite, deliberately unfiltered: a name filter here silently stopped
 # covering this feature once a second scheduling test was added under a
@@ -297,5 +297,5 @@ the tests check that a firing arrives with the task's message, and drive the
 consumer with the occurrence as AWS delivers it.
 
 Inside the emulator, step `6/8` of [`deploy/qemu-nitro/run-e2e.sh`](../deploy/qemu-nitro/run-e2e.sh)
-schedules work through the real passkey client and waits for it to finish, with
+schedules work through the real wallet client and waits for it to finish, with
 the in-memory backend.

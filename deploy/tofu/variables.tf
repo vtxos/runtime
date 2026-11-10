@@ -43,8 +43,8 @@ variable "instance_type" {
 variable "roots_bucket" {
   type        = string
   description = <<-EOT
-    The Object-Locked bucket: the pool's anchor chain, the boot records, the
-    guest and the sealed ACME cache. Its COMPLIANCE retention is the entire
+    The Object-Locked bucket: the pools' anchor chains, the boot records, the
+    tenant registry and the guest. Its COMPLIANCE retention is the entire
     rollback guarantee; the state itself is on the pool's disk. It must
     already exist — this deployment deliberately does not create it, because
     COMPLIANCE retention cannot be undone by anyone, including AWS support.

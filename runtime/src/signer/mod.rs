@@ -1,96 +1,190 @@
-//! Each tenant's wallet key: the signer's half of its 2-of-2, kept on the tenant's own pool,
-//! and `enclave:signer`, the guest's way to sign with it.
+//! Each tenant's wallet key: the runtime's half of its 2-of-2, and `enclave:signer`, the guest's
+//! way to sign with it.
 //!
-//! Made by the DKG that rides the passkey's registration ([`dkg`]), written once, and read by
-//! every signing round after it. On the pool, so it is under the tenant's key like the rest of its
-//! data, and a release opens it only when its owner sends that key.
+//! Made by the DKG registration carries ([`dkg`]). The runtime's share is the operator's. It is
+//! kept in the tenant's write-once registry record, sealed under a key derived from the operator
+//! master ([`seal_share`]), and not on the tenant's pool: the pool is keyed with this share
+//! ([`tenant_key`]), so the share has to be readable first. Every release reads the same master,
+//! so nothing moves between releases.
 //!
 //! The ABI is defined in wit/signer/signer.wit. No function accepts a tenant id, none returns the
-//! signer's share, and every one is interactive only: the context is set on an authenticated
+//! runtime's share, and every one is interactive only: the context is set on an authenticated
 //! request and on nothing else.
 
 pub mod dkg;
 mod key;
 pub mod signing;
-#[cfg(test)]
-pub(crate) mod testing;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use key::WalletKey;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, ensure, Context, Result};
+use aws_lc_rs::aead::LessSafeKey;
+use hkdf::Hkdf;
+use k256::Scalar;
+use sha2::Sha256;
+use threshold::ecdh::{Partial, Session};
 use threshold::identifier::Identifier;
+use threshold::scalar::{scalar_from_bytes, scalar_to_bytes};
 use wasmtime::component::{ComponentType, Lift, Linker, Lower, Resource, ResourceType};
 use zeroize::Zeroizing;
 
 use signing::Signing;
 
 use crate::keys::OperatorMaster;
+use crate::random::Rng;
 use crate::state::State;
-use crate::store::zfs::Zfs;
+use crate::store::crypto::seal::{seal, unseal};
+use crate::store::registry::{Registry, SEALED_SHARE_LEN};
+use crate::tenant::TenantKey;
 
-const DIR: &str = "keys";
-const FILE: &str = "wallet";
+/// The HKDF salt of the key each tenant's share is sealed under.
+const SHARE_SALT: &[u8] = b"aegira/signer/share-seal/v1";
 
-/// What [`store`] found.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Stored {
-    /// The key is kept, and anchored.
-    New,
-    /// The tenant already had this key: a DKG run again with the same passkey rebuilds it.
-    Same,
-    /// The tenant already has a different key, which is kept.
-    Different,
+/// `HKDF-SHA256(operator master, SHARE_SALT, tenant id)`: one key per tenant, so a sealed share
+/// opens only under the name it was sealed for.
+fn share_key(master: &[u8; 32], tenant: &[u8; 16]) -> Result<LessSafeKey> {
+    let mut okm = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(SHARE_SALT), master)
+        .expand(tenant, &mut okm[..])
+        .map_err(|e| anyhow!("hkdf: {e}"))?;
+    Ok(crate::store::crypto::keys::aes_key(&okm)?)
 }
 
-/// The tenant's wallet key, if it has one. The tenant must be attached.
-pub async fn load(zfs: &Zfs, tenant: [u8; 16]) -> Result<Option<WalletKey>> {
-    let path = zfs.tenant_runtime_dir(tenant, DIR).await?.join(FILE);
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => WalletKey::decode(&Zeroizing::new(bytes))
-            .map(Some)
-            .map_err(anyhow::Error::msg),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-    }
+/// The runtime's share of `tenant`'s wallet key, sealed for its registry record: AES-256-GCM
+/// under [`share_key`], with the tenant id as associated data.
+pub fn seal_share(
+    master: &[u8; 32],
+    tenant: &[u8; 16],
+    share: &Scalar,
+) -> Result<[u8; SEALED_SHARE_LEN]> {
+    let plain = Zeroizing::new(scalar_to_bytes(share));
+    let sealed = seal(&share_key(master, tenant)?, tenant, plain.as_slice())?;
+    sealed
+        .try_into()
+        .map_err(|_| anyhow!("a sealed share is {SEALED_SHARE_LEN} bytes"))
 }
 
-/// Keep a tenant's wallet key, anchored before this returns.
+/// What [`seal_share`] sealed, or an error for anything sealed under another master or for
+/// another tenant.
+pub fn unseal_share(
+    master: &[u8; 32],
+    tenant: &[u8; 16],
+    sealed: &[u8; SEALED_SHARE_LEN],
+) -> Result<Scalar> {
+    let plain = Zeroizing::new(unseal(&share_key(master, tenant)?, tenant, sealed)?);
+    let bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+        plain
+            .as_slice()
+            .try_into()
+            .context("a sealed share holds 32 bytes")?,
+    );
+    scalar_from_bytes(&bytes).map_err(|e| anyhow!("the runtime's share: {e}"))
+}
+
+/// `k` for the tenant whose wallet key this is: the runtime's half of threshold ECDH, finished
+/// with the wallet's partial under `transcript`. Returns `k` and the runtime's own partial, from
+/// which the wallet derives the same `k`.
 ///
-/// Never replaces one: everything held under a wallet key is spendable only with it, so a second
-/// DKG that made another key is answered with [`Stored::Different`] and changes nothing.
-pub async fn store(zfs: &Zfs, tenant: [u8; 16], key: &WalletKey) -> Result<Stored> {
-    if let Some(existing) = load(zfs, tenant).await? {
-        return Ok(if existing.group_key() == key.group_key() {
-            Stored::Same
-        } else {
-            Stored::Different
-        });
-    }
-    let dir = zfs.tenant_runtime_dir(tenant, DIR).await?;
-    // Temp file, then renamed into place, so a crash leaves no half-written key.
-    let temp = dir.join(format!("{FILE}.tmp"));
-    tokio::fs::write(&temp, &*key.encode()).await?;
-    tokio::fs::rename(&temp, dir.join(FILE)).await?;
-    zfs.anchor_tenant(tenant).await?;
-    Ok(Stored::New)
+/// Fails if the wallet's proof does not verify against its verifying share: a partial that was
+/// not made with the wallet's share is never combined.
+pub fn tenant_key(
+    key: &WalletKey,
+    wallet: &Partial,
+    transcript: &[u8],
+) -> std::result::Result<(TenantKey, Partial), threshold::error::Error> {
+    let group = key.public_key_package().verifying_key.point;
+    let (session, mine) = Session::start(
+        &group,
+        key.signer(),
+        key.secret_share(),
+        transcript,
+        &mut Rng,
+    )?;
+    let k = session.finish(key.wallet(), key.wallet_share(), wallet)?;
+    Ok((TenantKey::from_bytes(*k), mine))
 }
 
-/// What a guest's `enclave:signer` calls reach: the tenant of one interactive call, and the master
-/// its dealt share is recomputed from.
+/// Each tenant's wallet key with its share unsealed, kept in memory from the first time a
+/// registration, a sign-in or the signer needs it in a boot. Never written anywhere.
+pub struct Keys {
+    registry: Arc<Registry>,
+    master: Arc<OperatorMaster>,
+    cache: Mutex<HashMap<[u8; 16], Arc<WalletKey>>>,
+}
+
+impl Keys {
+    pub fn new(registry: Arc<Registry>, master: Arc<OperatorMaster>) -> Self {
+        Keys {
+            registry,
+            master,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// What the runtime's polynomials are derived from, and its shares sealed under.
+    pub fn master(&self) -> &Arc<OperatorMaster> {
+        &self.master
+    }
+
+    /// Keep a key a registration just made.
+    pub fn insert(&self, tenant: [u8; 16], key: WalletKey) -> Arc<WalletKey> {
+        let key = Arc::new(key);
+        self.cache
+            .lock()
+            .expect("signer keys poisoned")
+            .insert(tenant, key.clone());
+        key
+    }
+
+    /// `tenant`'s wallet key, from memory or from its record.
+    pub async fn get(&self, tenant: [u8; 16]) -> Result<Arc<WalletKey>> {
+        if let Some(key) = self
+            .cache
+            .lock()
+            .expect("signer keys poisoned")
+            .get(&tenant)
+        {
+            return Ok(key.clone());
+        }
+        let record = self
+            .registry
+            .tenant(tenant)
+            .await?
+            .context("this tenant has no wallet key")?;
+        let master = self.master.get().await?;
+        let share = unseal_share(master, &tenant, &record.key.share)?;
+        let key = WalletKey::from_record(&record.key, share).map_err(anyhow::Error::msg)?;
+        Ok(self.insert(tenant, key))
+    }
+}
+
+impl std::fmt::Debug for Keys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keys")
+            .field(
+                "held",
+                &self.cache.lock().map(|c| c.len()).unwrap_or_default(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a guest's `enclave:signer` calls reach: the tenant of one interactive call, and the keys
+/// its wallet key is read from.
 #[derive(Clone)]
 pub struct SignerContext {
-    pub zfs: Arc<Zfs>,
-    pub master: Option<Arc<OperatorMaster>>,
+    pub keys: Arc<Keys>,
     pub tenant: [u8; 16],
 }
 
 impl SignerContext {
-    async fn key(&self) -> Result<WalletKey> {
-        load(&self.zfs, self.tenant)
-            .await?
-            .context("this tenant has no wallet key yet")
+    async fn key(&self) -> Result<Arc<WalletKey>> {
+        self.keys.get(self.tenant).await
     }
 
     /// `f_c(id_w)` for the key's wallet, if that is the wallet `identifier` names.
@@ -99,15 +193,9 @@ impl SignerContext {
         let asked = Identifier::try_from(identifier).map_err(|e| anyhow!("bad identifier: {e}"))?;
         ensure!(
             &asked == key.wallet(),
-            "that passkey does not derive this wallet's identifier: the share it rebuilt would \
-             not sign"
+            "that identifier is not this wallet's: the share it rebuilt would not sign"
         );
-        let master = self
-            .master
-            .as_ref()
-            .context("this enclave has no operator master")?
-            .get()
-            .await?;
+        let master = self.keys.master().get().await?;
         dkg::dealt_share(master, key.handle(), key.wallet()).map_err(anyhow::Error::msg)
     }
 }
@@ -265,58 +353,69 @@ pub fn add_to_linker(linker: &mut Linker<State>) -> wasmtime::Result<()> {
 mod tests {
     use super::testing::{enrol, Wallet};
     use super::*;
+    use crate::tenant::tenant_of;
 
-    const ALICE: [u8; 16] = [1; 16];
     const MASTER: [u8; 32] = [7; 32];
     const HANDLE: [u8; 16] = [9; 16];
 
-    fn key(wallet: &mut Wallet) -> WalletKey {
-        let to_signer = wallet
-            .deal(&dkg::opening(&MASTER, &HANDLE).unwrap())
-            .unwrap();
-        dkg::register(&MASTER, &HANDLE, &wallet.package, &to_signer)
-            .unwrap()
-            .key
+    #[test]
+    fn a_sealed_share_opens_only_for_its_tenant_under_its_master() {
+        let share = Scalar::from(12345u64);
+        let sealed = seal_share(&MASTER, &[1; 16], &share).unwrap();
+        assert_eq!(unseal_share(&MASTER, &[1; 16], &sealed).unwrap(), share);
+        assert!(
+            unseal_share(&MASTER, &[2; 16], &sealed).is_err(),
+            "another tenant"
+        );
+        assert!(
+            unseal_share(&[8; 32], &[1; 16], &sealed).is_err(),
+            "another master"
+        );
     }
 
+    /// Registered once; read back from the record by a boot that never saw the registration.
     #[tokio::test]
-    async fn a_key_is_kept_once_and_never_replaced() {
-        let fs = Zfs::scratch().await;
-        fs.tenant_dir(ALICE).await.unwrap();
-        assert!(load(&fs, ALICE).await.unwrap().is_none());
+    async fn a_key_is_read_back_from_its_record() {
+        let fs = crate::store::zfs::Zfs::scratch().await;
+        let (_, registered, _) = enrol(&MASTER, &HANDLE);
+        let tenant = tenant_of(&registered.key.group_key());
+        let sealed = seal_share(&MASTER, &tenant, registered.key.secret_share()).unwrap();
+        fs.registry()
+            .register(tenant, registered.key.record(sealed))
+            .await
+            .unwrap();
 
-        let mut wallet = Wallet::random();
-        assert_eq!(
-            store(&fs, ALICE, &key(&mut wallet)).await.unwrap(),
-            Stored::New
+        let keys = Keys::new(
+            fs.registry().clone(),
+            Arc::new(OperatorMaster::fixed(MASTER)),
         );
-        assert_eq!(
-            store(&fs, ALICE, &key(&mut wallet)).await.unwrap(),
-            Stored::Same
-        );
-        let other = key(&mut Wallet::random());
-        assert_eq!(store(&fs, ALICE, &other).await.unwrap(), Stored::Different);
-
-        let kept = load(&fs, ALICE).await.unwrap().expect("a key");
-        assert_eq!(kept.group_key(), key(&mut wallet).group_key());
-        assert_eq!(kept.handle(), &HANDLE);
+        let back = keys.get(tenant).await.unwrap();
+        assert_eq!(back.group_key(), registered.key.group_key());
+        assert_eq!(back.secret_share(), registered.key.secret_share());
+        assert!(keys.get([3; 16]).await.is_err(), "a tenant with no record");
     }
 
     /// The dealt share goes to the key's own wallet and to nobody else, and it is the one the DKG
     /// dealt, recomputed from the handle the record keeps.
     #[tokio::test]
     async fn the_dealt_share_goes_only_to_the_keys_wallet() {
-        let fs = Zfs::scratch().await;
-        fs.tenant_dir(ALICE).await.unwrap();
-        let ctx = SignerContext {
-            zfs: fs.clone(),
-            master: Some(Arc::new(OperatorMaster::fixed(MASTER))),
-            tenant: ALICE,
-        };
+        let fs = crate::store::zfs::Zfs::scratch().await;
         let (wallet, registered, _) = enrol(&MASTER, &HANDLE);
+        let tenant = tenant_of(&registered.key.group_key());
+        let ctx = SignerContext {
+            keys: Arc::new(Keys::new(
+                fs.registry().clone(),
+                Arc::new(OperatorMaster::fixed(MASTER)),
+            )),
+            tenant,
+        };
         assert!(ctx.dealt_share(&wallet.id().serialize()).await.is_err());
 
-        store(&fs, ALICE, &registered.key).await.unwrap();
+        let sealed = seal_share(&MASTER, &tenant, registered.key.secret_share()).unwrap();
+        fs.registry()
+            .register(tenant, registered.key.record(sealed))
+            .await
+            .unwrap();
         let share = ctx.dealt_share(&wallet.id().serialize()).await.unwrap();
         assert_eq!(
             *share,
@@ -325,5 +424,37 @@ mod tests {
         let stranger = Wallet::random();
         assert!(ctx.dealt_share(&stranger.id().serialize()).await.is_err());
         assert!(ctx.dealt_share(&[0; 31]).await.is_err());
+    }
+
+    /// The wallet and the runtime, each with its own share, derive one `k`; the wallet's partial
+    /// made with any other share is refused.
+    #[test]
+    fn both_halves_of_the_ecdh_derive_one_key() {
+        let (_, registered, wallet_key) = enrol(&MASTER, &HANDLE);
+        let key = registered.key;
+        let group = key.public_key_package().verifying_key.point;
+        let (session, partial) = Session::start(
+            &group,
+            &wallet_key.identifier,
+            &wallet_key.secret_share,
+            b"transcript",
+            &mut Rng,
+        )
+        .unwrap();
+        let (k, runtime) = tenant_key(&key, &partial, b"transcript").unwrap();
+        let k_wallet = session
+            .finish(key.signer(), &key.key_package().verifying_share, &runtime)
+            .unwrap();
+        assert!(k.ct_eq(&TenantKey::from_bytes(*k_wallet)));
+
+        let (_, impostor) = Session::start(
+            &group,
+            &wallet_key.identifier,
+            &(wallet_key.secret_share + Scalar::ONE),
+            b"transcript",
+            &mut Rng,
+        )
+        .unwrap();
+        assert!(tenant_key(&key, &impostor, b"transcript").is_err());
     }
 }

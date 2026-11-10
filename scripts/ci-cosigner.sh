@@ -10,7 +10,7 @@ cd "$REPO"
 
 say "cosigner: tests"
 cargo test -p cosigner -p enclave-client
-cargo test -p threshold --features std
+cargo test -p threshold --features std,ecdh
 cargo test -p ark --all-features
 
 say "cosigner: clippy"

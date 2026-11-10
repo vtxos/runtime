@@ -1,7 +1,8 @@
 //! Verifying that a connection reaches the enclave a client pinned.
 //!
-//! enclave-runtime attaches an attestation document to every `/auth/*` response, in
-//! `x-enclave-attestation`, over the nonce the client sent in `x-enclave-nonce`. The document is
+//! enclave-runtime attaches an attestation document to two answers — `register/options` and
+//! `request/options` — in `x-enclave-attestation`, over the nonce the client sent in
+//! `x-enclave-nonce`. The document is
 //! an AWS Nitro COSE_Sign1 whose `user_data` binds the TLS certificate the connection served and
 //! the guest component behind it. [`verify_connection`] checks all of it; the client then holds
 //! [`Attested::certificate_sha256`] and refuses any later connection that serves a different

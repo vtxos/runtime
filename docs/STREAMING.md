@@ -29,11 +29,10 @@ never be bound by a body hash, and rather than keep a second weaker path for it,
 the approval now names something both shapes have — the interaction.
 
 ```console
-POST /auth/request/options   { credential_id, method, path, query }
-        ↓                     response is attested: check it, pin the certificate
-   Face ID / Touch ID
-        ↓
-POST /auth/request/verify    { challenge_id, assertion }  →  { token, expires_in_secs }
+POST /auth/request/options   { group_key, method, path, query }  →  { challenge_id }
+        ↓                     response is attested: check it, pin the certificate,
+        ↓                     sign the challenge and the interaction with the wallet share
+POST /auth/request/verify    { challenge_id, signature, ecdh }   →  { token, expires_in_secs, ecdh }
         ↓
 <the interaction>            Authorization: Bearer <token>
 ```
@@ -55,7 +54,7 @@ tenant. Redeeming removes it before anything about it is checked, so two callers
 racing one token have exactly one winner and a token offered for the wrong route
 is spent by the attempt.
 
-### Per-message approval: not built, and not buildable today
+### Per-message approval: not built
 
 If a guest wants "the person approved *these bytes*", it must obtain that
 itself, per message, inside the interaction. **The runtime cannot do it**: it
@@ -63,11 +62,12 @@ hands the body through without reading it, and teaching it to parse a guest's
 message format would make it care about a protocol it deliberately knows
 nothing about.
 
-**But the guest cannot do it either, yet.** Verifying a passkey assertion needs
-the stored credential, the challenge that was issued, the relying-party
-configuration, and the ability to mark that challenge used. All four live in the
-runtime, and a guest is given standard WASI and nothing else — there is no host
-function it can call to ask.
+**No guest does it yet.** An approval is a BIP-340 signature by the owner's
+share of the wallet key. `enclave:signer`'s `wallet-key` gives a guest the
+public key package, with the owner's verifying share. So a guest could check
+such a signature itself. What it would have to add is freshness: a challenge of
+its own for each message, used once, because the runtime's challenges are not
+visible to it.
 
 `examples/guest-grpc` deliberately carries **no** approval fields on
 `ClientMsg`. An earlier draft carried `challenge_id` and `assertion` and refused
@@ -75,10 +75,9 @@ messages without them, which promised a check nothing performed; fields that
 look like a credential and are never verified read as a guarantee, and are worse
 than their absence.
 
-Closing this needs a new host import — a way for a guest to hand the runtime an
-assertion and get back yes or no. **It should be designed before a real key
-depends on it**, because until then "someone opened an interaction" is the only
-thing between a compromised client and whatever the guest will do.
+**It should be designed before a real key depends on it**, because until then
+"someone opened an interaction" is the only thing between a compromised client
+and whatever the guest will do.
 
 ### What a stolen token buys
 
@@ -126,22 +125,22 @@ every other request.
 
 The runtime does not retry, resume, or deduplicate anything. **There is no
 exactly-once guarantee and no automatic replay of signing rounds.** A client
-that reconnects opens a *new* stream with a *new* stream-open assertion, and
+that reconnects opens a *new* stream with a *new* approval, and
 any message it re-sends is simply a new message.
 Duplicates are the guest's to detect by sequence number, and its round handling
 must be idempotent because the transport promises nothing.
 
 ## Attestation
 
-The `x-enclave-attestation` document is on the response head, which for gRPC is
-the initial metadata. A client should verify it — against the nonce it chose
-and the leaf from its own handshake — **before sending anything
-signing-sensitive**.
+A stream carries no document of its own. The client verified one on the
+challenge for the sign-in that bought its token, against the nonce it chose and
+the leaf from its own handshake, and pinned that certificate. It opens the stream on a connection
+serving the same certificate, and TLS proves the peer still holds its key. That
+is all done **before it sends anything signing-sensitive**.
 
-One document per stream, at open. **It attests the connection**: that this
-enclave terminates it and is alive now. It says nothing about individual
-messages and nothing about signing results, because it is generated before the
-guest runs.
+**The document attests the connection**: that this enclave terminates it and is
+alive now. It says nothing about individual messages and nothing about signing
+results.
 
 ## Known limits
 
@@ -149,7 +148,7 @@ guest runs.
   truly simultaneously. Sufficient for a request/response signing protocol; a
   guest needing to emit unsolicited frames while blocked on a read would need
   more.
-- **Per-message authorization is designed, not built.** See above.
+- **Per-message authorization is not built.** See above.
 - **`grpc-timeout` is forwarded, never enforced.** The runtime's deadlines are
   its own so a client cannot lengthen them by asking; interpreting a client's
   deadline is the guest's, because only the guest knows what its work is worth.

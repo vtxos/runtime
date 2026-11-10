@@ -37,7 +37,7 @@ fail() {
 prepare_enclave_host() {
     local work="${WORK:-$REPO/target/qemu-nitro}"
     local image="${QEMU_IMAGE:-enclave-qemu-nitro:latest}"
-    # Pinned, like the Pebble image beside it. An unpinned build tool makes the
+    # Pinned, like every image the harness runs. An unpinned build tool makes the
     # harness's behaviour depend on whatever crates.io served that morning.
     local vsock_version="${VSOCK_VERSION:-0.3.0}"
 

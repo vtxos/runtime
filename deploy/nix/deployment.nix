@@ -36,9 +36,12 @@
   masterKeyParameter = "/CHANGE-ME/master-key";
 
   # The SSM SecureString the operator writes its master to, once the enclave is
-  # up: 64 hex characters. Each wallet key's cosigner half is derived from it,
-  # so the same passkey always rebuilds the same key. The instance role needs
-  # ssm:GetParameter on it and kms:Decrypt on the key SSM encrypts it with.
+  # up: 64 hex characters. Each wallet key's runtime half is derived from it,
+  # and the runtime's share of every wallet is sealed under it in the tenant's
+  # registry record, so it must never be lost or changed. Setting it is what
+  # turns authentication on: every request that could reach the guest then
+  # needs an approval signed with its tenant's wallet share. The instance role
+  # needs ssm:GetParameter on it and kms:Decrypt on the key SSM encrypts it with.
   operatorMasterParameter = "/CHANGE-ME/operator-master";
 
   # This runtime release's number. Bump it with every release and never reuse
@@ -51,34 +54,6 @@
   # the deployment. Ten years for anything that holds real value; a test
   # deployment can say a day (the least the runtime accepts) and be retired.
   rootRetentionSecs = 10 * 365 * 24 * 60 * 60;
-
-  # Domains for the serving certificate. Required, and not only for browsers:
-  # the runtime obtains its certificate over ACME and nothing else, so an empty
-  # list means no certificate and no HTTPS at all. A platform authenticator
-  # also refuses to attest against a certificate a browser does not trust, so a
-  # deployment that authenticates needs a real domain here.
-  tlsDomains = [ ];
-
-  # The domain passkeys are scoped to, and the origin assertions must claim.
-  #
-  # Must be one of `tlsDomains`: a passkey is bound to a domain, and an
-  # assertion carries the origin the page was served from, compared exactly.
-  # Baked into the image, so PCR0 records which relying party an enclave will
-  # accept assertions for — a client can verify that before trusting it with a
-  # key.
-  rpId = "CHANGE-ME.example.com";
-
-  # Origins other than `https://${rpId}` that assertions may claim — native
-  # apps, which never claim the web origin. An Android app claims
-  # "android:apk-key-hash:<hash>", the unpadded base64url SHA-256 of the
-  # certificate it is signed with; for a Play release that is the app signing
-  # key, not the upload key. `keytool` prints the colon-separated hex form of
-  # the same digest, which must be converted — the runtime refuses it at boot.
-  #
-  # Android lets an app claim this only if
-  # `https://${rpId}/.well-known/assetlinks.json` lists it, so that file must
-  # be served too. Measured by PCR0 like `rpId`: adding an app is a new image.
-  webauthnAllowedOrigins = [ ];
 
   # Where guest stdout and stderr go, on top of the enclave console: this
   # group's `guest` stream, or "" for the console only.

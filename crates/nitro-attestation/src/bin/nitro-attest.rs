@@ -1,17 +1,20 @@
 //! `nitro-attest` — check that an HTTPS endpoint is the enclave you think.
 //!
 //! ```console
-//! $ nitro-attest --url https://enclave.example --pcr0 8cac35ce… \
-//!       --guest ./guest.wasm
+//! $ nitro-attest --document proof/document.b64 --peer-certificate proof/certificate.der \
+//!       --nonce "$(cat proof/nonce.hex)" --pcr0 8cac35ce… --guest ./guest.wasm
 //! ```
 //!
 //! The check that matters is the last one, and it is the reason this tool
 //! exists rather than `curl | openssl`:
 //!
-//! 1. Open a TLS connection and keep the certificate the server presented.
-//! 2. Make an ordinary request, quoting a freshly generated nonce in
-//!    `x-enclave-nonce`. Every response carries a document in
-//!    `x-enclave-attestation`; there is no separate attestation endpoint.
+//! 1. Keep the certificate the server presented on the TLS connection.
+//! 2. Quote a freshly generated nonce in `x-enclave-nonce`. enclave-runtime
+//!    attests the answers a client identifies it by — `register/options` and
+//!    `request/options` — in `x-enclave-attestation`; there is no separate
+//!    attestation endpoint. `wallet-client --dump-proof` keeps the
+//!    three files above from one of those; `--url` fetches a document itself,
+//!    from a server that attests a plain GET.
 //! 3. Verify the document's signature and its chain to the AWS Nitro root.
 //! 4. Check the document's `user_data` contains **the hash of that same
 //!    certificate**.
@@ -25,8 +28,7 @@
 //! PKI is deliberately not what establishes trust here. The certificate is
 //! accepted whatever a public CA thinks of it, because the attestation is the
 //! stronger statement — it says which *code* terminates the connection, which
-//! no CA can attest to. A Let's Encrypt certificate still helps browsers,
-//! which cannot check attestations; this tool does not need it.
+//! no CA can attest to. So the enclave serves a self-signed certificate.
 //!
 //! ## Which code: two measurements
 //!
@@ -65,14 +67,12 @@ const ATTESTATION_HEADER: &str = "x-enclave-attestation";
 #[derive(Parser, Debug)]
 #[command(version, about = "Verify an AWS Nitro Enclaves attestation document")]
 struct Cli {
-    /// URL to request, e.g. `https://enclave.example`. The path defaults to
-    /// `/auth/`.
+    /// URL to GET, path included, e.g. `https://enclave.example/some/path`.
     ///
-    /// Not every route carries a document: the runtime attests its `/auth/`
-    /// exchanges, which is where a client identifies the enclave before
-    /// approving anything, and leaves guest responses alone — a caller has
-    /// already pinned the certificate by then. `/auth/` needs no credential and
-    /// reaches no guest; it answers 404 or 405, and is attested either way.
+    /// enclave-runtime attests only two answers, `register/options` and
+    /// `request/options`: POSTs with a body, which a plain GET cannot make.
+    /// Against it, take the document a client received instead (`wallet-client
+    /// --dump-proof`) and pass `--document`, `--peer-certificate` and `--nonce`.
     #[arg(long, conflicts_with = "document")]
     url: Option<String>,
 
@@ -527,12 +527,10 @@ fn split_url(url: &str) -> Result<(String, u16, String)> {
     let rest = url
         .strip_prefix("https://")
         .context("--url must start with https://")?;
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        // The probe: attested, needs no credential, reaches no guest. What
-        // comes back is a refusal, and the document on it is the point.
-        None => (rest, "/auth/"),
-    };
+    let (authority, path) = rest
+        .find('/')
+        .map(|i| (&rest[..i], &rest[i..]))
+        .context("--url needs a path: name a route that answers with a document")?;
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().context("invalid port")?),
         None => (authority.to_string(), 443u16),

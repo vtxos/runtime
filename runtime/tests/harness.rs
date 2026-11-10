@@ -31,17 +31,14 @@ async fn a_guest_author_can_stand_up_an_enclave_and_sign_a_request() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body.trim(), "1");
 
-    // And the gate is real: the same route without an assertion is refused.
+    // And the gate is real: the same route without a token is refused.
     let (status, _, _) = enclave.request("GET", "/counter", &[], "").await.unwrap();
-    assert_eq!(
-        status, 401,
-        "the harness served a guest without an assertion"
-    );
+    assert_eq!(status, 401, "the harness served a guest without a token");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs examples/guest-http built for wasm32-wasip2"]
-async fn two_passkeys_are_two_tenants() {
+async fn two_wallets_are_two_tenants() {
     let enclave = Enclave::builder(guest()).start().await.unwrap();
     let alice = enclave.enrol().await.unwrap();
     let bob = enclave.enrol().await.unwrap();

@@ -1,14 +1,15 @@
-//! The operator master: the 32 bytes each tenant's cosigner polynomial is derived from.
+//! The operator master: the 32 bytes each tenant's cosigner polynomial is derived from, and the
+//! runtime's share of each wallet key is sealed under.
 //!
 //! The operator writes it as an SSM `SecureString` once the enclave is up, and the runtime reads
-//! it the first time a DKG needs it, then keeps it in memory. Until it is there, DKG requests are
-//! answered as unavailable and the read is tried again on the next one.
+//! it the first time a registration or a sign-in needs it, then keeps it in memory. Until it is
+//! there, those are answered as unavailable and the read is tried again on the next one.
 //!
-//! What holding it gives: the cosigner's polynomial `f_c` for every wallet, and nothing that signs.
-//! The cosigner's share also needs `f_w(id_c)`, which only the wallet deals, and which is kept on
-//! the tenant's own pool. So anything able to read the parameter, the parent's instance role
-//! included, learns `f_c` and no key. What it buys is that the same passkey under the same master
-//! always rebuilds the same wallet key.
+//! What holding it gives, with the roots bucket: the runtime's share of every wallet key
+//! ([`crate::signer`]). That share is the operator's, and it signs nothing and opens no pool
+//! alone — both need the owner's share too. Every release reads the same master, so nothing
+//! moves between releases; and it must never be lost or changed, since every runtime share is
+//! sealed under it.
 
 use anyhow::{Context, Result};
 use tokio::sync::OnceCell;
