@@ -7,38 +7,18 @@
 //! $ POLICY_WASM=<path to policy.wasm> cargo test --test runtime -- --ignored
 //! ```
 
-use std::time::Duration;
+mod common;
 
-use std::process::Command;
 use std::sync::Arc;
 
-use enclave_runtime::testing::Enclave as Harness;
+use common::{bitcoin_cli, fund, harness, mine, pins, recipient_address, settled_balance};
 use vtxos_client::asp::Asp;
-use vtxos_client::enclave::{Enclave, Pins};
+use vtxos_client::enclave::Enclave;
 use vtxos_client::wallet::{Renewal, Wallet};
 use vtxos_client::{guest, Error};
 
 /// A push token as FCM issues them: the guest takes 32 to 512 characters.
 const TOKEN: &str = "fcm-token-for-a-phone-that-holds-this-wallet:0123456789";
-
-async fn harness() -> Harness {
-    let path = std::env::var_os("POLICY_WASM").expect("POLICY_WASM: the policy guest to serve");
-    Harness::builder(std::fs::read(path).expect("read POLICY_WASM"))
-        .notify()
-        .background_tasks()
-        .start()
-        .await
-        .expect("the runtime starts")
-}
-
-fn pins(h: &Harness) -> Pins {
-    Pins {
-        trust_root: h.trust_root(),
-        pcr0: h.pcr0().to_vec(),
-        pcr16: h.pcr16().to_vec(),
-        max_age: Duration::from_secs(300),
-    }
-}
 
 /// A passkey registers a wallet; the record and the same passkey open it again; the opened wallet
 /// signs in to the guest's own calls.
@@ -156,78 +136,4 @@ async fn a_wallet_boards_sends_refreshes_and_protects_against_arkd() {
         .expect("protected");
     assert_eq!(protected.exits.len(), 1);
     assert!(protected.device_enrolled);
-}
-
-/// The balance once the indexer shows `expected`.
-async fn settled_balance(wallet: &Wallet, expected: u64) -> u64 {
-    for _ in 0..30 {
-        let balance = wallet.balance().await.unwrap();
-        if balance == expected {
-            return balance;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    wallet.balance().await.unwrap()
-}
-
-/// Someone else's Ark address on this ASP.
-async fn recipient_address(asp: &Asp) -> String {
-    let info = ark::client::server_info(asp.info().await.unwrap()).unwrap();
-    let someone = bitcoin::secp256k1::Keypair::new(
-        &bitcoin::secp256k1::Secp256k1::new(),
-        &mut rand_core::OsRng,
-    );
-    ark::client::ark_address(
-        &someone.x_only_public_key().0.to_string(),
-        &info.signer_pk.to_string(),
-        ark::client::exit_delay_value(info.unilateral_exit_delay).unwrap(),
-        info.network,
-    )
-    .unwrap()
-}
-
-/// `bitcoin-cli` in the regtest bitcoind container, as the wallet's `scripts/bitcoin.sh` runs it.
-fn bitcoin_cli(args: &[&str]) -> String {
-    let container =
-        std::env::var("ARK_LIVE_BITCOIND").unwrap_or_else(|_| "mpc_bitcoind".to_string());
-    let output = Command::new("docker")
-        .args([
-            "exec",
-            &container,
-            "bitcoin-cli",
-            "-regtest",
-            "-rpcuser=admin1",
-        ])
-        .args(["-rpcpassword=123", "-rpcwallet=default"])
-        .args(args)
-        .output()
-        .expect("run docker");
-    assert!(
-        output.status.success(),
-        "bitcoin-cli {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_string()
-}
-
-fn mine(blocks: u32) {
-    let address = bitcoin_cli(&["getnewaddress", "", "bech32m"]);
-    bitcoin_cli(&["generatetoaddress", &blocks.to_string(), &address]);
-}
-
-/// Pay `sats` to `address` and confirm it; the output's outpoint.
-fn fund(address: &str, sats: u64) -> (String, u32) {
-    let btc = format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000);
-    let txid = bitcoin_cli(&["sendtoaddress", address, &btc]);
-    mine(1);
-    let tx: serde_json::Value =
-        serde_json::from_str(&bitcoin_cli(&["gettransaction", &txid])).unwrap();
-    let vout = tx["details"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|d| d["address"] == address && d["category"] == "send")
-        .and_then(|d| d["vout"].as_u64())
-        .expect("the funding output");
-    (txid, vout as u32)
 }

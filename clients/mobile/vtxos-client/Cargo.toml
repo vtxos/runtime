@@ -12,6 +12,8 @@ enclave-client = { path = "../../../crates/enclave-client" }
 threshold = { path = "../../../crates/threshold", features = ["std", "ecdh"] }
 # The sessions the guest drives, its exits, and arkd's messages.
 ark = { path = "../../../crates/ark", features = ["signing"] }
+# The way down to a VTXO for its exit: its branch ordered and finalized.
+ark-core = "0.9"
 bitcoin = "0.32"
 
 k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }

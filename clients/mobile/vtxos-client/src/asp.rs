@@ -1,13 +1,15 @@
 //! The ASP: arkd's `ArkService` and `IndexerService`, over HTTP/2.
 //!
 //! The guest never reaches the ASP during a ceremony; the phone does, and relays what the ASP says.
-//! So these are the calls the ceremonies need, and the indexer's VTXO listing.
+//! So these are the calls the ceremonies need, the indexer's VTXO listing, and the chains of
+//! virtual transactions an exit needs on chain before it.
 
 use ark::client::proto::{
     ConfirmRegistrationRequest, FinalizeTxRequest, GetEventStreamRequest, GetEventStreamResponse,
-    GetInfoRequest, GetInfoResponse, GetVtxosRequest, IndexerVtxo, Intent, RegisterIntentRequest,
-    SubmitSignedForfeitTxsRequest, SubmitTreeNoncesRequest, SubmitTreeSignaturesRequest,
-    SubmitTxRequest, SubmitTxResponse,
+    GetInfoRequest, GetInfoResponse, GetVirtualTxsRequest, GetVtxoChainRequest, GetVtxosRequest,
+    IndexerChain, IndexerOutpoint, IndexerPageRequest, IndexerPageResponse, IndexerVtxo, Intent,
+    RegisterIntentRequest, SubmitSignedForfeitTxsRequest, SubmitTreeNoncesRequest,
+    SubmitTreeSignaturesRequest, SubmitTxRequest, SubmitTxResponse,
 };
 use http::Uri;
 use hyper::client::conn::http2::SendRequest;
@@ -25,6 +27,15 @@ use crate::proto::guest::{asp_submit, AspSubmit};
 pub struct Asp {
     url: String,
     connection: Mutex<Option<(SendRequest<BoxBody>, Uri)>>,
+}
+
+/// The indexer's pages, as the Arkade SDK walks them.
+const PAGE_SIZE: i32 = 100;
+
+/// The index of the page after `page`, if there is one.
+fn next_page(page: Option<IndexerPageResponse>, items: usize) -> Option<i32> {
+    let page = page?;
+    (page.current < page.total && items >= PAGE_SIZE as usize).then_some(page.next)
 }
 
 fn refused(call: &str, status: tonic::Status) -> Error {
@@ -90,6 +101,55 @@ impl Asp {
             .map_err(|s| refused("GetVtxos", s))?
             .into_inner()
             .vtxos)
+    }
+
+    /// The transactions a VTXO descends from, back to the commitment transactions it comes out of.
+    pub async fn vtxo_chain(&self, txid: &str, vout: u32) -> Result<Vec<IndexerChain>> {
+        let mut indexer = self.indexer().await?;
+        let mut chain = Vec::new();
+        let mut index = Some(0);
+        while let Some(i) = index {
+            let answer = indexer
+                .get_vtxo_chain(GetVtxoChainRequest {
+                    outpoint: Some(IndexerOutpoint {
+                        txid: txid.to_string(),
+                        vout,
+                    }),
+                    page: Some(IndexerPageRequest {
+                        size: PAGE_SIZE,
+                        index: i,
+                    }),
+                })
+                .await
+                .map_err(|s| refused("GetVtxoChain", s))?
+                .into_inner();
+            index = next_page(answer.page, answer.chain.len());
+            chain.extend(answer.chain);
+        }
+        Ok(chain)
+    }
+
+    /// The virtual transactions `txids`, as signed PSBTs in base64.
+    pub async fn virtual_txs(&self, txids: &[String]) -> Result<Vec<String>> {
+        let mut indexer = self.indexer().await?;
+        let mut txs = Vec::new();
+        let mut index = Some(0);
+        while let Some(i) = index {
+            let answer = indexer
+                .get_virtual_txs(GetVirtualTxsRequest {
+                    txids: txids.to_vec(),
+                    page: Some(IndexerPageRequest {
+                        size: PAGE_SIZE,
+                        index: i,
+                    }),
+                })
+                .await
+                .map_err(|s| refused("GetVirtualTxs", s))?
+                .into_inner();
+            index = next_page(answer.page, answer.txs.len());
+            txs.extend(answer.txs);
+        }
+        Ok(txs)
     }
 
     pub async fn submit_tx(

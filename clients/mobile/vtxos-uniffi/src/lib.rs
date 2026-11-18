@@ -177,13 +177,25 @@ pub struct Renewal {
     pub device_token: Option<String>,
 }
 
-/// A signed exit: broadcast `raw_tx` once its delay has passed, to leave without the ASP.
+/// A signed exit, with everything needed to leave without the ASP. Keep it.
+///
+/// To leave: put each of `unroll` on chain in order, then, once the last has confirmed and
+/// `sequence` has passed, `raw_tx`. Each pays no fee and carries a P2A anchor, so each goes in a
+/// package with a child that spends the anchor and pays for both, from the app's own wallet; one
+/// per block, since TRUC lets a transaction have only one unconfirmed parent.
+///
+/// It holds until the VTXO is spent or refreshed, or its batch expires and the ASP sweeps it. A
+/// newer exit replaces it.
 #[derive(uniffi::Record)]
 pub struct Exit {
+    /// The VTXO it spends, `txid:vout`.
     pub outpoint: String,
     pub raw_tx: Vec<u8>,
+    /// The relative timelock `raw_tx` waits for, as its input's nSequence.
     pub sequence: u32,
     pub amount_sats: u64,
+    /// The virtual transactions from the batch down to the VTXO, in the order they go on chain.
+    pub unroll: Vec<Vec<u8>>,
 }
 
 /// A delegate renewed: the guest refreshes these VTXOs itself from `valid_at_secs`.
@@ -250,6 +262,7 @@ impl From<client::Renewed> for Renewed {
                     raw_tx: e.raw_tx,
                     sequence: e.sequence,
                     amount_sats: e.amount_sats,
+                    unroll: e.unroll,
                 })
                 .collect(),
         }

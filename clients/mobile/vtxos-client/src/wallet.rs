@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use ark::client::{exit_delay_value, server_info, Info};
 use bitcoin::address::NetworkUnchecked;
+use bitcoin::consensus::serialize;
 use bitcoin::{Address, ScriptBuf, XOnlyPublicKey};
 use enclave_auth::client::Client;
 use prost::Message as _;
@@ -29,6 +30,7 @@ use crate::proto::guest::{
     SendSubmitted, VtxoInput, WalletRound,
 };
 use crate::proto::wallet::ArkInfo as WireInfo;
+use crate::unroll;
 
 /// A VTXO this wallet holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,9 +325,13 @@ impl Wallet {
             Some(renewal) => {
                 let spent: Vec<(String, u32)> =
                     held.iter().map(|v| (v.txid.clone(), v.vout)).collect();
+                // The spent gone and the change in: the indexer may drop the one before it shows
+                // the other.
+                let change = held.iter().map(|v| v.amount_sats).sum::<u64>() > amount_sats;
                 let now = self
                     .held_once(&info, |h| {
                         !h.iter().any(|v| spent.contains(&(v.txid.clone(), v.vout)))
+                            && (!change || h.iter().any(|v| v.txid == complete.ark_txid))
                     })
                     .await?;
                 let (request, plan) = self.delegate_request(&info, &wire, &now, &renewal)?;
@@ -345,7 +351,9 @@ impl Wallet {
                 out.say(send_client_msg::Body::Signed(SendSigned { rounds }))
                     .await?;
                 match next_send(&mut inbound).await? {
-                    send_server_msg::Body::DelegateRenewed(d) => Some(renewed(&plan, d)?),
+                    send_server_msg::Body::DelegateRenewed(d) => {
+                        Some(self.renewed(&plan, d).await?)
+                    }
                     other => return Err(unexpected("Send", "the renewed delegate", &other)),
                 }
             }
@@ -429,7 +437,7 @@ impl Wallet {
         out.say(renew_client_msg::Body::Signed(RenewSigned { rounds }))
             .await?;
         match next_renew(&mut inbound).await? {
-            renew_server_msg::Body::DelegateRenewed(d) => renewed(&plan, d),
+            renew_server_msg::Body::DelegateRenewed(d) => self.renewed(&plan, d).await,
             other => Err(unexpected("Renew", "the renewed delegate", &other)),
         }
     }
@@ -534,7 +542,7 @@ impl Wallet {
                     let mut done = settled.take().ok_or_else(|| {
                         Error::Protocol("a delegate renewed before the round settled".into())
                     })?;
-                    done.renewed = Some(renewed(plan, d)?);
+                    done.renewed = Some(self.renewed(plan, d).await?);
                     return Ok(done);
                 }
             }
@@ -566,6 +574,31 @@ impl Wallet {
         ))
     }
 
+    /// The delegate the guest renewed, its exits checked, and each given the virtual transactions
+    /// it needs on chain first: fetched now, while the indexer is there to ask.
+    async fn renewed(&self, plan: &Plan, d: DelegateRenewed) -> Result<Renewed> {
+        let mut exits = plan.verify(&d.exit_txs)?;
+        for exit in &mut exits {
+            let (txid, vout) = exit
+                .outpoint
+                .rsplit_once(':')
+                .and_then(|(txid, vout)| Some((txid, vout.parse().ok()?)))
+                .ok_or_else(|| Error::Protocol(format!("outpoint {}", exit.outpoint)))?;
+            exit.unroll = unroll::branch(&self.asp, txid, vout)
+                .await?
+                .iter()
+                .map(serialize)
+                .collect();
+        }
+        Ok(Renewed {
+            valid_at_secs: d.valid_at_secs,
+            margin_secs: d.margin_secs,
+            covered: d.covered,
+            device_enrolled: d.device_enrolled,
+            exits,
+        })
+    }
+
     /// The delegate's round: its messages, then the exits', which must be exactly the ones
     /// [`Plan`] built.
     fn delegate_rounds(
@@ -580,16 +613,6 @@ impl Wallet {
         let messages: Vec<Vec<u8>> = delegate.iter().chain(exits).cloned().collect();
         self.sign(cosigner, &messages, commitments)
     }
-}
-
-fn renewed(plan: &Plan, d: DelegateRenewed) -> Result<Renewed> {
-    Ok(Renewed {
-        valid_at_secs: d.valid_at_secs,
-        margin_secs: d.margin_secs,
-        covered: d.covered,
-        device_enrolled: d.device_enrolled,
-        exits: plan.verify(&d.exit_txs)?,
-    })
 }
 
 fn wire_vtxo(v: &Vtxo) -> VtxoInput {

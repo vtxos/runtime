@@ -17,6 +17,7 @@ pub mod h2;
 pub mod keys;
 pub mod proto;
 pub mod tls;
+mod unroll;
 pub mod wallet;
 
 pub use error::{Error, Result};

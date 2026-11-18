@@ -15,7 +15,15 @@ use bitcoin::{ScriptBuf, Transaction, XOnlyPublicKey};
 use crate::error::{Error, Result};
 use crate::proto::guest::{ExitTx, VtxoInput};
 
-/// One exit, signed and ready to broadcast once its delay has passed.
+/// One exit, signed, with everything needed to put it on chain without the ASP.
+///
+/// To leave: put each of `unroll` on chain in order, then, once the last has confirmed and
+/// `sequence` has passed, `raw_tx`. Each pays no fee and carries a P2A anchor, so each goes in a
+/// package with a child that spends the anchor and pays for both, from whatever wallet the user
+/// pays with; one per block, since TRUC lets a transaction have only one unconfirmed parent.
+///
+/// It holds until the VTXO is spent or refreshed, or its batch expires and the ASP sweeps it. A
+/// newer exit replaces it.
 #[derive(Debug, Clone)]
 pub struct Exit {
     /// The VTXO it spends, `txid:vout`.
@@ -25,6 +33,9 @@ pub struct Exit {
     /// The relative timelock it waits for, as the input's nSequence.
     pub sequence: u32,
     pub amount_sats: u64,
+    /// The virtual transactions from the batch down to the VTXO, consensus-serialized, in the
+    /// order they go on chain.
+    pub unroll: Vec<Vec<u8>>,
 }
 
 /// The exits the guest is expected to ask for.
@@ -121,6 +132,8 @@ impl Plan {
                     raw_tx: exit.raw_tx.clone(),
                     sequence: spend.sequence,
                     amount_sats: exit.amount_sats,
+                    // The wallet fetches it from the indexer once the exits check out.
+                    unroll: Vec::new(),
                 })
             })
             .collect()

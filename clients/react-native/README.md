@@ -30,6 +30,23 @@ await wallet.send(address, 10_000n, { exitAddress, deviceToken });
 wallet.close(); // drops the share
 ```
 
+### Exits
+
+A renewal with an `exitAddress` returns one signed `Exit` per VTXO. Store each one, including
+`unroll`: with it, the user can leave even if the ASP has disappeared.
+
+To leave:
+1. Put each transaction in `unroll` on chain in order, then `rawTx` once the last of them has
+   confirmed and `sequence` has passed.
+2. Each one pays no fee and carries a P2A anchor. Broadcast it as a package with a child from the
+   app's own on-chain wallet that spends the anchor and pays for both.
+3. Do one per block: TRUC allows only one unconfirmed parent.
+
+The provider must accept packages, e.g. Esplora's `POST /txs/package`. The regtest electrs doesn't
+have that endpoint; on regtest, use bitcoind's `submitpackage`.
+
+An exit holds until its VTXO is spent or refreshed, or its batch expires; a newer one replaces it.
+
 Errors are `VtxosError`s: check `VtxosError.Attestation.instanceOf(e)`, and so on for `Pinning`,
 `Auth`, `Enclave`, `Asp`, `WrongPasskey`, `Protocol` and `Transport`.
 
