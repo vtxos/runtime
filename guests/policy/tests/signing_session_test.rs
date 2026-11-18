@@ -1,4 +1,4 @@
-//! A signing session: FROST carried inside the stream that needs it — see `cosigner::sign`.
+//! A signing session: FROST carried inside the stream that needs it — see `policy::sign`.
 //!
 //! The nested form — a second `Sign` stream per sighash while the outer stream waited — deadlocks
 //! inside enclave-runtime, which runs one request per tenant for the whole life of a stream. That
@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use bitcoin::secp256k1::{schnorr, Message, Secp256k1, XOnlyPublicKey};
 use rand::rngs::OsRng;
 
-use cosigner::sign::{SigningSession, WalletHalf};
-use cosigner::types::Commitment;
+use policy::sign::{SigningSession, WalletHalf};
+use policy::types::Commitment;
 
 use threshold::commitment::SigningPackage;
 use threshold::identifier::Identifier;
@@ -78,7 +78,7 @@ fn bip340_ok(pkp: &PublicKeyPackage, message: &[u8], signature: &[u8]) -> bool {
 
 /// A cosigner whose runtime holds a wallet's key, the wallet's key package (alone, at index 0),
 /// and the group's public package.
-fn seeded() -> Option<(cosigner::Cosigner, Vec<KeyPackage>, PublicKeyPackage)> {
+fn seeded() -> Option<(policy::Cosigner, Vec<KeyPackage>, PublicKeyPackage)> {
     let store = common::try_store()?;
     let wallet = common::wallet();
     let cosigner = common::open_holding(&store, &wallet);
@@ -87,7 +87,7 @@ fn seeded() -> Option<(cosigner::Cosigner, Vec<KeyPackage>, PublicKeyPackage)> {
 }
 
 /// Round one over [messages], through the runtime.
-fn begin(cosigner: &cosigner::Cosigner, messages: &[Vec<u8>]) -> (SigningSession, Vec<Commitment>) {
+fn begin(cosigner: &policy::Cosigner, messages: &[Vec<u8>]) -> (SigningSession, Vec<Commitment>) {
     SigningSession::begin(cosigner.host(), messages).expect("round one")
 }
 

@@ -28,7 +28,7 @@ const NONCE_HEX: &str = include_str!("fixtures/dev-nonce.hex");
 /// As printed by `dev-enclave.sh` for that boot.
 const PCR0: &str = "8f2026d5a6c50479e27152c06ca86852ce0ec9528efd5f13d8bee969f128076adf1c720ead49d5629724fe2562a1cd99";
 const PCR16: &str = "e5d19028de3519c28511df1942d0bac7ba3e633707adbd3c4017d4ba8ca8e515a1b79e5b91081ec19267cf35f732f9b3";
-/// `sha256sum cosigner.wasm` for the component it served.
+/// `sha256sum policy.wasm` for the component it served (built as `cosigner.wasm` then).
 const GUEST_SHA256: &str = "8c8e83402faafdaf775f7b421ede83bc1d8325eba84f97395c91783271f9d51f";
 /// `sha256sum dev-served-leaf.der`.
 const LEAF_SHA256: &str = "a9f24f8f55d4541b3dddccc4a73ee585e03e1722da0bdd00855472111114188c";

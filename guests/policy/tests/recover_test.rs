@@ -7,7 +7,7 @@
 
 mod common;
 
-use cosigner::session::proto::RecoverRequest;
+use policy::session::proto::RecoverRequest;
 
 use threshold::identifier::Identifier;
 

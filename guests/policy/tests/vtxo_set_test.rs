@@ -9,7 +9,7 @@
 mod common;
 
 use ark::client::types::ArkInfo;
-use cosigner::types::{BoardingSettleSubmitted, VtxoInput};
+use policy::types::{BoardingSettleSubmitted, VtxoInput};
 
 /// The two delays a wallet's VTXOs can carry: received/refreshed, and boarded.
 fn info() -> ArkInfo {

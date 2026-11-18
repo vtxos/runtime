@@ -9,10 +9,10 @@ mod common;
 
 /// Open from the seal, with no runtime around it.
 fn open(
-    store: std::sync::Arc<cosigner::store::Store>,
+    store: std::sync::Arc<policy::store::Store>,
     group_key: String,
-) -> Result<cosigner::Cosigner, cosigner::grpc::Status> {
-    cosigner::Cosigner::open(store, group_key, std::sync::Arc::new(cosigner::host::Detached))
+) -> Result<policy::Cosigner, policy::grpc::Status> {
+    policy::Cosigner::open(store, group_key, std::sync::Arc::new(policy::host::Detached))
 }
 
 /// A seal that is there and cannot be read refuses to open as an empty wallet.

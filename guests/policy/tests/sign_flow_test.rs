@@ -11,7 +11,7 @@
 
 mod common;
 
-use cosigner::sign::SigningSession;
+use policy::sign::SigningSession;
 use threshold::point;
 use threshold::scalar::scalar_from_bytes;
 use threshold::signature::Signature;

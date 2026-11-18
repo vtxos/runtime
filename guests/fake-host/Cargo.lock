@@ -378,27 +378,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 
 [[package]]
-name = "cosigner"
-version = "0.1.0"
-dependencies = [
- "ark",
- "bitcoin",
- "bytes",
- "hex",
- "http",
- "http-body",
- "http-body-util",
- "k256",
- "parking_lot",
- "prost",
- "serde",
- "serde_json",
- "tonic-build",
- "wit-bindgen 0.46.0",
- "wstd",
-]
-
-[[package]]
 name = "cpp_demangle"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -766,11 +745,11 @@ dependencies = [
  "ark",
  "bitcoin",
  "bytes",
- "cosigner",
  "hex",
  "http-body",
  "http-body-util",
  "hyper",
+ "policy",
  "prost",
  "rand 0.8.5",
  "rand_core 0.6.4",
@@ -1677,6 +1656,27 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
+name = "policy"
+version = "0.1.0"
+dependencies = [
+ "ark",
+ "bitcoin",
+ "bytes",
+ "hex",
+ "http",
+ "http-body",
+ "http-body-util",
+ "k256",
+ "parking_lot",
+ "prost",
+ "serde",
+ "serde_json",
+ "tonic-build",
+ "wit-bindgen 0.46.0",
+ "wstd",
+]
 
 [[package]]
 name = "postcard"

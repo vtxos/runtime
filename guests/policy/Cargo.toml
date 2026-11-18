@@ -1,12 +1,12 @@
 [package]
-name = "cosigner"
+name = "policy"
 version = "0.1.0"
 edition = "2021"
 
 # A component, not a server. `wstd::http_server` exports `wasi:http/incoming-handler`; the
 # runtime owns the socket and calls it once per request.
 [[bin]]
-name = "cosigner"
+name = "policy"
 path = "src/main.rs"
 
 [features]

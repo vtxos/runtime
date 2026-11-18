@@ -20,10 +20,10 @@
 
 mod common;
 
-use cosigner::grpc::Code;
-use cosigner::session::proto;
-use cosigner::wallet_proto as wp;
-use cosigner::Cosigner;
+use policy::grpc::Code;
+use policy::session::proto;
+use policy::wallet_proto as wp;
+use policy::Cosigner;
 
 use common::wire::{block_on, collect, request, service, Answer};
 

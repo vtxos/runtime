@@ -10,12 +10,12 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use ark::client::types::ArkInfo;
-use cosigner::cosigner::{Outcome, Task, CATEGORY_SETTLE_DUE, WATCH_TASK_ID};
+use policy::cosigner::{Outcome, Task, CATEGORY_SETTLE_DUE, WATCH_TASK_ID};
 use common::Recorder;
-use cosigner::renew::DelegateRenew;
-use cosigner::host::valid_label;
-use cosigner::session::proto;
-use cosigner::types::VtxoInput;
+use policy::renew::DelegateRenew;
+use policy::host::valid_label;
+use policy::session::proto;
+use policy::types::VtxoInput;
 use threshold::keys::KeyPackage;
 
 fn payload(deadline_secs: u64) -> Vec<u8> {
@@ -23,11 +23,11 @@ fn payload(deadline_secs: u64) -> Vec<u8> {
 }
 
 fn open_with(
-    store: &Arc<cosigner::store::Store>,
+    store: &Arc<policy::store::Store>,
     host: Arc<Recorder>,
     group_key: &str,
-) -> cosigner::Cosigner {
-    cosigner::Cosigner::open(store.clone(), group_key.to_string(), host)
+) -> policy::Cosigner {
+    policy::Cosigner::open(store.clone(), group_key.to_string(), host)
         .expect("open")
 }
 
@@ -102,9 +102,9 @@ fn arming_enqueues_a_repeating_watch() {
 
 /// A wallet that has been through DKG, on [host].
 fn wallet(
-    store: &Arc<cosigner::store::Store>,
+    store: &Arc<policy::store::Store>,
     host: Arc<Recorder>,
-) -> (Arc<Mutex<cosigner::Cosigner>>, KeyPackage) {
+) -> (Arc<Mutex<policy::Cosigner>>, KeyPackage) {
     let test = common::wallet();
     host.hold(&test);
     let c = Mutex::new(open_with(store, host, &test.group_key()));
@@ -113,7 +113,7 @@ fn wallet(
 
 /// Renew the delegate over one VTXO expiring at [expires_at], answering its round as the wallet
 /// would. Renewing is what arms the watch.
-fn renew_expiring_at(c: &Arc<Mutex<cosigner::Cosigner>>, kp_user: &KeyPackage, expires_at: i64) {
+fn renew_expiring_at(c: &Arc<Mutex<policy::Cosigner>>, kp_user: &KeyPackage, expires_at: i64) {
     let request = proto::RenewDelegate {
         vtxos: vec![proto::VtxoInput {
             txid: "a".repeat(64),
@@ -134,7 +134,7 @@ fn renew_expiring_at(c: &Arc<Mutex<cosigner::Cosigner>>, kp_user: &KeyPackage, e
 }
 
 /// The deadline a VTXO expiring at [expires_at] is armed for: its expiry, less the margin.
-fn deadline(store: &cosigner::store::Store, expires_at: i64) -> u64 {
+fn deadline(store: &policy::store::Store, expires_at: i64) -> u64 {
     (expires_at - store.auto_settle_safety_margin_secs) as u64
 }
 
@@ -168,13 +168,13 @@ fn ark_info() -> ArkInfo {
 
 /// Build a cosigner holding a real, signed delegate — the state the watch exists to watch.
 fn with_delegate(
-    store: &Arc<cosigner::store::Store>,
+    store: &Arc<policy::store::Store>,
     host: Arc<Recorder>,
-) -> Option<(cosigner::Cosigner, String)> {
+) -> Option<(policy::Cosigner, String)> {
     let test = common::wallet();
     let group_key = test.group_key();
     host.hold(&test);
-    let mut c = cosigner::Cosigner::open(store.clone(), group_key.clone(), host)
+    let mut c = policy::Cosigner::open(store.clone(), group_key.clone(), host)
         .expect("open");
     c.accept_vtxos(
         vec![VtxoInput {
@@ -257,7 +257,7 @@ struct ScriptedAsp {
 
 struct EndedStream;
 
-impl cosigner::asp::EventSource for EndedStream {
+impl policy::asp::EventSource for EndedStream {
     async fn next(
         &mut self,
     ) -> Result<Option<ark::client::proto::get_event_stream_response::Event>, String> {
@@ -265,7 +265,7 @@ impl cosigner::asp::EventSource for EndedStream {
     }
 }
 
-impl cosigner::asp::AspApi for ScriptedAsp {
+impl policy::asp::AspApi for ScriptedAsp {
     type Events = EndedStream;
     async fn get_info(&mut self) -> Result<ArkInfo, String> {
         Ok(ark_info())
@@ -296,8 +296,8 @@ impl cosigner::asp::AspApi for ScriptedAsp {
 
 /// The guest's `run-task`, with no ASP to run a delegate against — so a due delegate wakes the
 /// owner instead.
-fn run_task(c: &mut cosigner::Cosigner, task_id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
-    block_on(c.run_task_with::<cosigner::asp::NoAsp>(task_id, payload, None))
+fn run_task(c: &mut policy::Cosigner, task_id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+    block_on(c.run_task_with::<policy::asp::NoAsp>(task_id, payload, None))
 }
 
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {

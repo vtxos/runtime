@@ -8,11 +8,11 @@ mod common;
 
 use bitcoin::consensus::deserialize;
 use bitcoin::Transaction;
-use cosigner::sign::WalletHalf;
-use cosigner::renew::DelegateRenew;
-use cosigner::session::proto;
+use policy::sign::WalletHalf;
+use policy::renew::DelegateRenew;
+use policy::session::proto;
 use std::sync::{Arc, Mutex};
-use cosigner::types::{Commitment, VtxoInput};
+use policy::types::{Commitment, VtxoInput};
 use std::collections::BTreeMap;
 
 use ark::client::types::ArkInfo;
@@ -30,7 +30,7 @@ use threshold::signing;
 /// signs with the wallet's key as the runtime would, through a `Recorder` holding it.
 struct Accepting(common::Recorder);
 
-impl cosigner::host::Host for Accepting {
+impl policy::host::Host for Accepting {
     fn enqueue(&self, _: &str, _: &[u8], _: u64, _: Option<u64>) -> Result<(), String> {
         Ok(())
     }
@@ -55,7 +55,7 @@ impl cosigner::host::Host for Accepting {
     fn wake(&self, _: &str, _: Option<&str>) -> Result<(), String> {
         Ok(())
     }
-    fn wallet_key(&self) -> Result<cosigner::host::WalletKey, String> {
+    fn wallet_key(&self) -> Result<policy::host::WalletKey, String> {
         self.0.wallet_key()
     }
     fn dealt_share(&self, identifier: &[u8]) -> Result<Vec<u8>, String> {
@@ -64,12 +64,12 @@ impl cosigner::host::Host for Accepting {
     fn signing_begin(
         &self,
         messages: &[Vec<u8>],
-    ) -> Result<(cosigner::host::SigningHandle, Vec<cosigner::host::Commitment>), String> {
+    ) -> Result<(policy::host::SigningHandle, Vec<policy::host::Commitment>), String> {
         self.0.signing_begin(messages)
     }
     fn signing_finish(
         &self,
-        signing: cosigner::host::SigningHandle,
+        signing: policy::host::SigningHandle,
         rounds: &[WalletHalf],
     ) -> Result<Vec<Vec<u8>>, String> {
         self.0.signing_finish(signing, rounds)
@@ -154,9 +154,9 @@ struct Renewed {
 
 /// A wallet as DKG leaves it, on a host that accepts whatever its renewals schedule.
 struct Wallet {
-    cosigner: Arc<Mutex<cosigner::Cosigner>>,
+    cosigner: Arc<Mutex<policy::Cosigner>>,
     test: common::TestWallet,
-    store: std::sync::Arc<cosigner::store::Store>,
+    store: std::sync::Arc<policy::store::Store>,
 }
 
 fn wallet() -> Option<Wallet> {
@@ -168,10 +168,10 @@ fn wallet() -> Option<Wallet> {
 
 /// A new instance over the store: what the runtime does on every request.
 fn reopen_at(
-    store: &std::sync::Arc<cosigner::store::Store>,
+    store: &std::sync::Arc<policy::store::Store>,
     test: &common::TestWallet,
-) -> cosigner::Cosigner {
-    cosigner::Cosigner::open(
+) -> policy::Cosigner {
+    policy::Cosigner::open(
         store.clone(),
         test.group_key(),
         std::sync::Arc::new(Accepting(common::Recorder::holding(test))),
@@ -218,7 +218,7 @@ fn renew(vtxos: Vec<VtxoInput>, exit_script: &[u8]) -> Option<Renewed> {
 }
 
 /// What [c] would seal now, parsed.
-fn snapshot(c: &cosigner::Cosigner) -> serde_json::Value {
+fn snapshot(c: &policy::Cosigner) -> serde_json::Value {
     serde_json::from_slice(&c.to_snapshot().expect("snapshot")).expect("json")
 }
 

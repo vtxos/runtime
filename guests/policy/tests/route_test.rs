@@ -6,10 +6,10 @@
 
 mod common;
 
-use cosigner::grpc::Code;
-use cosigner::session::proto;
-use cosigner::wallet_proto::{GetServerInfoRequest, GetServerInfoResponse};
-use cosigner::Cosigner;
+use policy::grpc::Code;
+use policy::session::proto;
+use policy::wallet_proto::{GetServerInfoRequest, GetServerInfoResponse};
+use policy::Cosigner;
 
 use threshold::keys::KeyPackage;
 

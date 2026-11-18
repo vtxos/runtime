@@ -1,4 +1,4 @@
-//! A wallet's life with its cosigner, against the very `cosigner.wasm` a release ships.
+//! A wallet's life with its cosigner, against the very `policy.wasm` a release ships.
 //!
 //! The test plays the wallet, over the cosigner's own gRPC service, and the fake host plays the
 //! runtime: the DKG it runs at registration, devices, a signature through the key it keeps,
@@ -7,29 +7,29 @@
 //! those calls it has to seal: every call is a fresh instance.
 //!
 //! ```console
-//! $ make cosigner-wasm                         # result/bin/cosigner.wasm, as a release builds it
-//! $ COSIGNER_WASM=result/bin/cosigner.wasm cargo test --manifest-path guests/fake-host/Cargo.toml
+//! $ nix build .#policy                          # result/bin/policy.wasm, as a release builds it
+//! $ POLICY_WASM=result/bin/policy.wasm cargo test --manifest-path guests/fake-host/Cargo.toml
 //! ```
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cosigner::cosigner::{
+use policy::cosigner::{
     Outcome, Task, CATEGORY_DELEGATE_SETTLED, CATEGORY_SETTLE_DUE, WATCH_TASK_ID,
 };
-use cosigner::session::proto;
-use cosigner::wallet_proto as wp;
+use policy::session::proto;
+use policy::wallet_proto as wp;
 use fake_host::Host;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use threshold::identifier::Identifier;
 use threshold::keys::KeyPackage;
 
-/// The component under test: `COSIGNER_WASM`, or what `make cosigner-wasm` leaves in `result/`.
+/// The component under test: `POLICY_WASM`, or what `nix build .#policy` leaves in `result/`.
 fn wasm() -> PathBuf {
-    std::env::var_os("COSIGNER_WASM").map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../result/bin/cosigner.wasm")
+    std::env::var_os("POLICY_WASM").map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../result/bin/policy.wasm")
     })
 }
 
@@ -39,7 +39,7 @@ const MARGIN_SECS: i64 = 1800;
 
 fn host() -> Host {
     let host = Host::new(&wasm(), &[("AUTO_SETTLE_SAFETY_MARGIN_SECS", "1800")])
-        .expect("load the component; build it first with `make cosigner-wasm`");
+        .expect("load the component; build it first with `nix build .#policy`");
     host.runtime.asp.lock().unwrap().info = ark_info_json();
     host
 }
@@ -236,10 +236,10 @@ async fn sign(host: &Host, wallet: &Wallet, message: &[u8; 32]) -> Vec<u8> {
     else {
         panic!("expected the cosigner's commitments");
     };
-    let commitments: Vec<cosigner::types::Commitment> = theirs
+    let commitments: Vec<policy::types::Commitment> = theirs
         .commitments
         .into_iter()
-        .map(|(identifier_hex, c)| cosigner::types::Commitment {
+        .map(|(identifier_hex, c)| policy::types::Commitment {
             identifier_hex,
             hiding: c.hiding,
             binding: c.binding,
@@ -292,10 +292,10 @@ async fn renew_delegate(host: &Host, wallet: &Wallet, expires_at: i64) -> proto:
     else {
         panic!("expected the delegate's sighashes");
     };
-    let commitments: Vec<cosigner::types::Commitment> = sighashes
+    let commitments: Vec<policy::types::Commitment> = sighashes
         .cosigner_commitments
         .into_iter()
-        .map(|c| cosigner::types::Commitment {
+        .map(|c| policy::types::Commitment {
             identifier_hex: sighashes.cosigner_identifier.clone(),
             hiding: c.hiding,
             binding: c.binding,
@@ -324,8 +324,8 @@ async fn renew_delegate(host: &Host, wallet: &Wallet, expires_at: i64) -> proto:
 fn wallet_answers(
     key: &KeyPackage,
     messages: &[Vec<u8>],
-    theirs: &[cosigner::types::Commitment],
-) -> Vec<cosigner::sign::WalletHalf> {
+    theirs: &[policy::types::Commitment],
+) -> Vec<policy::sign::WalletHalf> {
     use threshold::commitment::SigningPackage;
     use threshold::nonce::{self, SigningCommitments};
     use threshold::point;
@@ -354,7 +354,7 @@ fn wallet_answers(
             commitments.insert(key.identifier.clone(), ours.commitments.clone());
             let package = SigningPackage::new(commitments, message.clone());
             let share = signing::sign(&package, &ours, key).expect("the wallet's share");
-            cosigner::sign::WalletHalf {
+            policy::sign::WalletHalf {
                 hiding: point::serialize_compressed(&ours.commitments.hiding).to_vec(),
                 binding: point::serialize_compressed(&ours.commitments.binding).to_vec(),
                 share: scalar_to_bytes(&share.s).to_vec(),

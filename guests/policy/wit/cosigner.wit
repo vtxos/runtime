@@ -5,7 +5,7 @@
 // the two still fit. A guest that wants two capabilities composes them here instead of editing
 // either.
 //
-// Not yet generated from. The crate now builds as a wasm32-wasip2 component — `make cosigner-wasm`
+// Not yet generated from. The crate now builds as a wasm32-wasip2 component — `nix build .#policy`
 // — serving gRPC over `wasi:http/incoming-handler`, which removed the reason this could not be
 // generated. What remains is composing this world with the one `wstd::http_server` exports, so
 // `src/host.rs` still mirrors these signatures behind a trait and `tests/wit_test.rs` checks the

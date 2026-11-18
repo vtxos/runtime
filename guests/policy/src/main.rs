@@ -16,8 +16,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use cosigner::grpc::Status;
-use cosigner::{config, grpc, session, store, Cosigner};
+use policy::grpc::Status;
+use policy::{config, grpc, session, store, Cosigner};
 use wstd::http::{Body, Request, Response};
 
 /// What the seal is filed under when `COSIGNER_GROUP_KEY` says nothing — see [`serve`].
@@ -53,7 +53,7 @@ async fn serve(req: Request<Body>) -> Result<Response<Body>, Status> {
     }
 
     let cosigner = Arc::new(Mutex::new(open_cosigner(&cfg)?));
-    let server_info = cosigner::wallet_proto::GetServerInfoResponse {
+    let server_info = policy::wallet_proto::GetServerInfoResponse {
         bitcoin_network: cfg.bitcoin_network.clone(),
     };
 
@@ -98,13 +98,13 @@ fn open_cosigner(cfg: &config::Config) -> Result<Cosigner, Status> {
 /// `Detached` off the target is not a fallback so much as the truth: a host build has no task queue
 /// and no push channel, and every call failing is what stops a missed deadline looking healthy.
 #[cfg(target_arch = "wasm32")]
-fn host() -> Arc<dyn cosigner::host::Host> {
+fn host() -> Arc<dyn policy::host::Host> {
     Arc::new(runtime::Runtime)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn host() -> Arc<dyn cosigner::host::Host> {
-    Arc::new(cosigner::host::Detached)
+fn host() -> Arc<dyn policy::host::Host> {
+    Arc::new(policy::host::Detached)
 }
 
 /// The runtime's capabilities, and the task it calls back into.
@@ -117,8 +117,8 @@ fn host() -> Arc<dyn cosigner::host::Host> {
 mod runtime {
     use std::sync::Arc;
 
-    use cosigner::host::{Commitment, Host, SigningHandle, WalletKey};
-    use cosigner::sign::WalletHalf;
+    use policy::host::{Commitment, Host, SigningHandle, WalletKey};
+    use policy::sign::WalletHalf;
 
     mod bindings {
         wit_bindgen::generate!({ path: "wit", world: "cosigner", generate_all });
@@ -222,11 +222,11 @@ mod runtime {
             // says why.
             println!("run-task {task_id}: start");
             let run = || {
-                let cfg = cosigner::config::Config::from_environment();
+                let cfg = policy::config::Config::from_environment();
                 let mut wallet = super::open_cosigner(&cfg).map_err(|e| e.to_string())?;
                 // The ASP, when the settings name one — a due delegate is then run here, not handed
                 // back to a phone.
-                let mut asp = cosigner::asp::rest::AspRest::from_env();
+                let mut asp = policy::asp::rest::AspRest::from_env();
                 println!("run-task {task_id}: asp={}", if asp.is_some() { "yes" } else { "no" });
                 wstd::runtime::block_on(wallet.run_task_with(&task_id, &payload, asp.as_mut()))
             };

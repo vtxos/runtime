@@ -13,7 +13,7 @@
 //! # async fn f() -> anyhow::Result<()> {
 //! use enclave_runtime::testing::Enclave;
 //!
-//! let enclave = Enclave::builder(std::fs::read("cosigner.wasm")?)
+//! let enclave = Enclave::builder(std::fs::read("policy.wasm")?)
 //!     .background_tasks()
 //!     .notify()
 //!     .start()

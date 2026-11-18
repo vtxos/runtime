@@ -1,4 +1,4 @@
-//! A small host for `cosigner.wasm`: the runtime's part, played by fakes, so a test can drive the
+//! A small host for `policy.wasm`: the runtime's part, played by fakes, so a test can drive the
 //! very component a release ships, and not a native build of its library.
 //!
 //! It links the component as the runtime does: all of WASI, `wasi:http` both ways, and the four

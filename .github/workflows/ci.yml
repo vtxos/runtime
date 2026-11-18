@@ -71,28 +71,28 @@ jobs:
           comment-on-alert: true
           fail-on-alert: false
 
-  # The cosigner: its component's and crates' tests, clippy, and the component
+  # The policy guest: its component's and crates' tests, clippy, and the component
   # exactly as a release builds it (Nix), run by the fake host.
-  cosigner:
-    name: cosigner
+  policy:
+    name: policy
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
-      # The cosigner's and ark's build scripts generate protobuf code.
+      # The policy guest's and ark's build scripts generate protobuf code.
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: ./.github/actions/rust
         with:
-          shared-key: cosigner
+          shared-key: policy
           workspaces: |
             . -> target
             guests/fake-host -> target
-      - run: scripts/ci-cosigner.sh
+      - run: scripts/ci-policy.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: cosigner.wasm
-          path: result/bin/cosigner.wasm
+          name: policy.wasm
+          path: result/bin/policy.wasm
 
   # There is deliberately no SQLite job. The runtime measures its guest into
   # PCR16 before it will serve, and that reads the NSM — which a hosted runner

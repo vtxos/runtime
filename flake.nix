@@ -24,7 +24,7 @@
 
     crane.url = "github:ipetkov/crane";
 
-    # The cosigner's compiler: the exact release rust-toolchain.toml names,
+    # The policy guest's compiler: the exact release rust-toolchain.toml names,
     # which needs a newer overlay than the runtime's `stable.latest` is pinned
     # to. Its own input, so moving one never moves the other's bytes.
     cosigner-rust-overlay = {
@@ -63,14 +63,14 @@
           under = d: lib.hasPrefix "${root}/${d}/" p || p == "${root}/${d}";
           # Workspace members the runtime does not build: their manifests stay
           # (cargo loads every member), their code does not, so editing the
-          # cosigner or the crates only it and the services use leaves the
+          # policy guest or the crates only it and the services use leaves the
           # runtime's store path, and its image's PCR0, alone. Their target
           # paths are explicit, which is what lets cargo load them without it.
           manifestOnly = d: under d && p != "${root}/${d}" && p != "${root}/${d}/Cargo.toml";
         in
         # The example guests are separate workspaces, and the fake host too.
         !(under "examples" || under "guests/fake-host")
-        && !(manifestOnly "guests/cosigner" || manifestOnly "crates/ark"
+        && !(manifestOnly "guests/policy" || manifestOnly "crates/ark"
           || manifestOnly "crates/enclave-client")
         && ((lib.hasSuffix ".pem" path)
         || (craneLib.filterCargoSources path type));
@@ -156,24 +156,24 @@
         cargoArtifacts = guestDeps;
       });
 
-      # ---- the cosigner ----------------------------------------------------
-      # cosigner.wasm is what PCR16 measures for the cosigner, so anyone must be
+      # ---- the policy guest ------------------------------------------------
+      # policy.wasm is what PCR16 measures for the guest, so anyone must be
       # able to rebuild a release and get the same bytes. It is a member of this
       # workspace, so its path dependencies hash by relative path; the compiler
       # is the exact one rust-toolchain.toml names; the clang that compiles
       # secp256k1-sys's C to wasm is pinned by flake.lock; and the build
       # directory is mapped out of the binary.
-      cosignerPkgs = import nixpkgs {
+      policyPkgs = import nixpkgs {
         inherit system;
         overlays = [ (import cosigner-rust-overlay) ];
       };
-      cosignerCraneLib = (crane.mkLib cosignerPkgs).overrideToolchain
+      policyCraneLib = (crane.mkLib policyPkgs).overrideToolchain
         (p: p.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml);
       # Unwrapped: the wrapper's flags are the host's. secp256k1-sys brings its
       # own wasm headers, so a clang with a wasm backend is all it needs.
-      cosignerClang = pkgs.llvmPackages.clang-unwrapped;
-      cosignerArgs = {
-        pname = "cosigner";
+      policyClang = pkgs.llvmPackages.clang-unwrapped;
+      policyArgs = {
+        pname = "policy";
         version = "0.1.0";
         # The whole workspace's Rust, plus the protos its build scripts compile
         # and the WIT its bindings come from.
@@ -183,10 +183,10 @@
             let p = toString path; root = toString ./.; in
             !(lib.hasPrefix "${root}/examples" p || lib.hasPrefix "${root}/guests/fake-host" p)
             && (lib.hasSuffix ".proto" path || lib.hasSuffix ".wit" path
-              || lib.hasSuffix ".pem" path || cosignerCraneLib.filterCargoSources path type);
-          name = "cosigner-source";
+              || lib.hasSuffix ".pem" path || policyCraneLib.filterCargoSources path type);
+          name = "policy-source";
         };
-        cargoExtraArgs = "--locked -p cosigner --bin cosigner";
+        cargoExtraArgs = "--locked -p policy --bin policy";
         # Sized for the enclave; the runtime's own release profile is untouched.
         CARGO_PROFILE = "wasm-release";
         CARGO_BUILD_TARGET = "wasm32-wasip2";
@@ -194,7 +194,7 @@
         doCheck = false;
         nativeBuildInputs = [ pkgs.protobuf ];
         PROTOC = "${pkgs.protobuf}/bin/protoc";
-        CC_wasm32_wasip2 = "${cosignerClang}/bin/clang";
+        CC_wasm32_wasip2 = "${policyClang}/bin/clang";
         AR_wasm32_wasip2 = "${pkgs.llvmPackages.bintools-unwrapped}/bin/llvm-ar";
         # Where the build ran must not reach the binary: a sandboxed Nix builds
         # in /build, one without a sandbox in a temporary directory.
@@ -203,8 +203,8 @@
           export CFLAGS_wasm32_wasip2="-ffile-prefix-map=$NIX_BUILD_TOP=/build"
         '';
       };
-      cosigner = cosignerCraneLib.buildPackage (cosignerArgs // {
-        cargoArtifacts = cosignerCraneLib.buildDepsOnly cosignerArgs;
+      policy = policyCraneLib.buildPackage (policyArgs // {
+        cargoArtifacts = policyCraneLib.buildDepsOnly policyArgs;
       });
 
       # What an operator uploads to the roots bucket, and the PCR16 a key policy
@@ -555,7 +555,7 @@
       lib.${system} = { inherit eifQemu mkEif; };
 
       packages.${system} = {
-        inherit enclave-runtime guest-http guest-release cosigner nsm-selftest nitro-attest eif-build blobs;
+        inherit enclave-runtime guest-http guest-release policy nsm-selftest nitro-attest eif-build blobs;
 
         # Both ends of the vsock from one package: `make build` emits gvproxy
         # for the parent and gvforwarder for the enclave, so they cannot drift.

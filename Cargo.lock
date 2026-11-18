@@ -1684,30 +1684,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosigner"
-version = "0.1.0"
-dependencies = [
- "ark",
- "bitcoin",
- "bytes",
- "hex",
- "http 1.4.0",
- "http-body 1.0.1",
- "http-body-util",
- "k256",
- "parking_lot",
- "prost 0.13.5",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "tempfile",
- "threshold",
- "tonic-build",
- "wit-bindgen 0.46.0",
- "wstd",
-]
-
-[[package]]
 name = "cpp_demangle"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3922,6 +3898,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670"
 dependencies = [
  "plotters-backend",
+]
+
+[[package]]
+name = "policy"
+version = "0.1.0"
+dependencies = [
+ "ark",
+ "bitcoin",
+ "bytes",
+ "hex",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "k256",
+ "parking_lot",
+ "prost 0.13.5",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "threshold",
+ "tonic-build",
+ "wit-bindgen 0.46.0",
+ "wstd",
 ]
 
 [[package]]

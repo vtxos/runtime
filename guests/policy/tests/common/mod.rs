@@ -10,15 +10,15 @@
 //! with both polynomials random, because the guest sees only the public package, the dealt share and
 //! the rounds, and how the runtime derives its half is the runtime's to test.
 
-use cosigner::Cosigner;
+use policy::Cosigner;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rand::rngs::OsRng;
 
-use cosigner::host::{Commitment, Host, SigningHandle, WalletKey};
-use cosigner::sign::WalletHalf;
-use cosigner::store::Store;
+use policy::host::{Commitment, Host, SigningHandle, WalletKey};
+use policy::sign::WalletHalf;
+use policy::store::Store;
 
 use threshold::commitment::SigningPackage;
 use threshold::dkg;
@@ -173,7 +173,7 @@ impl Round {
 
 /// Open the cosigner this process serves, with no runtime around it: no wallet key, no queue.
 pub fn open_cosigner(store: &Arc<Store>, group_key: &str) -> Mutex<Cosigner> {
-    let detached = std::sync::Arc::new(cosigner::host::Detached);
+    let detached = std::sync::Arc::new(policy::host::Detached);
     let cosigner = Cosigner::open(store.clone(), group_key.to_string(), detached);
     Mutex::new(cosigner.expect("open cosigner"))
 }
@@ -190,8 +190,8 @@ pub fn open_holding(store: &Arc<Store>, wallet: &TestWallet) -> Mutex<Cosigner> 
 pub fn wallet_answers(
     kp_user: &KeyPackage,
     messages: &[Vec<u8>],
-    cosigner_commitments: &[cosigner::types::Commitment],
-) -> Vec<cosigner::sign::WalletHalf> {
+    cosigner_commitments: &[policy::types::Commitment],
+) -> Vec<policy::sign::WalletHalf> {
     use threshold::commitment::SigningPackage;
     use threshold::nonce::{self, SigningCommitments};
     use threshold::point;
@@ -213,7 +213,7 @@ pub fn wallet_answers(
             commitments.insert(kp_user.identifier.clone(), ours.commitments.clone());
             let package = SigningPackage::new(commitments, message.clone());
             let share = signing::sign(&package, &ours, kp_user).expect("wallet share");
-            cosigner::sign::WalletHalf {
+            policy::sign::WalletHalf {
                 hiding: point::serialize_compressed(&ours.commitments.hiding).to_vec(),
                 binding: point::serialize_compressed(&ours.commitments.binding).to_vec(),
                 share: scalar_to_bytes(&share.s).to_vec(),
@@ -243,10 +243,10 @@ pub mod wire {
     use bytes::Bytes;
     use http_body_util::BodyExt;
 
-    use cosigner::grpc::framing::{frame, Deframer};
-    use cosigner::session::Session;
-    use cosigner::wallet_proto::GetServerInfoResponse;
-    use cosigner::Cosigner;
+    use policy::grpc::framing::{frame, Deframer};
+    use policy::session::Session;
+    use policy::wallet_proto::GetServerInfoResponse;
+    use policy::Cosigner;
     use wstd::http::{Body, Request, Response};
 
     /// Drive a future to completion on this thread.

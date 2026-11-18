@@ -3,10 +3,10 @@ name = "fake-host"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "A small host for cosigner.wasm: the runtime's part played by fakes, for tests of the component a release ships."
+description = "A small host for policy.wasm: the runtime's part played by fakes, for tests of the component a release ships."
 
-# Its own workspace, kept out of the cosigner's: wasmtime is a host dependency and must never be
-# in what the wasm build resolves. Its lock was seeded from the cosigner's, whose secp256k1 beta is
+# Its own workspace, kept out of the policy's: wasmtime is a host dependency and must never be
+# in what the wasm build resolves. Its lock was seeded from the policy's, whose secp256k1 beta is
 # yanked and would not resolve afresh.
 [workspace]
 
@@ -30,7 +30,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 
 [dev-dependencies]
 # The wallet's side of the conversation: the wire types, and the threshold maths it signs with.
-cosigner = { path = "../cosigner" }
+policy = { path = "../policy" }
 ark = { path = "../../crates/ark", features = ["signing"] }
 threshold = { path = "../../crates/threshold", features = ["std"] }
 bitcoin = "0.32"
