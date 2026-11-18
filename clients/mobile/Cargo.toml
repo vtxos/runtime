@@ -1,0 +1,13 @@
+# The vtxos client for phones: a workspace of its own, out of the root one, so
+# its networking (hyper, tonic, rustls with ring) and uniffi stay out of the
+# root lock, which also resolves the policy guest, and so its rustls provider
+# never meets the runtime's in one build.
+[workspace]
+resolver = "2"
+members = ["vtxos-client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"

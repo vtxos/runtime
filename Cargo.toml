@@ -16,8 +16,10 @@ members = [
 # relative path and one outside it by its absolute path, and that hash names
 # every symbol: two checkouts in two directories would build two policy.wasm.
 # The fake host is its own workspace (guests/fake-host): wasmtime must never be
-# in what the wasm build resolves.
-exclude = ["guests/fake-host"]
+# in what the wasm build resolves. So is the mobile client (clients/mobile): its
+# networking and uniffi stay out of this lock, and its rustls provider out of
+# the runtime's builds.
+exclude = ["guests/fake-host", "clients/mobile"]
 
 [workspace.package]
 version = "0.1.0"

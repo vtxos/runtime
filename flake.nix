@@ -68,8 +68,9 @@
           # paths are explicit, which is what lets cargo load them without it.
           manifestOnly = d: under d && p != "${root}/${d}" && p != "${root}/${d}/Cargo.toml";
         in
-        # The example guests are separate workspaces, and the fake host too.
-        !(under "examples" || under "guests/fake-host")
+        # The example guests are separate workspaces, and so are the fake host and
+        # the mobile client.
+        !(under "examples" || under "guests/fake-host" || under "clients")
         && !(manifestOnly "guests/policy" || manifestOnly "crates/ark"
           || manifestOnly "crates/enclave-client")
         && ((lib.hasSuffix ".pem" path)
@@ -181,7 +182,8 @@
           src = ./.;
           filter = path: type:
             let p = toString path; root = toString ./.; in
-            !(lib.hasPrefix "${root}/examples" p || lib.hasPrefix "${root}/guests/fake-host" p)
+            !(lib.hasPrefix "${root}/examples" p || lib.hasPrefix "${root}/guests/fake-host" p
+              || lib.hasPrefix "${root}/clients" p)
             && (lib.hasSuffix ".proto" path || lib.hasSuffix ".wit" path
               || lib.hasSuffix ".pem" path || policyCraneLib.filterCargoSources path type);
           name = "policy-source";
