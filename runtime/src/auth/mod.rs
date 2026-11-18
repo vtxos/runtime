@@ -18,7 +18,7 @@
 //! these bytes: the body is not part of it, because an interaction may be a stream whose body
 //! does not exist yet. A client compromised between signing and sending can change the payload.
 
-pub mod approval;
+pub use enclave_auth::approval;
 pub mod challenge;
 /// A client in software, for tests, the in-process harness and `wallet-client`.
 ///

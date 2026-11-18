@@ -118,6 +118,8 @@ hex            = "0.4"
 # `ecdh`: the tenant key, by threshold ECDH between the client's share and the
 # runtime's (src/signer, src/auth).
 threshold      = { path = "../crates/threshold", features = ["std", "ecdh"] }
+# The sign-in protocol, shared with every client: the approval, /auth/*'s messages, the tenant id.
+enclave-auth   = { path = "../crates/enclave-auth" }
 k256           = { version = "0.13", default-features = false, features = ["arithmetic"] }
 hkdf           = "0.12"
 sha2           = "0.10"

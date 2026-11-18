@@ -55,9 +55,7 @@ const INFO_TASK_SEAL: &[u8] = b"aegira/pool/task-seal/v1";
 /// Every tenant's record and pool is named by this, so changing it strands them all;
 /// `tenant_of_is_pinned` is what notices.
 pub fn tenant_of(group_key: &[u8; 33]) -> [u8; 16] {
-    let digest =
-        nitro_attestation::sha256(&[b"aegira/tenant/v1".as_slice(), group_key.as_slice()].concat());
-    digest[..16].try_into().expect("16 bytes")
+    enclave_auth::tenant::tenant_of(group_key)
 }
 
 /// One tenant's key, `k`: the root of its pool, and of nothing else. Scrubbed on drop, never

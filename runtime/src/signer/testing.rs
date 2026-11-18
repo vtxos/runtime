@@ -46,24 +46,7 @@ impl Wallet {
         runtime: &Round1Package,
         dealt: &Round2Package,
     ) -> Result<(Round2Package, KeyPackage, PublicKeyPackage), String> {
-        if runtime.commitment.coeffs.len() != 2 {
-            return Err("the runtime's round one is not of a 2-of-2".into());
-        }
-        let id = Identifier::derive(&runtime.commitment.to_verifying_key().serialize())
-            .map_err(|e| e.to_string())?;
-        let theirs = BTreeMap::from([(id.clone(), runtime.clone())]);
-        let (round2, mut out) =
-            dkg::dkg_part2(&self.round1, &theirs, &[]).map_err(|e| e.to_string())?;
-        let to_runtime = out.remove(&id).ok_or("no share for the runtime")?;
-        let (key, public) = dkg::dkg_part3(
-            &self.round1,
-            &round2,
-            &theirs,
-            &BTreeMap::from([(id, dealt.clone())]),
-            &[],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok((to_runtime, key, public))
+        enclave_auth::client::finish_dkg(&self.round1, runtime, dealt)
     }
 }
 

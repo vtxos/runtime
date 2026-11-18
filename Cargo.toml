@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ark",
+    "crates/enclave-auth",
     "crates/enclave-client",
     "crates/nitro-attestation",
     "crates/nitro-nsm",

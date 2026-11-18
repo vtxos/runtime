@@ -2231,6 +2231,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "enclave-auth"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "hex",
+ "k256",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "threshold",
+ "zeroize",
+]
+
+[[package]]
 name = "enclave-client"
 version = "0.1.0"
 dependencies = [
@@ -2275,6 +2290,7 @@ dependencies = [
  "cms",
  "criterion",
  "der",
+ "enclave-auth",
  "enclave-runtime",
  "futures",
  "getrandom 0.3.4",

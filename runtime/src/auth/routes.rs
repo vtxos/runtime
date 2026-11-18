@@ -47,10 +47,15 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use threshold::dkg::{Round1Package, Round2Package};
-use threshold::ecdh::{Partial, PartialBytes};
 use threshold::point;
+
+use enclave_auth::wire::{
+    RegisterOptionsRequest, RegisterOptionsResponse, RegisterVerifyRequest, RegisterVerifyResponse,
+    RequestOptionsRequest, RequestOptionsResponse, RequestVerifyRequest, RuntimeDeal,
+    TokenResponse, WirePartial,
+};
 
 use super::approval;
 use super::challenge::ChallengeStore;
@@ -86,133 +91,6 @@ type Body = wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 pub struct AuthResponse {
     pub response: hyper::Response<Body>,
     pub attest: bool,
-}
-
-/// The wallet's round one: its commitment and proof of knowledge, nothing secret.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RegisterOptionsRequest {
-    dkg: WalletCommitment,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WalletCommitment {
-    /// threshold's JSON.
-    round1_package: String,
-}
-
-#[derive(Serialize)]
-struct RegisterOptionsResponse {
-    registration_id: String,
-    dkg: RuntimeDeal,
-}
-
-/// The runtime's round one, and the share it deals the wallet, as threshold's JSON.
-#[derive(Serialize)]
-struct RuntimeDeal {
-    round1_package: String,
-    /// `f_c(id_w)`.
-    round2_package: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RegisterVerifyRequest {
-    registration_id: String,
-    dkg: WalletDeal,
-    /// Hex, 64 bytes: BIP-340 by the wallet's finished share over
-    /// [`approval::register`].
-    signature: String,
-    ecdh: WirePartial,
-}
-
-/// The share the wallet deals the runtime, `f_w(id_c)`, as threshold's JSON.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WalletDeal {
-    round2_package: String,
-}
-
-#[derive(Serialize)]
-struct RegisterVerifyResponse {
-    tenant_id: String,
-    /// `X`, compressed, hex.
-    group_key: String,
-    /// The runtime's ECDH partial: with it the wallet derives the same `k`.
-    ecdh: WirePartial,
-}
-
-/// What a sign-in will approve: one interaction, for the tenant whose group key this is.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RequestOptionsRequest {
-    /// `X`, compressed and even-Y, hex: names the tenant.
-    group_key: String,
-    method: String,
-    path: String,
-    #[serde(default)]
-    query: Option<String>,
-}
-
-#[derive(Serialize)]
-struct RequestOptionsResponse {
-    /// Base64url, 16 bytes: single use, good for a minute.
-    challenge_id: String,
-}
-
-/// One sign-in, answering one challenge.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RequestVerifyRequest {
-    challenge_id: String,
-    /// Hex, 64 bytes: BIP-340 by the wallet's share over [`approval::request`].
-    signature: String,
-    /// The wallet's ECDH partial, over the same message.
-    ecdh: WirePartial,
-}
-
-/// The token, and how long it has to be spent.
-#[derive(Serialize)]
-struct TokenResponse {
-    token: String,
-    /// Seconds. This bounds the time to *start* an interaction, and is not how
-    /// long one may run once started.
-    expires_in_secs: u64,
-    /// The runtime's ECDH partial: with it the wallet derives the same `k`.
-    ecdh: WirePartial,
-}
-
-/// An ECDH partial on the wire ([`threshold::ecdh`]): compressed points and a scalar, hex.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WirePartial {
-    share: String,
-    a: String,
-    b: String,
-    s: String,
-}
-
-impl WirePartial {
-    fn encode(partial: &Partial) -> Self {
-        let bytes = partial.to_bytes();
-        WirePartial {
-            share: hex::encode(bytes.share),
-            a: hex::encode(bytes.a),
-            b: hex::encode(bytes.b),
-            s: hex::encode(bytes.s),
-        }
-    }
-
-    fn decode(&self) -> Option<Partial> {
-        Partial::from_bytes(&PartialBytes {
-            share: hex_array(&self.share)?,
-            a: hex_array(&self.a)?,
-            b: hex_array(&self.b)?,
-            s: hex_array(&self.s)?,
-        })
-        .ok()
-    }
 }
 
 struct PendingRegistration {
