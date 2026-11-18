@@ -142,3 +142,38 @@ jobs:
           path: |
             target/qemu-nitro/e2e/*.log
           if-no-files-found: ignore
+
+  # The React Native package (clients/react-native) over the vtxos client
+  # (clients/mobile), one job per platform: iOS builds only on macOS.
+  mobile-android:
+    name: React Native, Android
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # vtxos-client's build script generates protobuf code.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: ./.github/actions/rust
+        with:
+          shared-key: mobile-android
+          workspaces: clients/mobile -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: clients/react-native/.nvmrc
+      - run: scripts/ci-mobile-android.sh
+
+  mobile-ios:
+    name: React Native, iOS
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install protobuf
+      - uses: ./.github/actions/rust
+        with:
+          shared-key: mobile-ios
+          workspaces: clients/mobile -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: clients/react-native/.nvmrc
+      - run: scripts/ci-mobile-ios.sh
