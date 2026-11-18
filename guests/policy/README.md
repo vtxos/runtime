@@ -6,7 +6,7 @@ The vtxos policy guest: a `wasm32-wasip2` component that this repository's runti
 |---|---|
 | [`guests/policy`](./) | The component. [`src/session.rs`](src/session.rs) routes each gRPC stream to its ceremony, and the seal ([`src/store.rs`](src/store.rs)) is the only durable state. [`wit/`](wit/) is its world and the runtime WIT it vendors |
 | [`runtime/src/signer`](../../runtime/src/signer/), [`crates/threshold`](../../crates/threshold/) | The wallet key the runtime makes and signs with for this component, and the FROST/DKG cryptography under it |
-| [`crates/ark`](../../crates/ark/) | The Ark protocol, and arkd's protos |
+| [`crates/ark`](../../crates/ark/) | The Ark sessions this component drives, built on Arkade's `ark-core` (which builds every transaction and computes every sighash), and arkd's protos |
 | [`crates/enclave-client`](../../crates/enclave-client/) | Attestation verification, for clients |
 | [`protocol/protos`](../../protocol/protos/) | The guest's wire (still `cosigner.v1` / `Cosigner`), which is the source of truth for every client |
 | [`guests/fake-host`](../fake-host/) | A small host that runs the shipped component through a wallet's life |

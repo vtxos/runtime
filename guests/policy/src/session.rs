@@ -318,8 +318,8 @@ async fn send(
 
     let info = open
         .ark_info
-        .map(ark::client::types::ArkInfo::from)
-        .ok_or_else(|| Status::invalid_argument("SendOpen carried no ark_info"))?;
+        .ok_or_else(|| Status::invalid_argument("SendOpen carried no ark_info"))
+        .and_then(|i| crate::util::server_info(i).map_err(Status::invalid_argument))?;
 
     // The caller names its inputs, and the cosigner validates every one against the scriptPubKey it
     // derives from its own owner key before selecting — so naming a VTXO here cannot widen what the
@@ -482,15 +482,15 @@ async fn renew(
     let mut dealt = Some(lock(&cosigner).dealt_share_for(&open.identifier)?);
     println!("Renew: returning the dealt share to the wallet's own identifier");
 
-    let info = open
+    let wire_info = open
         .ark_info
-        .map(ark::client::types::ArkInfo::from)
         .ok_or_else(|| Status::invalid_argument("RenewOpen carried no ark_info"))?;
+    let info = crate::util::server_info(wire_info.clone()).map_err(Status::invalid_argument)?;
     if open.delegate_only {
         // Nothing to refresh now; renew the delegate over the set and close.
         let request = proto::RenewDelegate {
             vtxos: open.vtxos,
-            ark_info: Some(wp::ArkInfo::from(&info)),
+            ark_info: Some(wire_info),
             device_token: open.device_token,
             exit_script_pubkey: open.exit_script_pubkey,
         };
@@ -522,8 +522,8 @@ async fn board(
 
     let info = open
         .ark_info
-        .map(ark::client::types::ArkInfo::from)
-        .ok_or_else(|| Status::invalid_argument("BoardOpen carried no ark_info"))?;
+        .ok_or_else(|| Status::invalid_argument("BoardOpen carried no ark_info"))
+        .and_then(|i| crate::util::server_info(i).map_err(Status::invalid_argument))?;
     let utxo = open
         .utxo
         .map(|u| (u.txid, u.vout, u.amount_sats))

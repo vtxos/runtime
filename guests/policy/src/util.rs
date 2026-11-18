@@ -79,38 +79,24 @@ impl From<proto::VtxoInput> for crate::types::VtxoInput {
     }
 }
 
-impl From<&ark::client::types::ArkInfo> for wp::ArkInfo {
-    fn from(i: &ark::client::types::ArkInfo) -> Self {
-        Self {
-            signer_pubkey: i.signer_pubkey.clone(),
-            forfeit_pubkey: i.forfeit_pubkey.clone(),
-            forfeit_address: i.forfeit_address.clone(),
-            checkpoint_tapscript: i.checkpoint_tapscript.clone(),
-            network: i.network.clone(),
-            session_duration: i.session_duration,
-            unilateral_exit_delay: i.unilateral_exit_delay,
-            boarding_exit_delay: i.boarding_exit_delay,
-            vtxo_min_amount: i.vtxo_min_amount,
-            dust: i.dust,
-        }
-    }
-}
-
-impl From<wp::ArkInfo> for ark::client::types::ArkInfo {
-    fn from(i: wp::ArkInfo) -> Self {
-        Self {
-            signer_pubkey: i.signer_pubkey,
-            forfeit_pubkey: i.forfeit_pubkey,
-            forfeit_address: i.forfeit_address,
-            checkpoint_tapscript: i.checkpoint_tapscript,
-            network: i.network,
-            session_duration: i.session_duration,
-            unilateral_exit_delay: i.unilateral_exit_delay,
-            boarding_exit_delay: i.boarding_exit_delay,
-            vtxo_min_amount: i.vtxo_min_amount,
-            dust: i.dust,
-        }
-    }
+/// The ASP's parameters as the wallet relays them, in ark-core's type.
+///
+/// The wire carries the part of arkd's `GetInfo` answer the wallet passes on, field for field, so
+/// it goes through the same conversion as an answer read from arkd itself.
+pub(crate) fn server_info(i: wp::ArkInfo) -> Result<ark::client::Info, String> {
+    ark::client::server_info(ark::client::proto::GetInfoResponse {
+        signer_pubkey: i.signer_pubkey,
+        forfeit_pubkey: i.forfeit_pubkey,
+        forfeit_address: i.forfeit_address,
+        checkpoint_tapscript: i.checkpoint_tapscript,
+        network: i.network,
+        session_duration: i.session_duration,
+        unilateral_exit_delay: i.unilateral_exit_delay,
+        boarding_exit_delay: i.boarding_exit_delay,
+        vtxo_min_amount: i.vtxo_min_amount,
+        dust: i.dust,
+        ..Default::default()
+    })
 }
 
 impl From<crate::renew::AspCall> for proto::AspSubmit {

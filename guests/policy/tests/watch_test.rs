@@ -9,7 +9,7 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use ark::client::types::ArkInfo;
+use ark::client::Info;
 use policy::cosigner::{Outcome, Task, CATEGORY_SETTLE_DUE, WATCH_TASK_ID};
 use common::Recorder;
 use policy::renew::DelegateRenew;
@@ -122,7 +122,7 @@ fn renew_expiring_at(c: &Arc<Mutex<policy::Cosigner>>, kp_user: &KeyPackage, exp
             exit_delay: 512,
             expires_at,
         }],
-        ark_info: Some((&ark_info()).into()),
+        ark_info: Some(wire_info()),
         ..Default::default()
     };
     let (renew, to_sign) = DelegateRenew::build(c, request).expect("build");
@@ -149,20 +149,34 @@ fn the_wake_category_is_an_opaque_label() {
 }
 
 /// Regtest-shaped ASP parameters. Only the keys and delays matter here.
-fn ark_info() -> ArkInfo {
-    ArkInfo {
+fn ark_info() -> Info {
+    let w = wire_info();
+    ark::client::server_info(ark::client::proto::GetInfoResponse {
+        signer_pubkey: w.signer_pubkey,
+        forfeit_pubkey: w.forfeit_pubkey,
+        forfeit_address: w.forfeit_address,
+        network: w.network,
+        unilateral_exit_delay: w.unilateral_exit_delay,
+        boarding_exit_delay: w.boarding_exit_delay,
+        dust: w.dust,
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+/// The same parameters as the wallet relays them.
+fn wire_info() -> policy::wallet_proto::ArkInfo {
+    policy::wallet_proto::ArkInfo {
         // Real keys and a real regtest address: `generate_delegate` parses all three, and with
         // placeholders every test that needs a delegate quietly skipped.
         signer_pubkey: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
         forfeit_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
         forfeit_address: "bcrt1qq5rjlmqartxjyh6vnmjrhrqnc58q2hqr5asln0".into(),
-        checkpoint_tapscript: String::new(),
         network: "regtest".into(),
-        session_duration: 0,
         unilateral_exit_delay: 512,
         boarding_exit_delay: 144,
-        vtxo_min_amount: 0,
         dust: 330,
+        ..Default::default()
     }
 }
 
@@ -267,7 +281,7 @@ impl policy::asp::EventSource for EndedStream {
 
 impl policy::asp::AspApi for ScriptedAsp {
     type Events = EndedStream;
-    async fn get_info(&mut self) -> Result<ArkInfo, String> {
+    async fn get_info(&mut self) -> Result<Info, String> {
         Ok(ark_info())
     }
     async fn register_intent(&mut self, _: &str, _: &str) -> Result<String, String> {
@@ -424,7 +438,7 @@ fn renewing_without_a_known_expiry_is_refused() {
             exit_delay: 512,
             expires_at: 0,
         }],
-        ark_info: Some((&ark_info()).into()),
+        ark_info: Some(wire_info()),
         ..Default::default()
     };
     let err = DelegateRenew::build(&c, request)

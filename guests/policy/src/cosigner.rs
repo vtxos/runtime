@@ -11,7 +11,7 @@ use crate::types::{BoardingSettleSubmitted, SendVtxoStep1, SnapshotState, VtxoEn
 
 use ark::client::batch::{DelegateSettleSession, PersistedDelegate};
 use ark::client::send::{SendSession, SendVtxoInput};
-use ark::client::types::ArkInfo;
+use ark::client::{exit_delay_value, Info};
 
 use crate::asp::{AspApi, EventSource};
 use crate::boarding::BoardingSettleSession;
@@ -186,10 +186,10 @@ impl Cosigner {
     /// Trusted: existence. Whether `(txid, vout)` is really unspent is the ASP's to know, and a
     /// caller inventing one gets a transaction the ASP rejects — it wastes a round and nothing
     /// else. Existence is not a secret, so taking it on trust costs nothing.
-    pub fn accept_vtxos(&mut self, supplied: Vec<VtxoInput>, info: &ArkInfo) -> Result<(), String> {
+    pub fn accept_vtxos(&mut self, supplied: Vec<VtxoInput>, info: &Info) -> Result<(), String> {
         let (unilateral, boarding) = (
-            info.unilateral_exit_delay as u32,
-            info.boarding_exit_delay as u32,
+            exit_delay_value(info.unilateral_exit_delay)?,
+            exit_delay_value(info.boarding_exit_delay)?,
         );
         let now = crate::store::now_secs();
         let mut accepted: Vec<VtxoEntry> = Vec::with_capacity(supplied.len());
@@ -259,7 +259,7 @@ impl Cosigner {
     /// for in person — the ASP refuses an intent valid in the future until then).
     pub fn generate_delegate(
         &mut self,
-        info: &ArkInfo,
+        info: &Info,
         deferred: bool,
     ) -> Result<Vec<Vec<u8>>, String> {
         let valid_at = if deferred { self.settle_deadline() } else { None };
@@ -343,7 +343,7 @@ impl Cosigner {
 
                 let mut events = asp.events(&topics).await?;
                 let held: u64 = self.vtxos.iter().map(|v| v.amount).sum();
-                let exit_delay = info.unilateral_exit_delay as u32;
+                let exit_delay = exit_delay_value(info.unilateral_exit_delay)?;
                 self.renew_session =
                     self.renew_session.take().map(|d| d.in_flight(exit_delay));
 
@@ -571,7 +571,7 @@ impl Cosigner {
     pub fn create_send_session(
         &mut self,
         req: SendVtxoStep1,
-        info: &ArkInfo,
+        info: &Info,
     ) -> Result<(SendSession, u32, Vec<Vec<u8>>), String> {
         // `req.vtxos` is the caller's account of the set; `accept_vtxos` decides what of it this
         // wallet could actually own before any of it is selected from.
@@ -630,7 +630,7 @@ pub(crate) fn build_send(
     owner_pk_hex: &str,
     vtxos: &[VtxoInput],
     req: &SendVtxoStep1,
-    info: &ArkInfo,
+    info: &Info,
 ) -> Result<(SendSession, u32, Vec<Vec<u8>>), String> {
     if vtxos.is_empty() {
         return Err("no VTXOs to send".into());
@@ -655,14 +655,13 @@ pub(crate) fn build_send(
         ));
     }
 
-    let network = ark::client::parse_network(&info.network)?;
-    let change_exit_delay = info.unilateral_exit_delay as u32;
+    let change_exit_delay = exit_delay_value(info.unilateral_exit_delay)?;
     let change_addr = if total > req.amount {
         Some(ark::client::ark_address(
             owner_pk_hex,
-            &info.signer_pubkey,
+            &info.signer_pk.to_string(),
             change_exit_delay,
-            network,
+            info.network,
         )?)
     } else {
         None

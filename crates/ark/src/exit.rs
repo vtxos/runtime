@@ -24,13 +24,21 @@
 //!
 //! Both sides of the 2-of-2 build this: the cosigner to know what it signs, the wallet to check
 //! what it is asked to sign. Same code, same bytes, or the sighashes disagree and the seal fails.
+//!
+//! **The one transaction here that ark-core does not build.** Its `create_unilateral_exit_transaction`
+//! signs as it builds, at version 2 with change and no anchor, so it cannot make a zero-fee spend
+//! to be signed now and broadcast months later. So the transaction and its sighash are built here;
+//! everything around them is ark-core's: the VTXO and its exit leaf, the anchor, and the witness.
 
+use ark_core::unilateral_exit::finalize_taproot_script_spend_witness;
 use ark_core::{anchor_output, Vtxo};
 use bitcoin::hashes::Hash;
 use bitcoin::key::Secp256k1;
+use bitcoin::psbt;
 use bitcoin::script::ScriptBuf;
+use bitcoin::secp256k1::schnorr;
 use bitcoin::sighash::{Prevouts, SighashCache};
-use bitcoin::taproot::{ControlBlock, LeafVersion};
+use bitcoin::taproot::{self, ControlBlock, LeafVersion};
 use bitcoin::{
     absolute::LockTime, transaction::Version, Amount, Network, OutPoint, Sequence, TapLeafHash,
     TapSighashType, Transaction, TxIn, TxOut, Txid, Witness, XOnlyPublicKey,
@@ -64,6 +72,8 @@ pub struct ExitSpend {
     pub control_block: ControlBlock,
     /// The input's nSequence: the exit delay, BIP-68 encoded.
     pub sequence: u32,
+    /// The key the exit leaf checks: the wallet key.
+    pub owner: XOnlyPublicKey,
 }
 
 /// The VTXO this owner holds under this ASP, from which every script and key below is derived.
@@ -83,9 +93,7 @@ pub fn vtxo(
 /// The exit leaf, its control block, the scriptPubKey it sits under, and the nSequence a spend of
 /// it must carry.
 ///
-/// Not the hand-rolled tree in this crate's root — that one writes the leaf in a different opcode
-/// order, with the delay unencoded, and ends on `OP_DROP` so it cannot be satisfied at all. Real
-/// VTXOs live under `ark_core`'s tree, and so does this.
+/// Real VTXOs live under `ark_core`'s tree, and so does this.
 pub fn exit_spend_info(
     asp_pk: XOnlyPublicKey,
     owner_pk: XOnlyPublicKey,
@@ -163,21 +171,27 @@ pub fn build_exit_tx(
         .map_err(|e| format!("exit sighash: {e}"))?
         .to_byte_array();
 
-    Ok(ExitSpend { tx, sighash, script, control_block, sequence })
+    Ok(ExitSpend { tx, sighash, script, control_block, sequence, owner: owner_pk })
 }
 
-/// The signed transaction, ready to broadcast: witness `[signature, exit leaf, control block]`.
+/// The signed transaction, ready to broadcast: witness `[signature, exit leaf, control block]`,
+/// assembled by ark-core from the leaf and the owner's signature, as it finalizes any script spend.
 pub fn finalize_exit_tx(spend: &ExitSpend, signature: &[u8]) -> Result<Vec<u8>, String> {
-    if signature.len() != 64 {
-        return Err(format!(
-            "an exit signature is 64 bytes of BIP-340, got {}",
-            signature.len()
-        ));
-    }
-    let mut witness = Witness::new();
-    witness.push(signature);
-    witness.push(spend.script.as_bytes());
-    witness.push(spend.control_block.serialize());
+    let signature = schnorr::Signature::from_slice(signature).map_err(|_| {
+        format!("an exit signature is 64 bytes of BIP-340, got {}", signature.len())
+    })?;
+    let leaf_hash = TapLeafHash::from_script(&spend.script, LeafVersion::TapScript);
+    let mut input = psbt::Input::default();
+    input.tap_scripts.insert(
+        spend.control_block.clone(),
+        (spend.script.clone(), LeafVersion::TapScript),
+    );
+    input.tap_script_sigs.insert(
+        (spend.owner, leaf_hash),
+        taproot::Signature { signature, sighash_type: TapSighashType::Default },
+    );
+    let witness = finalize_taproot_script_spend_witness(&input)
+        .map_err(|e| format!("finalize the exit's witness: {e}"))?;
 
     let mut tx = spend.tx.clone();
     tx.input[0].witness = witness;

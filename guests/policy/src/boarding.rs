@@ -7,7 +7,7 @@
 
 use ark::client::batch::{BoardingTreeSigner, SettleAction, SettleSession};
 use ark::client::proto::get_event_stream_response::Event;
-use ark::client::types::ArkInfo;
+use ark::client::{exit_delay_value, Info};
 
 use crate::renew::{AspCall, RenewStep};
 use crate::types::BoardingSettleSubmitted;
@@ -42,25 +42,25 @@ impl BoardingSettleSession {
     /// from the caller.
     pub(crate) fn begin(
         owner_pk_hex: &str,
-        info: &ArkInfo,
+        info: &Info,
         (txid, vout, amount_sats): (String, u32, u64),
     ) -> Result<(Self, Vec<Vec<u8>>), String> {
-        let network = ark::client::parse_network(&info.network)?;
-        let exit_delay = info.boarding_exit_delay as u32;
+        let asp = info.signer_pk.to_string();
+        let exit_delay = exit_delay_value(info.boarding_exit_delay)?;
         let boarding_address =
-            ark::client::boarding_address(owner_pk_hex, &info.signer_pubkey, exit_delay, network)
+            ark::client::boarding_address(owner_pk_hex, &asp, exit_delay, info.network)
                 .map_err(|e| format!("boarding_address: {e}"))?;
         let signer = BoardingTreeSigner::generate();
         let (session, sighashes) = SettleSession::new_boarding(
             owner_pk_hex,
-            &info.signer_pubkey,
-            &info.forfeit_pubkey,
+            &asp,
+            &info.forfeit_pk.to_string(),
             &boarding_address,
             &txid,
             vout,
             amount_sats,
             exit_delay,
-            &info.network,
+            &info.network.to_string(),
             &signer.cosigner_pubkey_hex(),
         )
         .map_err(|e| format!("new_boarding: {e}"))?;

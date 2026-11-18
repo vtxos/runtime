@@ -8,23 +8,22 @@
 
 mod common;
 
-use ark::client::types::ArkInfo;
+use ark::client::Info;
 use policy::types::{BoardingSettleSubmitted, VtxoInput};
 
 /// The two delays a wallet's VTXOs can carry: received/refreshed, and boarded.
-fn info() -> ArkInfo {
-    ArkInfo {
-        signer_pubkey: String::new(),
-        forfeit_pubkey: String::new(),
-        forfeit_address: String::new(),
-        checkpoint_tapscript: String::new(),
+fn info() -> Info {
+    ark::client::server_info(ark::client::proto::GetInfoResponse {
+        signer_pubkey: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
+        forfeit_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
+        forfeit_address: "bcrt1qq5rjlmqartxjyh6vnmjrhrqnc58q2hqr5asln0".into(),
         network: "regtest".into(),
-        session_duration: 0,
         unilateral_exit_delay: 512,
         boarding_exit_delay: 144,
-        vtxo_min_amount: 0,
-        dust: 0,
-    }
+        dust: 330,
+        ..Default::default()
+    })
+    .unwrap()
 }
 
 fn vtxo(txid: &str, amount: u64, exit_delay: u32) -> VtxoInput {

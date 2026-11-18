@@ -11,7 +11,7 @@ use ark::client::proto::{
     BatchFinalizedEvent, BatchStartedEvent, Heartbeat, StreamStartedEvent, TreeNoncesAggregatedEvent,
     TreeNoncesEvent, TreeSignatureEvent, TreeSigningStartedEvent, TreeTxEvent,
 };
-use ark::client::types::ArkInfo;
+use ark::client::Info;
 use serde_json::Value;
 
 /// One event payload off the stream. `Ok(None)` for a message that carries no event.
@@ -118,8 +118,8 @@ pub fn event(payload: &str) -> Result<Option<Event>, String> {
     }))
 }
 
-/// `GET /v1/info`, as the session code's `ArkInfo`.
-pub fn ark_info(body: &str) -> Result<ArkInfo, String> {
+/// `GET /v1/info`, through the same conversion as the info the wallet relays.
+pub fn ark_info(body: &str) -> Result<Info, String> {
     let v: Value = serde_json::from_str(body).map_err(|e| format!("ASP info is not JSON: {e}"))?;
     let text = |k: &str| {
         v.get(k)
@@ -127,7 +127,8 @@ pub fn ark_info(body: &str) -> Result<ArkInfo, String> {
             .map(str::to_string)
             .ok_or_else(|| format!("ASP info has no {k}"))
     };
-    Ok(ArkInfo {
+    ark::client::server_info(ark::client::proto::GetInfoResponse {
+        version: text("version").unwrap_or_default(),
         signer_pubkey: text("signerPubkey")?,
         forfeit_pubkey: text("forfeitPubkey")?,
         forfeit_address: text("forfeitAddress")?,
@@ -136,8 +137,14 @@ pub fn ark_info(body: &str) -> Result<ArkInfo, String> {
         session_duration: int(&v, "sessionDuration")?,
         unilateral_exit_delay: int(&v, "unilateralExitDelay")?,
         boarding_exit_delay: int(&v, "boardingExitDelay")?,
+        utxo_min_amount: int(&v, "utxoMinAmount")?,
+        utxo_max_amount: int(&v, "utxoMaxAmount")?,
         vtxo_min_amount: int(&v, "vtxoMinAmount")?,
+        vtxo_max_amount: int(&v, "vtxoMaxAmount")?,
         dust: int(&v, "dust")?,
+        digest: text("digest").unwrap_or_default(),
+        max_tx_weight: int(&v, "maxTxWeight")?,
+        ..Default::default()
     })
 }
 
@@ -179,10 +186,10 @@ mod tests {
     /// The arkd in docker-compose.ark.yml answered `/v1/info` with exactly these fields.
     #[test]
     fn info_reads_from_the_gateway_json() {
-        let info = ark_info(r#"{"version":"v0.9.2","signerPubkey":"02e3","forfeitPubkey":"03dd","forfeitAddress":"bcrt1q","checkpointTapscript":"5ab2","network":"regtest","sessionDuration":"10","unilateralExitDelay":"86016","boardingExitDelay":"172032","vtxoMinAmount":"1","dust":"330"}"#)
+        let info = ark_info(r#"{"version":"v0.9.2","signerPubkey":"02e35799157be4b37565bb5afe4d04e6a0fa0a4b6a4f4e48b0d904685d253cdbdb","forfeitPubkey":"03dd8bd6d61d7a4c25eeda780b749923aa62ec5dabe1deb76f11cd5ae1067b698f","forfeitAddress":"bcrt1qq5rjlmqartxjyh6vnmjrhrqnc58q2hqr5asln0","checkpointTapscript":"5ab27520dd8bd6d61d7a4c25eeda780b749923aa62ec5dabe1deb76f11cd5ae1067b698fac","network":"regtest","sessionDuration":"10","unilateralExitDelay":"86016","boardingExitDelay":"172032","utxoMinAmount":"330","utxoMaxAmount":"-1","vtxoMinAmount":"1","vtxoMaxAmount":"-1","dust":"330","digest":"a48046fcabd0a17c8a214ed18e244b524819b135573b6e84725234b9f01e72ac","maxTxWeight":"40000","maxOpReturnOutputs":"3"}"#)
             .unwrap();
-        assert_eq!(info.network, "regtest");
-        assert_eq!(info.unilateral_exit_delay, 86016);
-        assert_eq!(info.dust, 330);
+        assert_eq!(info.network, bitcoin::Network::Regtest);
+        assert_eq!(ark::client::exit_delay_value(info.unilateral_exit_delay).unwrap(), 86016);
+        assert_eq!(info.dust.to_sat(), 330);
     }
 }

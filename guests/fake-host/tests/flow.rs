@@ -274,7 +274,7 @@ async fn renew_delegate(host: &Host, wallet: &Wallet, expires_at: i64) -> proto:
         session_id: "renew".into(),
         seq: 1,
         body: Some(proto::renew_client_msg::Body::Open(proto::RenewOpen {
-            ark_info: Some(wp::ArkInfo::from(&ark_info())),
+            ark_info: Some(ark_info()),
             vtxos: vec![proto::VtxoInput {
                 txid: vtxo_txid(),
                 vout: 0,
@@ -401,8 +401,8 @@ fn commitment_txid() -> String {
 }
 
 /// Regtest-shaped ASP parameters: real keys and a real address, which the delegate parses.
-fn ark_info() -> ark::client::types::ArkInfo {
-    ark::client::types::ArkInfo {
+fn ark_info() -> wp::ArkInfo {
+    wp::ArkInfo {
         signer_pubkey: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
         forfeit_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
         forfeit_address: "bcrt1qq5rjlmqartxjyh6vnmjrhrqnc58q2hqr5asln0".into(),

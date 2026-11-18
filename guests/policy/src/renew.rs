@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use ark::client::batch::{DelegateOutput, DelegateSettleSession, DelegateVtxoInput};
 use ark::client::proto::get_event_stream_response::Event;
-use ark::client::types::ArkInfo;
+use ark::client::{exit_delay_value, Info};
 use ark::exit::{self, ExitInput, ExitSpend};
 
 use crate::boarding::BoardingSettleSession;
@@ -81,13 +81,13 @@ impl Cosigner {
     pub fn renew_begin(
         &mut self,
         vtxos: Vec<VtxoInput>,
-        info: ArkInfo,
+        info: Info,
     ) -> Result<Vec<Vec<u8>>, String> {
         // The set the caller supplies, validated against what this wallet could own.
         self.accept_vtxos(vtxos, &info)?;
         // Now, not deferred: the owner is here asking for a refresh.
         let sighashes = self.generate_delegate(&info, false)?;
-        let exit_delay = info.unilateral_exit_delay as u32;
+        let exit_delay = exit_delay_value(info.unilateral_exit_delay)?;
         self.renew_session = self.renew_session.take().map(|d| d.in_flight(exit_delay));
         Ok(sighashes)
     }
@@ -98,7 +98,7 @@ impl Cosigner {
     pub fn board_begin(
         &mut self,
         utxo: (String, u32, u64),
-        info: &ArkInfo,
+        info: &Info,
     ) -> Result<Vec<Vec<u8>>, String> {
         let (boarding, sighashes) =
             BoardingSettleSession::begin(&self.owner_pk_hex()?, info, utxo)?;
@@ -223,7 +223,7 @@ impl RenewSession {
     pub(crate) fn generate(
         owner_pk_hex: &str,
         vtxos: &[VtxoInput],
-        info: &ArkInfo,
+        info: &Info,
         intent_valid_at: Option<u64>,
     ) -> Result<(Self, Vec<Vec<u8>>), String> {
         if vtxos.is_empty() {
@@ -239,12 +239,12 @@ impl RenewSession {
                 exit_delay: v.exit_delay,
             })
             .collect();
-        let network = ark::client::parse_network(&info.network)?;
+        let asp = info.signer_pk.to_string();
         let owner_ark_address = ark::client::ark_address(
             owner_pk_hex,
-            &info.signer_pubkey,
-            info.unilateral_exit_delay as u32,
-            network,
+            &asp,
+            exit_delay_value(info.unilateral_exit_delay)?,
+            info.network,
         )
         .map_err(|e| format!("ark_address: {e}"))?;
         let outputs = vec![DelegateOutput {
@@ -253,13 +253,13 @@ impl RenewSession {
         }];
         let (session, sighashes) = DelegateSettleSession::generate_delegate(
             owner_pk_hex,
-            &info.signer_pubkey,
-            &info.forfeit_pubkey,
+            &asp,
+            &info.forfeit_pk.to_string(),
             &vtxo_inputs,
             &outputs,
-            &info.forfeit_address,
-            info.dust as u64,
-            &info.network,
+            &info.forfeit_address.to_string(),
+            info.dust.to_sat(),
+            &info.network.to_string(),
             intent_valid_at,
         )
         .map_err(|e| format!("generate_delegate: {e}"))?;
@@ -397,8 +397,8 @@ impl DelegateRenew {
     ) -> Result<(Self, ToSign), Status> {
         let info = request
             .ark_info
-            .map(ArkInfo::from)
-            .ok_or_else(|| Status::invalid_argument("RenewDelegate carried no ark_info"))?;
+            .ok_or_else(|| Status::invalid_argument("RenewDelegate carried no ark_info"))
+            .and_then(|i| crate::util::server_info(i).map_err(Status::invalid_argument))?;
         let mut c = lock(cosigner);
         c.accept_vtxos(request.vtxos.into_iter().map(Into::into).collect(), &info)
             .map_err(Status::failed_precondition)?;
@@ -428,10 +428,8 @@ impl DelegateRenew {
         if !request.exit_script_pubkey.is_empty() {
             let owner_pk_hex = c.owner_pk_hex().map_err(Status::failed_precondition)?;
             let owner = ark::keys::parse_xonly(&owner_pk_hex).map_err(Status::failed_precondition)?;
-            let asp =
-                ark::keys::parse_xonly(&info.signer_pubkey).map_err(Status::failed_precondition)?;
-            let network =
-                ark::client::parse_network(&info.network).map_err(Status::failed_precondition)?;
+            let asp = info.signer_pk.x_only_public_key().0;
+            let network = info.network;
             let destination = bitcoin::ScriptBuf::from_bytes(request.exit_script_pubkey);
             for v in &c.vtxos {
                 let input = ExitInput {

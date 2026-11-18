@@ -453,7 +453,7 @@ The [roadmap](docs/ROADMAP.md) records milestone history.
 | [`wit`](wit/) | Capability contracts: [`notify`](wit/notify/notify.wit), [`tasks`](wit/tasks/tasks.wit), [`telemetry`](wit/telemetry/telemetry.wit), [`signer`](wit/signer/signer.wit) |
 | [`crates/nitro-nsm`](crates/nitro-nsm/) | NSM device access: entropy, PCRs, attestation requests |
 | [`crates/nitro-attestation`](crates/nitro-attestation/) | Attestation verification and the `nitro-attest` client |
-| [`crates/threshold`](crates/threshold/), [`crates/ark`](crates/ark/), [`crates/enclave-client`](crates/enclave-client/) | FROST/DKG for the runtime's [wallet key](runtime/src/signer/), the Ark protocol and its taproot trees for the cosigner, and attestation verification for the cosigner's clients |
+| [`crates/threshold`](crates/threshold/), [`crates/ark`](crates/ark/), [`crates/enclave-client`](crates/enclave-client/) | FROST/DKG for the runtime's [wallet key](runtime/src/signer/), the Ark sessions the policy guest drives, on top of Arkade's `ark-core`, and attestation verification for the guest's clients |
 | [`guests/policy`](guests/policy/), [`protocol/protos`](protocol/protos/) | The policy component, and its wire ([README](guests/policy/README.md)) |
 | [`runtime/src/store/zfs.rs`](runtime/src/store/zfs.rs), [`nix/kernel-zfs.nix`](nix/kernel-zfs.nix) | Storage: the pool, its disk, the anchor ([docs/STORAGE.md](docs/STORAGE.md)) |
 | [`runtime/src/store`](runtime/src/store/) | The roots bucket's S3 backend, the key hierarchy and signing |

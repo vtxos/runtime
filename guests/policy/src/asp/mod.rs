@@ -21,14 +21,14 @@ pub mod sse;
 pub mod rest;
 
 use ark::client::proto::get_event_stream_response::Event;
-use ark::client::types::ArkInfo;
+use ark::client::Info;
 
 /// What one delegate round needs from the ASP.
 #[allow(async_fn_in_trait)]
 pub trait AspApi {
     type Events: EventSource;
 
-    async fn get_info(&mut self) -> Result<ArkInfo, String>;
+    async fn get_info(&mut self) -> Result<Info, String>;
     async fn register_intent(&mut self, proof: &str, message: &str) -> Result<String, String>;
     async fn events(&mut self, topics: &[String]) -> Result<Self::Events, String>;
     async fn confirm_registration(&mut self, intent_id: &str) -> Result<(), String>;
@@ -66,7 +66,7 @@ pub struct NoAsp;
 
 impl AspApi for NoAsp {
     type Events = NoEvents;
-    async fn get_info(&mut self) -> Result<ark::client::types::ArkInfo, String> {
+    async fn get_info(&mut self) -> Result<Info, String> {
         Err("this deployment names no ASP".into())
     }
     async fn register_intent(&mut self, _: &str, _: &str) -> Result<String, String> {

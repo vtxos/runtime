@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex};
 use policy::types::{Commitment, VtxoInput};
 use std::collections::BTreeMap;
 
-use ark::client::types::ArkInfo;
 use rand::rngs::OsRng;
 use threshold::identifier::Identifier;
 use threshold::keys::KeyPackage;
@@ -83,18 +82,17 @@ fn destination() -> Vec<u8> {
     spk
 }
 
-fn ark_info() -> ArkInfo {
-    ArkInfo {
+/// The ASP's parameters as the wallet relays them.
+fn ark_info() -> policy::wallet_proto::ArkInfo {
+    policy::wallet_proto::ArkInfo {
         signer_pubkey: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
         forfeit_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
         forfeit_address: "bcrt1qq5rjlmqartxjyh6vnmjrhrqnc58q2hqr5asln0".into(),
-        checkpoint_tapscript: String::new(),
         network: "regtest".into(),
-        session_duration: 0,
         unilateral_exit_delay: 512,
         boarding_exit_delay: 144,
-        vtxo_min_amount: 0,
         dust: 330,
+        ..Default::default()
     }
 }
 
@@ -183,7 +181,7 @@ fn reopen_at(
 fn renew_on(w: &mut Wallet, vtxos: Vec<VtxoInput>, exit_script: &[u8]) -> Renewed {
     let request = proto::RenewDelegate {
         vtxos: vtxos.into_iter().map(proto_vtxo).collect(),
-        ark_info: Some((&ark_info()).into()),
+        ark_info: Some(ark_info()),
         exit_script_pubkey: exit_script.to_vec(),
         device_token: String::new(),
     };

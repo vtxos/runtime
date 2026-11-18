@@ -8,7 +8,7 @@ use wstd::http::{Body, Client, Method, Request};
 
 use super::{json, sse::SseFramer, AspApi, EventSource};
 use ark::client::proto::get_event_stream_response::Event;
-use ark::client::types::ArkInfo;
+use ark::client::Info;
 
 pub struct AspRest {
     base: String,
@@ -65,7 +65,7 @@ impl AspRest {
 impl AspApi for AspRest {
     type Events = RestEvents;
 
-    async fn get_info(&mut self) -> Result<ArkInfo, String> {
+    async fn get_info(&mut self) -> Result<Info, String> {
         json::ark_info(&self.call(Method::GET, "/v1/info", None).await?)
     }
 

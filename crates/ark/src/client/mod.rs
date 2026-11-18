@@ -1,18 +1,14 @@
-//! Ark protocol: tx-building + signing math (available under `signing`, wasm-buildable)
-//! plus the ASP gRPC transport (`asp_client`, only under `client`).
+//! The sessions the policy guest drives — board, send, renew through a delegate — and the wire
+//! types it relays. Transport-free and wasm-buildable: the caller talks to the ASP.
 
 pub mod address;
-#[cfg(feature = "client")]
-pub mod asp_client;
 pub mod batch;
+mod info;
 pub mod send;
-pub mod types;
+mod sighashes;
 
-/// Generated protobuf types for the arkd ArkService and IndexerService (both share
-/// `package ark.v1`, so tonic-build merges them into one file). Included with a plain
-/// `include!` (not `tonic::include_proto!`) so it needs no tonic at the include site:
-/// under `signing` this is prost messages only; under `client` it also has the tonic
-/// client (tonic is then in scope).
+/// arkd's ArkService and IndexerService messages (both `package ark.v1`, so one file). Prost
+/// messages only: there is no transport here.
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/ark.v1.rs"));
 }
@@ -22,6 +18,4 @@ pub use address::{
     ark_address, ark_address_script_pubkey_hex, boarding_address, parse_network,
     vtxo_script_pubkey_hex,
 };
-#[cfg(feature = "client")]
-pub use asp_client::AspClient;
-pub use types::{ArkInfo, StoredVtxo, VtxoStatus};
+pub use info::{exit_delay_value, server_info, Info};

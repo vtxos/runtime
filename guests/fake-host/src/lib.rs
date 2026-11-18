@@ -188,7 +188,7 @@ impl Runtime {
 /// and every call recorded.
 #[derive(Default)]
 pub struct Asp {
-    /// `GET /v1/info`: the gateway's JSON for `ArkInfo`.
+    /// `GET /v1/info`: the gateway's JSON for the ASP's parameters.
     pub info: serde_json::Value,
     /// Refuse `registerIntent`, as an ASP does that will not take the intent.
     pub refuse_registration: bool,
