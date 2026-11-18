@@ -4,7 +4,7 @@
 # never meets the runtime's in one build.
 [workspace]
 resolver = "2"
-members = ["vtxos-client"]
+members = ["vtxos-client", "vtxos-uniffi"]
 
 [workspace.package]
 version = "0.1.0"

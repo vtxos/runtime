@@ -1,0 +1,39 @@
+[package]
+name = "vtxos-uniffi"
+description = "vtxos-client for Kotlin, Swift and React Native, through UniFFI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "vtxos_uniffi"
+# `staticlib` for iOS's xcframework, `cdylib` for Android and for generating bindings from the
+# library, `lib` for Rust tests.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+# The bindings generator, for checking the exports from a host build. uniffi-bindgen-react-native
+# brings its own.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["uniffi/cli"]
+
+[dependencies]
+vtxos-client = { path = "../vtxos-client" }
+# uniffi-bindgen-react-native 0.31 generates for uniffi 0.31.
+uniffi = { version = "=0.31.2", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+thiserror = "2"
+hex = "0.4"
+serde_json = "1"
+
+[dev-dependencies]
+# The runtime itself, in process, for tests/exports.rs.
+enclave-runtime = { path = "../../../runtime", features = ["testing"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+base64 = "0.22"
+hex = "0.4"
