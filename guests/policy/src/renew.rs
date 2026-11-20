@@ -27,8 +27,10 @@ use crate::boarding::BoardingSettleSession;
 use crate::cosigner::{
     Cosigner, Task, CATEGORY_SETTLE_DUE, WATCH_INTERVAL_MS, WATCH_TASK_ID,
 };
-use crate::grpc::{Duplex, HasBody, Status};
-use crate::host::valid_label;
+use crate::status::Status;
+use crate::util::valid_label;
+use crate::wire::{Duplex, HasBody};
+use enclave_wit::enclave::tasks::queue;
 use crate::session::{enrol_device, lock, proto};
 use crate::types::{BoardingSettleSubmitted, VtxoInput};
 
@@ -338,9 +340,9 @@ impl RenewSession {
 }
 
 /// A stream that carries the delegate exchange: how its own messages hold each step.
-pub(crate) trait DelegateStream: Sized {
+pub(crate) trait DelegateStream: prost::Message + Sized {
     /// What the wallet sends on this stream.
-    type In: HasBody;
+    type In: HasBody + prost::Message + Default;
 
     /// What the delegate's round signs, with the wallet's dealt share when this is the stream's
     /// first round — empty otherwise.
@@ -456,7 +458,7 @@ impl DelegateRenew {
         let exit_sighashes: Vec<Vec<u8>> = exits.iter().map(|(_, s)| s.sighash.to_vec()).collect();
         let all: Vec<Vec<u8>> = delegate.iter().chain(exit_sighashes.iter()).cloned().collect();
         let (signing, commitments) =
-            crate::sign::SigningSession::begin(c.host(), &all).map_err(Status::unavailable)?;
+            crate::sign::SigningSession::begin(&all).map_err(Status::unavailable)?;
         Ok((Self { signing, exits }, ToSign { delegate, exits: exit_sighashes, commitments }))
     }
 
@@ -468,7 +470,7 @@ impl DelegateRenew {
         rounds: Vec<proto::WalletRound>,
         device_token: &str,
     ) -> Result<proto::DelegateRenewed, Status> {
-        let device_enrolled = enrol_device(cosigner, device_token);
+        let device_enrolled = enrol_device(device_token);
         let mut c = lock(cosigner);
         // A bad share is the caller's fault, and is reported as such.
         let signatures = self
@@ -522,9 +524,8 @@ impl DelegateRenew {
         // First run at the deadline itself — a delegate is not valid before it, so running earlier
         // would only report NotDue and put the real run a whole interval late. One already past
         // runs at once; one missed while the enclave was down runs when it recovers the queue.
-        let host = c.host.clone();
         let enqueue =
-            || host.enqueue(WATCH_TASK_ID, &payload, valid_at * 1000, Some(WATCH_INTERVAL_MS));
+            || queue::enqueue(WATCH_TASK_ID, &payload, valid_at * 1000, Some(WATCH_INTERVAL_MS));
         match enqueue() {
             Ok(()) => {}
             // A task id is an idempotency key: arming again with the same deadline is a no-op, and
@@ -534,8 +535,8 @@ impl DelegateRenew {
             // happens in a request, which holds the tenant the background task would need.
             Err(e) if e.contains("different input") => {
                 let rearm = |e: String| Status::internal(format!("re-arming the watch: {e}"));
-                host.cancel(WATCH_TASK_ID).map_err(rearm)?;
-                host.forget(WATCH_TASK_ID).map_err(rearm)?;
+                queue::cancel(WATCH_TASK_ID).map_err(rearm)?;
+                queue::forget(WATCH_TASK_ID).map_err(rearm)?;
                 enqueue().map_err(Status::internal)?;
             }
             Err(e) => return Err(Status::internal(e)),

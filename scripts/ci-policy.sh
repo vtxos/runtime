@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# The policy guest: its component's and its crates' tests on the host, clippy, and
-# the component a release ships, built by Nix and run by the fake host through
-# a wallet's life.
+# The policy guest: its tests, as wasm inside the fake host; its crates' tests on
+# the host; clippy; and the component a release ships, built by Nix and run by
+# the fake host through a wallet's life.
 #
-# Needs protoc for the build scripts, and Nix for the component.
+# Needs protoc for the build scripts, and Nix for the component and the policy's
+# shell (the wasm clang, and `fake-host-run` to run its tests).
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 cd "$REPO"
 
-say "policy: tests"
-cargo test -p policy -p enclave-client
+say "policy: tests, as wasm in the fake host"
+# Run from guests/policy, whose cargo config targets wasm32-wasip2 and hands each
+# test binary to `fake-host-run`. The same command a developer runs.
+(cd guests/policy && nix develop "$REPO#policy" -c cargo test --locked)
+
+say "policy: the crates it is built from"
+cargo test -p enclave-client
 cargo test -p threshold --features std,ecdh
 cargo test -p ark --all-features
 

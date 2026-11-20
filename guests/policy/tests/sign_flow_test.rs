@@ -24,12 +24,11 @@ fn a_sign_session_verifies_under_the_group_key() {
     };
     let wallet = common::wallet();
     let message = vec![0x42u8; 32];
-    let cosigner = common::open_holding(&store, &wallet);
+    let _cosigner = common::open_holding(&store, &wallet);
 
     // Round 1. The round leaves the cosigner with the reply; nothing is parked behind it.
-    let host = cosigner.lock().unwrap().host();
     let (round, theirs) =
-        SigningSession::begin(host, std::slice::from_ref(&message)).expect("round one");
+        SigningSession::begin(std::slice::from_ref(&message)).expect("round one");
     assert_eq!(theirs.len(), 1, "one message, one commitment");
 
     // The client's round-trip, with no lock held on the cosigner.
@@ -68,13 +67,12 @@ fn abandoned_ceremony_leaves_no_reusable_nonce() {
 
     let wallet = common::wallet();
     let message = vec![0x42u8; 32];
-    let cosigner = common::open_holding(&store, &wallet);
-    let host = cosigner.lock().unwrap().host();
+    let _cosigner = common::open_holding(&store, &wallet);
 
     // Open a round and abandon it, as an interrupted stream does.
-    let (_, first) = SigningSession::begin(host.clone(), std::slice::from_ref(&message)).unwrap();
+    let (_, first) = SigningSession::begin(std::slice::from_ref(&message)).unwrap();
     // Same cosigner, same message: a second round must not reuse the first one's nonce.
-    let (_, second) = SigningSession::begin(host, std::slice::from_ref(&message)).unwrap();
+    let (_, second) = SigningSession::begin(std::slice::from_ref(&message)).unwrap();
 
     assert_ne!(first[0].hiding, second[0].hiding, "hiding commitment must not repeat");
     assert_ne!(first[0].binding, second[0].binding, "binding commitment must not repeat");

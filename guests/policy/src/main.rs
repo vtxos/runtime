@@ -5,10 +5,10 @@
 //! had, where a caller could name one wallet while addressing another. There is no other wallet to
 //! address.
 //!
-//! There is no listener here and no runtime to start. The component exports
-//! `wasi:http/incoming-handler`; the runtime owns the socket, the TLS and the HTTP/2 negotiation,
-//! and calls [`main`] once per request. What used to be `tonic::transport::Server::builder()` is
-//! gone with the rest of tonic, which does not build for `wasm32-wasip2` at all.
+//! There is no listener here and no transport. The component exports `enclave:rpc/service`: the
+//! runtime owns the socket, the TLS, HTTP/2 and gRPC's framing, and calls [`Policy::call`] once
+//! per call with its messages as a stream. It also exports `run-task`, which the runtime calls on
+//! its own schedule. Both are in `enclave_wit`'s `guest` world, read from the runtime's own WIT.
 //!
 //! Nor is there a shutdown signal. The old server caught SIGTERM so in-flight sessions could
 //! finish; a guest has no signals, and the runtime stopping an instance between requests is what
@@ -16,50 +16,131 @@
 
 use std::sync::{Arc, Mutex};
 
-use policy::grpc::Status;
-use policy::{config, grpc, session, store, Cosigner};
-use wstd::http::{Body, Request, Response};
+use enclave_wit::exports::enclave::rpc::service as rpc;
+use enclave_wit::{wit_future, wit_stream};
+use policy::status::{Code, Status};
+use policy::wire::{Wire, WireFuture};
+use policy::{config, session, store, Cosigner};
+use wit_bindgen::{FutureReader, StreamReader, StreamWriter};
 
-/// What the seal is filed under when `COSIGNER_GROUP_KEY` says nothing — see [`serve`].
+/// What the seal is filed under when `COSIGNER_GROUP_KEY` says nothing — see [`open_cosigner`].
 const DEFAULT_GROUP_KEY: &str = "wallet";
 
-#[wstd::http_server]
-async fn main(req: Request<Body>) -> Result<Response<Body>, wstd::http::Error> {
-    Ok(match serve(req).await {
-        Ok(response) => response,
-        // A failure to open the wallet at all is still a gRPC call that has to answer. Reporting it
-        // in the trailers rather than as an HTTP error is what lets a client tell "this wallet is
+struct Policy;
+
+impl rpc::Guest for Policy {
+    async fn call(
+        method: String,
+        requests: StreamReader<Vec<u8>>,
+    ) -> (StreamReader<Vec<u8>>, FutureReader<Result<(), rpc::Status>>) {
+        let (replies, out) = wit_stream::new::<Vec<u8>>();
+        let (done, status) = wit_future::new::<Result<(), rpc::Status>>(|| {
+            Err(rpc::Status {
+                code: Code::Internal as u32,
+                message: "the call ended without a status".into(),
+            })
+        });
+        // Returned at once, so the runtime can send the head; the call runs after. The streams are
+        // dropped when `serve` returns, so every reply is out before the status is written.
+        wit_bindgen::spawn(async move {
+            let outcome = serve(&method, Box::new(Streams { requests, replies })).await;
+            let _ = done
+                .write(outcome.map_err(|s| rpc::Status {
+                    code: s.code() as u32,
+                    message: s.message().to_string(),
+                }))
+                .await;
+        });
+        (out, status)
+    }
+}
+
+/// `run-task`, the other half of `enclave:tasks/background`.
+///
+/// The runtime calls this on its own schedule with no request in flight, so it opens the wallet
+/// itself rather than sharing one — there is no instance kept between a request and a task to
+/// share. When the sealed delegate has come due it runs it against the ASP its settings name —
+/// see `Cosigner::run_task_with` — and wakes the owner only when it cannot.
+impl enclave_wit::Guest for Policy {
+    fn run_task(task_id: String, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        // The runtime records a failed run's error inside the sealed task record, where nobody
+        // reads it; stderr reaches the console. Said here too, so a watch that keeps failing
+        // says why.
+        println!("run-task {task_id}: start");
+        let run = || {
+            let cfg = config::Config::from_environment();
+            let mut wallet = open_cosigner(&cfg).map_err(|e| e.to_string())?;
+            // The ASP, when the settings name one — a due delegate is then run here, not handed
+            // back to a phone. A native build (clippy, the fake host's wire types) has no client.
+            #[cfg(target_arch = "wasm32")]
+            let mut asp = policy::asp::rest::AspRest::from_env();
+            #[cfg(not(target_arch = "wasm32"))]
+            let mut asp = None::<policy::asp::NoAsp>;
+            println!("run-task {task_id}: asp={}", if asp.is_some() { "yes" } else { "no" });
+            wstd::runtime::block_on(wallet.run_task_with(&task_id, &payload, asp.as_mut()))
+        };
+        run()
+            .inspect(|_| println!("run-task {task_id}: done"))
+            .inspect_err(|e| eprintln!("background task {task_id} failed: {e}"))
+    }
+}
+
+enclave_wit::export!(Policy);
+
+/// The call's two streams, as the router reads and writes them.
+struct Streams {
+    requests: StreamReader<Vec<u8>>,
+    replies: StreamWriter<Vec<u8>>,
+}
+
+impl Wire for Streams {
+    fn recv(&mut self) -> WireFuture<'_, Option<Vec<u8>>> {
+        Box::pin(self.requests.next())
+    }
+
+    fn send(&mut self, message: Vec<u8>) -> WireFuture<'_, ()> {
+        Box::pin(async move {
+            // Handed back only when the runtime has dropped the stream: the client went away, and
+            // the next read finds that out.
+            let _ = self.replies.write_one(message).await;
+        })
+    }
+}
+
+async fn serve(method: &str, wire: Box<dyn Wire>) -> Result<(), Status> {
+    let opened = (|| {
+        let cfg = config::Config::from_environment();
+
+        // Refuse to serve with an empty `bitcoin_network`. The client uses this string verbatim as
+        // the HRP source for rendering wallet addresses; an empty value would silently fall through
+        // to a wrong-network default on the client side. `from_environment` already defaults to
+        // "regtest" on a missing var, so this only fires when the operator explicitly set
+        // BITCOIN_NETWORK="".
+        const VALID_NETWORKS: [&str; 5] = ["mainnet", "testnet", "signet", "mutinynet", "regtest"];
+        if !VALID_NETWORKS.contains(&cfg.bitcoin_network.as_str()) {
+            return Err(Status::failed_precondition(format!(
+                "invalid BITCOIN_NETWORK={:?}; expected one of {VALID_NETWORKS:?}",
+                cfg.bitcoin_network
+            )));
+        }
+
+        let cosigner = Arc::new(Mutex::new(open_cosigner(&cfg)?));
+        let server_info = policy::wallet_proto::GetServerInfoResponse {
+            bitcoin_network: cfg.bitcoin_network.clone(),
+        };
+        Ok(session::Session::new(cosigner, server_info))
+    })();
+
+    match opened {
+        Ok(session) => session.route(method, wire).await,
+        // A failure to open the wallet at all is still a call that has to answer. Reporting it as
+        // its status rather than failing the call is what lets a client tell "this wallet is
         // misconfigured" from "the runtime could not reach the guest".
         Err(status) => {
             eprintln!("request failed before routing: {status}");
-            grpc::failed(status)
+            Err(status)
         }
-    })
-}
-
-async fn serve(req: Request<Body>) -> Result<Response<Body>, Status> {
-    let cfg = config::Config::from_environment();
-
-    // Refuse to serve with an empty `bitcoin_network`. The client uses this string verbatim as the
-    // HRP source for rendering wallet addresses; an empty value would silently fall through to a
-    // wrong-network default on the client side. `from_environment` already defaults to "regtest" on
-    // a missing var, so this only fires when the operator explicitly set BITCOIN_NETWORK="".
-    const VALID_NETWORKS: [&str; 5] = ["mainnet", "testnet", "signet", "mutinynet", "regtest"];
-    if !VALID_NETWORKS.contains(&cfg.bitcoin_network.as_str()) {
-        return Err(Status::failed_precondition(format!(
-            "invalid BITCOIN_NETWORK={:?}; expected one of {VALID_NETWORKS:?}",
-            cfg.bitcoin_network
-        )));
     }
-
-    let cosigner = Arc::new(Mutex::new(open_cosigner(&cfg)?));
-    let server_info = policy::wallet_proto::GetServerInfoResponse {
-        bitcoin_network: cfg.bitcoin_network.clone(),
-    };
-
-    Ok(session::Session::new(cosigner, server_info)
-        .route(req)
-        .await)
 }
 
 /// This instance's wallet, loaded from its seal.
@@ -90,155 +171,7 @@ fn open_cosigner(cfg: &config::Config) -> Result<Cosigner, Status> {
     let group_key =
         std::env::var("COSIGNER_GROUP_KEY").unwrap_or_else(|_| DEFAULT_GROUP_KEY.to_string());
 
-    Cosigner::open(store, group_key, host())
+    Cosigner::open(store, group_key)
 }
 
-/// The runtime, if we are running inside one.
-///
-/// `Detached` off the target is not a fallback so much as the truth: a host build has no task queue
-/// and no push channel, and every call failing is what stops a missed deadline looking healthy.
-#[cfg(target_arch = "wasm32")]
-fn host() -> Arc<dyn policy::host::Host> {
-    Arc::new(runtime::Runtime)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn host() -> Arc<dyn policy::host::Host> {
-    Arc::new(policy::host::Detached)
-}
-
-/// The runtime's capabilities, and the task it calls back into.
-///
-/// Only on the component target: `wit_bindgen::generate!` emits component-model imports that a
-/// native build has nothing to link against. `host.rs` describes the same two interfaces as a
-/// trait so everything above this can be written and tested on the host; this is the one `impl`
-/// that was always going to be the point of that.
-#[cfg(target_arch = "wasm32")]
-mod runtime {
-    use std::sync::Arc;
-
-    use policy::host::{Commitment, Host, SigningHandle, WalletKey};
-    use policy::sign::WalletHalf;
-
-    mod bindings {
-        wit_bindgen::generate!({ path: "wit", world: "cosigner", generate_all });
-    }
-
-    use bindings::enclave::signer::wallet;
-    use bindings::enclave::notify::notify;
-    use bindings::enclave::tasks::queue;
-
-    /// Each method is the WIT function with the same name. Nothing is adapted, which is what the
-    /// trait was shaped for.
-    pub struct Runtime;
-
-    impl Host for Runtime {
-        fn enqueue(
-            &self,
-            id: &str,
-            payload: &[u8],
-            run_at_ms: u64,
-            interval_ms: Option<u64>,
-        ) -> Result<(), String> {
-            queue::enqueue(id, payload, run_at_ms, interval_ms)
-        }
-        fn status(&self, id: &str) -> Result<String, String> {
-            queue::status(id)
-        }
-        fn cancel(&self, id: &str) -> Result<(), String> {
-            queue::cancel(id)
-        }
-        fn forget(&self, id: &str) -> Result<(), String> {
-            queue::forget(id)
-        }
-        fn register_device(&self, token: &str) -> Result<(), String> {
-            notify::register_device(token)
-        }
-        fn forget_device(&self, token: &str) -> Result<(), String> {
-            notify::forget_device(token)
-        }
-        fn devices(&self) -> Result<u32, String> {
-            notify::devices()
-        }
-        fn wake(&self, category: &str, reference: Option<&str>) -> Result<(), String> {
-            notify::wake(category, reference)
-        }
-        fn wallet_key(&self) -> Result<WalletKey, String> {
-            let key = wallet::wallet_key()?;
-            Ok(WalletKey {
-                group_key: key.group_key,
-                public_key_package: key.public_key_package,
-                signer_identifier: key.signer_identifier,
-                wallet_identifier: key.wallet_identifier,
-            })
-        }
-        fn dealt_share(&self, identifier: &[u8]) -> Result<Vec<u8>, String> {
-            wallet::dealt_share(identifier)
-        }
-        fn signing_begin(
-            &self,
-            messages: &[Vec<u8>],
-        ) -> Result<(SigningHandle, Vec<Commitment>), String> {
-            let (signing, commitments) = wallet::Signing::begin(messages)?;
-            let commitments = commitments
-                .into_iter()
-                .map(|c| Commitment { hiding: c.hiding, binding: c.binding })
-                .collect();
-            Ok((SigningHandle(Box::new(signing)), commitments))
-        }
-        fn signing_finish(
-            &self,
-            signing: SigningHandle,
-            rounds: &[WalletHalf],
-        ) -> Result<Vec<Vec<u8>>, String> {
-            let signing = signing
-                .0
-                .downcast::<wallet::Signing>()
-                .map_err(|_| "not a round this runtime began".to_string())?;
-            let rounds: Vec<_> = rounds
-                .iter()
-                .map(|r| wallet::WalletRound {
-                    hiding: r.hiding.clone(),
-                    binding: r.binding.clone(),
-                    share: r.share.clone(),
-                })
-                .collect();
-            signing.finish(&rounds)
-        }
-    }
-
-    /// `run-task`, the other half of `enclave:tasks/background`.
-    ///
-    /// The runtime calls this on its own schedule with no request in flight, so it opens the wallet
-    /// itself rather than sharing one — there is no instance kept between a request and a task to
-    /// share. When the sealed delegate has come due it runs it against the ASP its settings name —
-    /// see `Cosigner::run_task_with` — and wakes the owner only when it cannot.
-    struct Background;
-
-    impl bindings::Guest for Background {
-        fn run_task(task_id: String, payload: Vec<u8>) -> Result<Vec<u8>, String> {
-            // The runtime records a failed run's error inside the sealed task record, where nobody
-            // reads it; stderr reaches the console. Said here too, so a watch that keeps failing
-            // says why.
-            println!("run-task {task_id}: start");
-            let run = || {
-                let cfg = policy::config::Config::from_environment();
-                let mut wallet = super::open_cosigner(&cfg).map_err(|e| e.to_string())?;
-                // The ASP, when the settings name one — a due delegate is then run here, not handed
-                // back to a phone.
-                let mut asp = policy::asp::rest::AspRest::from_env();
-                println!("run-task {task_id}: asp={}", if asp.is_some() { "yes" } else { "no" });
-                wstd::runtime::block_on(wallet.run_task_with(&task_id, &payload, asp.as_mut()))
-            };
-            run()
-                .inspect(|_| println!("run-task {task_id}: done"))
-                .inspect_err(|e| eprintln!("background task {task_id} failed: {e}"))
-        }
-    }
-
-    bindings::export!(Background with_types_in bindings);
-
-    /// Silences the unused warning for a type whose only purpose is to be exported.
-    #[allow(dead_code)]
-    fn _keep(_: Arc<dyn Host>) {}
-}
+fn main() {}

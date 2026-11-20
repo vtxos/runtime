@@ -15,22 +15,22 @@
 //!
 //! # Why these are plain `async fn`s
 //!
-//! They were `async_stream::try_stream!` blocks behind a tonic service trait. tonic does not build
-//! for `wasm32-wasip2` at all, so the guest port replaced it with [`crate::grpc`] — 250 lines that
-//! do the framing, the trailers and the duplex. What did *not* change is these bodies: `yield x`
-//! became `duplex.send(x)`, `inbound.next().await` became `duplex.recv().await`, and the ceremonies
-//! are otherwise the same code. That was the test of whether the transport had been kept at arm's
-//! length, and it passed.
+//! They were `async_stream::try_stream!` blocks behind a tonic service trait, then bodies driven by
+//! the guest's own gRPC framing. The runtime ends gRPC now and hands over messages, and these
+//! bodies still did not change: `yield x` became `duplex.send(x)`, `inbound.next().await` became
+//! `duplex.recv().await`, and the ceremonies are otherwise the same code. That was the test of
+//! whether the transport had been kept at arm's length, and it passed twice.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use wstd::http::{Body, Request, Response};
+use enclave_wit::enclave::notify::notify;
 
 use crate::cosigner::Cosigner;
 use crate::renew::{DelegateRenew, DelegateStream};
 use crate::sign::SigningSession;
-use crate::grpc::{self, Duplex, HasBody, SessionBody, Status};
+use crate::status::Status;
 use crate::wallet_proto as wp;
+use crate::wire::{Duplex, HasBody, Wire};
 
 pub mod proto {
     #![allow(clippy::all)]
@@ -57,131 +57,90 @@ impl Session {
         }
     }
 
-    /// One request, routed.
+    /// One call, routed: `method` is its path, and `wire` carries its messages.
     ///
-    /// This is what the generated service trait was for. Matching `:path` by hand is a table of
-    /// fifteen names — clearer than a code generator, and the only part of tonic still in use once
-    /// the framing and the status had their own modules.
-    pub async fn route(&self, req: Request<Body>) -> Response<Body> {
-        // Authentication is the runtime's: it lets a request through only once a passkey approved
-        // it. Run it without a gate and anyone can call this.
-        let path = req.uri().path().to_string();
-        let Some(method) = path.strip_prefix(PREFIX) else {
-            eprintln!("request to unknown service: {path}");
-            return grpc::failed(Status::unimplemented(format!("no such service: {path}")));
+    /// This is what a generated service trait would be for. Matching the path by hand is a table
+    /// of nine names, clearer than a code generator. Whatever a ceremony queued goes out before
+    /// its status does, however it ends.
+    pub async fn route(&self, method: &str, wire: Box<dyn Wire>) -> Result<(), Status> {
+        // Authentication is the runtime's: it lets a call through only once its owner signed in.
+        // Run it without a gate and anyone can call this.
+        let Some(name) = method.strip_prefix(PREFIX) else {
+            eprintln!("request to unknown service: {method}");
+            return Err(Status::unimplemented(format!("no such service: {method}")));
         };
-        println!("{method}: request");
+        println!("{name}: request");
 
         // --- The ceremonies ---------------------------------------------------------------------
-        //
-        // Each holds the request body for the life of the response, so the head goes out before the
-        // first round does.
         macro_rules! ceremony {
             ($handler:path) => {{
-                let cosigner = Arc::clone(&self.cosigner);
-                let inbound = req.into_body().into_boxed_body();
-                // The handler runs as the response streams, so its outcome is known later than the
-                // `request` line above. Logging the end here, with the method, leaves every ceremony
-                // a start/end pair; the handler itself adds the ids beyond the method name.
-                let op = method.to_string();
-                return grpc::streaming(SessionBody::new(inbound, move |duplex| async move {
-                    match $handler(cosigner, duplex).await {
-                        Ok(()) => {
-                            println!("{op}: done");
-                            Ok(())
-                        }
-                        Err(status) => {
-                            eprintln!("{op}: failed: {status}");
-                            Err(status)
-                        }
-                    }
-                }));
+                let duplex = Duplex::new(wire);
+                let outcome = $handler(Arc::clone(&self.cosigner), &duplex).await;
+                duplex.flush().await;
+                outcome
             }};
         }
-        match method {
+        let outcome = match name {
             "Sign" => ceremony!(sign),
             "Send" => ceremony!(send),
             "Renew" => ceremony!(renew),
             "Board" => ceremony!(board),
-            _ => {}
-        }
 
-        // --- The single-round calls ---------------------------------------------------------------
-        //
-        // Nothing is held between messages, so a stream would buy nothing.
-        macro_rules! unary {
-            ($body:expr) => {
-                match $body.await {
-                    Ok(resp) => {
-                        println!("{method}: done");
-                        grpc::unary(resp)
-                    }
-                    Err(status) => {
-                        eprintln!("{method}: failed: {status}");
-                        grpc::failed(status)
-                    }
-                }
-            };
-        }
-        let body = req.into_body();
-        match method {
-            "GetServerInfo" => unary!(self.get_server_info(body)),
-            "RegisterDevice" => unary!(self.register_device(body)),
-            "ForgetDevice" => unary!(self.forget_device(body)),
-            "DeviceCount" => unary!(self.device_count(body)),
-            "Recover" => unary!(self.recover(body)),
+            // --- The single-round calls -----------------------------------------------------------
+            //
+            // Nothing is held between messages, so a stream would buy nothing.
+            "GetServerInfo" => unary(wire, |_: wp::GetServerInfoRequest| Ok(self.server_info.clone())).await,
+            "RegisterDevice" => unary(wire, register_device).await,
+            "ForgetDevice" => unary(wire, forget_device).await,
+            "DeviceCount" => unary(wire, device_count).await,
+            "Recover" => unary(wire, |req| lock(&self.cosigner).recover(req)).await,
             other => {
                 eprintln!("{other}: no such method");
-                grpc::failed(Status::unimplemented(format!("no such method: {other}")))
+                return Err(Status::unimplemented(format!("no such method: {other}")));
             }
+        };
+        match &outcome {
+            Ok(()) => println!("{name}: done"),
+            Err(status) => eprintln!("{name}: failed: {status}"),
         }
+        outcome
     }
+}
 
-    // -------------------------------------------------------------------------------------------
-    // The single-round calls.
-    // -------------------------------------------------------------------------------------------
+/// A single-round call: one request in, one answer out.
+async fn unary<Req, Resp>(
+    wire: Box<dyn Wire>,
+    answer: impl FnOnce(Req) -> Result<Resp, Status>,
+) -> Result<(), Status>
+where
+    Req: prost::Message + Default,
+    Resp: prost::Message,
+{
+    let duplex = Duplex::<Req, Resp>::new(wire);
+    duplex.send(answer(duplex.only().await?)?);
+    duplex.flush().await;
+    Ok(())
+}
 
-    async fn get_server_info(&self, body: Body) -> Result<wp::GetServerInfoResponse, Status> {
-        let _: wp::GetServerInfoRequest = grpc::one_message(body).await?;
-        Ok(self.server_info.clone())
-    }
+// --- Devices -----------------------------------------------------------------------------------
+//
+// Forwarded to the runtime and not stored here. The cosigner has no push channel of its own and
+// never sees a token twice; `device_count` returns a number because it is not meant to be able to
+// enumerate a tenant's devices.
 
-    // --- Devices -------------------------------------------------------------------------------
-    //
-    // Forwarded to the runtime and not stored here. The cosigner has no push channel of its own and
-    // never sees a token twice; `device_count` returns a number because it is not meant to be able
-    // to enumerate a tenant's devices.
+fn register_device(req: proto::RegisterDeviceRequest) -> Result<proto::RegisterDeviceResponse, Status> {
+    notify::register_device(&req.token).map_err(Status::unavailable)?;
+    Ok(proto::RegisterDeviceResponse {})
+}
 
-    async fn register_device(&self, body: Body) -> Result<proto::RegisterDeviceResponse, Status> {
-        let req: proto::RegisterDeviceRequest = grpc::one_message(body).await?;
-        lock(&self.cosigner)
-            .host
-            .register_device(&req.token)
-            .map_err(Status::unavailable)?;
-        Ok(proto::RegisterDeviceResponse {})
-    }
+fn forget_device(req: proto::ForgetDeviceRequest) -> Result<proto::ForgetDeviceResponse, Status> {
+    notify::forget_device(&req.token).map_err(Status::unavailable)?;
+    Ok(proto::ForgetDeviceResponse {})
+}
 
-    async fn forget_device(&self, body: Body) -> Result<proto::ForgetDeviceResponse, Status> {
-        let req: proto::ForgetDeviceRequest = grpc::one_message(body).await?;
-        lock(&self.cosigner)
-            .host
-            .forget_device(&req.token)
-            .map_err(Status::unavailable)?;
-        Ok(proto::ForgetDeviceResponse {})
-    }
-
-    async fn device_count(&self, body: Body) -> Result<proto::DeviceCountResponse, Status> {
-        let _: proto::DeviceCountRequest = grpc::one_message(body).await?;
-        let devices = lock(&self.cosigner).host.devices().map_err(Status::unavailable)?;
-        Ok(proto::DeviceCountResponse { devices })
-    }
-
-    /// See [`Cosigner::recover`]. Reads the seal; installs nothing.
-    async fn recover(&self, body: Body) -> Result<proto::RecoverResponse, Status> {
-        let req: proto::RecoverRequest = grpc::one_message(body).await?;
-        lock(&self.cosigner).recover(req)
-    }
-
+fn device_count(_: proto::DeviceCountRequest) -> Result<proto::DeviceCountResponse, Status> {
+    let devices = notify::devices().map_err(Status::unavailable)?;
+    Ok(proto::DeviceCountResponse { devices })
 }
 
 /// The cosigner, with a poisoned lock recovered rather than propagated.
@@ -209,7 +168,7 @@ pub(crate) fn lock(cosigner: &Arc<Mutex<Cosigner>>) -> MutexGuard<'_, Cosigner> 
 /// rather than left to fail as a bad share.
 async fn sign(
     cosigner: Arc<Mutex<Cosigner>>,
-    duplex: Duplex<SignClientMsg, SignServerMsg>,
+    duplex: &Duplex<SignClientMsg, SignServerMsg>,
 ) -> Result<(), Status> {
     // --- Round 1: open --------------------------------------------------------------------
     let first = duplex.expect("it opened").await?;
@@ -240,9 +199,8 @@ async fn sign(
     // The round is OURS, as an ordinary local. The lock is released before we wait on the client —
     // a slow client blocks nobody.
     let messages = vec![open.message_to_sign.clone()];
-    let host = lock(&cosigner).host();
     let (signing, commitments) =
-        SigningSession::begin(host, &messages).map_err(Status::unavailable)?;
+        SigningSession::begin(&messages).map_err(Status::unavailable)?;
 
     println!("Sign: returned the dealt share to the wallet's own identifier");
     duplex.send(SignServerMsg {
@@ -301,7 +259,7 @@ async fn sign(
 /// transaction addressable by the next request nor a recorded spend that never happened.
 async fn send(
     cosigner: Arc<Mutex<Cosigner>>,
-    duplex: Duplex<proto::SendClientMsg, proto::SendServerMsg>,
+    duplex: &Duplex<proto::SendClientMsg, proto::SendServerMsg>,
 ) -> Result<(), Status> {
     let first = duplex.expect("it opened").await?;
     let session_id = first.session_id.clone();
@@ -333,7 +291,7 @@ async fn send(
         lock(&cosigner).create_send_session(step1, &info).map_err(Status::internal)?
     };
 
-    drive_send(&cosigner, &duplex, &session_id, session, change_exit_delay, sighashes, dealt).await
+    drive_send(&cosigner, duplex, &session_id, session, change_exit_delay, sighashes, dealt).await
 }
 
 /// A send's rounds, from its sighashes to its change recorded and an optional delegate renewal —
@@ -358,9 +316,8 @@ async fn drive_send<S: SendStream>(
 
     // Round one of the FROST signature, on this stream. It used to be a nested `Sign` stream per
     // sighash, which deadlocks inside enclave-runtime — see `crate::sign`.
-    let host = lock(cosigner).host();
     let (signing, commitments) =
-        SigningSession::begin(host, &sighashes).map_err(Status::unavailable)?;
+        SigningSession::begin(&sighashes).map_err(Status::unavailable)?;
 
     say(1, proto::send_server_msg::Body::Sighashes(proto::SendSighashes {
         wallet_dealt_share: dealt,
@@ -418,7 +375,7 @@ async fn drive_send<S: SendStream>(
     //
     // On this stream so it rides the approval — and the passkey seed — the send already had. A
     // caller that closes instead has simply not asked for it.
-    if let Some(msg) = duplex.recv().await {
+    if let Some(msg) = duplex.recv().await? {
         let request = match msg.into_body().and_then(S::uncarry) {
             Some(proto::send_client_msg::Body::RenewDelegate(r)) => r,
             _ => {
@@ -466,7 +423,7 @@ impl SendStream for proto::SendServerMsg {
 /// ASP. See `Cosigner::renew_begin` for why that cannot redirect funds.
 async fn renew(
     cosigner: Arc<Mutex<Cosigner>>,
-    duplex: Duplex<proto::RenewClientMsg, proto::RenewServerMsg>,
+    duplex: &Duplex<proto::RenewClientMsg, proto::RenewServerMsg>,
 ) -> Result<(), Status> {
     let first = duplex.expect("it opened").await?;
     let session_id = first.session_id.clone();
@@ -495,18 +452,18 @@ async fn renew(
             exit_script_pubkey: open.exit_script_pubkey,
         };
         let dealt = dealt.take().unwrap_or_default();
-        return DelegateRenew::run(&cosigner, &duplex, request, &session_id, 1, dealt).await;
+        return DelegateRenew::run(&cosigner, duplex, request, &session_id, 1, dealt).await;
     }
     let vtxos = open.vtxos.into_iter().map(Into::into).collect();
     let sighashes = lock(&cosigner).renew_begin(vtxos, info).map_err(Status::internal)?;
-    drive_round(&cosigner, &duplex, &session_id, dealt, sighashes).await
+    drive_round(&cosigner, duplex, &session_id, dealt, sighashes).await
 }
 
 /// Boarding one on-chain output into Ark: the round `renew` drives, opened with `BoardOpen` on a
 /// stream of its own.
 async fn board(
     cosigner: Arc<Mutex<Cosigner>>,
-    duplex: Duplex<proto::RenewClientMsg, proto::RenewServerMsg>,
+    duplex: &Duplex<proto::RenewClientMsg, proto::RenewServerMsg>,
 ) -> Result<(), Status> {
     let first = duplex.expect("it opened").await?;
     let session_id = first.session_id.clone();
@@ -529,7 +486,7 @@ async fn board(
         .map(|u| (u.txid, u.vout, u.amount_sats))
         .ok_or_else(|| Status::invalid_argument("BoardOpen carried no utxo"))?;
     let sighashes = lock(&cosigner).board_begin(utxo, &info).map_err(Status::internal)?;
-    drive_round(&cosigner, &duplex, &session_id, Some(dealt), sighashes).await
+    drive_round(&cosigner, duplex, &session_id, Some(dealt), sighashes).await
 }
 
 /// The round `renew` and `board` share: from the first sighashes to `RenewComplete`, and the
@@ -560,8 +517,7 @@ async fn drive_round(
             RenewStep::Sighashes(messages_to_sign) => {
                 // Round one, on this stream — see `crate::sign` for why it cannot be a nested
                 // `Sign` any more.
-                let host = lock(cosigner).host();
-                let (signing, commitments) = SigningSession::begin(host, &messages_to_sign)
+                let (signing, commitments) = SigningSession::begin(&messages_to_sign)
                     .map_err(Status::unavailable)?;
                 pending_round = Some(signing);
                 Some(proto::renew_server_msg::Body::Sighashes(proto::RenewSighashes {
@@ -600,7 +556,7 @@ async fn drive_round(
                 });
                 // Optionally, renew the delegate over what the wallet holds now — on this stream,
                 // so it rides the approval and the passkey seed the renewal already had.
-                if let Some(msg) = duplex.recv().await {
+                if let Some(msg) = duplex.recv().await? {
                     let request = match msg.body {
                         Some(proto::renew_client_msg::Body::RenewDelegate(r)) => r,
                         _ => {
@@ -667,10 +623,10 @@ async fn drive_round(
 /// Enrol a device token carried in-band, if there is one. Whether it was, rather than an error: the
 /// operation it rode on is what the caller asked for, and must not fail because a wake could not be
 /// arranged — the wallet sends the token again next time.
-pub(crate) fn enrol_device(cosigner: &Arc<Mutex<Cosigner>>, token: &str) -> bool {
+pub(crate) fn enrol_device(token: &str) -> bool {
     if token.is_empty() {
         return false;
     }
-    lock(cosigner).host.register_device(token).is_ok()
+    notify::register_device(token).is_ok()
 }
 

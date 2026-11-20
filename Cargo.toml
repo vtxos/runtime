@@ -9,6 +9,7 @@ members = [
     "crates/threshold",
     "guests/policy",
     "runtime",
+    "wit",
 ]
 # The policy component is a member, not a workspace of its own, so the
 # path dependencies it builds with (crates/ark, crates/threshold) sit inside

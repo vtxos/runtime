@@ -19,6 +19,7 @@
 pub mod attest;
 pub mod client;
 pub mod egress;
+mod grpc;
 mod http;
 pub mod pool;
 pub mod progress;

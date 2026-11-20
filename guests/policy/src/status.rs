@@ -1,14 +1,9 @@
-//! A gRPC status, without tonic.
+//! A call's outcome: a gRPC status code and a message.
 //!
-//! This is `crate::grpc::Status` reduced to what the cosigner actually uses: a code, a message, and the
-//! nine constructors named across the handlers. Every one of those handlers returns
-//! `Result<_, Status>` and none of them ever touched the parts of tonic's type that are about a
-//! transport — metadata, source errors, the HTTP mapping — so replacing it costs an import line
-//! per file and nothing else.
-//!
-//! The numbers are the wire values from the gRPC specification. They go out in the `grpc-status`
-//! trailer, which is the only place a gRPC call's real outcome is ever reported: the HTTP status
-//! of a failed call is still 200.
+//! The crate's error type, and what `enclave:rpc/service`'s `call` resolves to. The runtime ends
+//! gRPC, so this never touches a wire itself: the runtime turns it into the `grpc-status` and
+//! `grpc-message` trailers. The numbers are the gRPC specification's, because that is what those
+//! trailers carry.
 
 use std::fmt;
 

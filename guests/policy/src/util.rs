@@ -1,7 +1,7 @@
 //! Conversions between the wire types and the cosigner's own, and the projections of its records
 //! onto the wire.
 
-use crate::grpc::Status;
+use crate::status::Status;
 use crate::session::proto;
 use crate::wallet_proto as wp;
 
@@ -148,7 +148,7 @@ impl TryFrom<proto::AspEvent> for Option<ark::client::proto::get_event_stream_re
 /// Every client message carries its payload in a `oneof body`, which prost makes an `Option` field.
 macro_rules! has_body {
     ($($msg:ident => $body:ident),* $(,)?) => {$(
-        impl crate::grpc::HasBody for proto::$msg {
+        impl crate::wire::HasBody for proto::$msg {
             type Body = proto::$body::Body;
 
             fn into_body(self) -> Option<Self::Body> {
@@ -162,4 +162,17 @@ has_body! {
     SignClientMsg => sign_client_msg,
     SendClientMsg => send_client_msg,
     RenewClientMsg => renew_client_msg,
+}
+
+/// Validate an opaque label the way `notify.wit` specifies, so a bad one is refused here rather
+/// than at the host boundary where the error has less to say.
+pub fn valid_label(s: &str) -> bool {
+    (1..=64).contains(&s.chars().count())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Validate a task id: the same alphabet, and the runtime treats it as an idempotency key.
+pub fn valid_task_id(s: &str) -> bool {
+    valid_label(s)
 }

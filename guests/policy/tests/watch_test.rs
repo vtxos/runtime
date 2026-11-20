@@ -13,7 +13,7 @@ use ark::client::Info;
 use policy::cosigner::{Outcome, Task, CATEGORY_SETTLE_DUE, WATCH_TASK_ID};
 use common::Recorder;
 use policy::renew::DelegateRenew;
-use policy::host::valid_label;
+use policy::valid_label;
 use policy::session::proto;
 use policy::types::VtxoInput;
 use threshold::keys::KeyPackage;
@@ -24,10 +24,10 @@ fn payload(deadline_secs: u64) -> Vec<u8> {
 
 fn open_with(
     store: &Arc<policy::store::Store>,
-    host: Arc<Recorder>,
+    _host: Arc<Recorder>,
     group_key: &str,
 ) -> policy::Cosigner {
-    policy::Cosigner::open(store.clone(), group_key.to_string(), host)
+    policy::Cosigner::open(store.clone(), group_key.to_string())
         .expect("open")
 }
 
@@ -46,9 +46,9 @@ fn a_watch_with_nothing_to_settle_cancels_itself() {
         serde_json::from_slice::<Outcome>(&out).unwrap(),
         Outcome::NothingToSettle
     );
-    assert_eq!(*host.cancelled.lock().unwrap(), vec![WATCH_TASK_ID]);
+    assert_eq!(host.cancelled(), vec![WATCH_TASK_ID]);
     assert!(
-        host.woken.lock().unwrap().is_empty(),
+        host.woken().is_empty(),
         "nobody should be woken when there is nothing to settle"
     );
 }
@@ -83,7 +83,7 @@ fn arming_enqueues_a_repeating_watch() {
 
     renew_expiring_at(&c, &kp_user, 2_000_000_000);
 
-    let enqueued = host.enqueued.lock().unwrap();
+    let enqueued = host.enqueued();
     assert_eq!(enqueued.len(), 1, "one watch, however often it is armed");
     let (id, payload, _run_at, interval) = &enqueued[0];
     assert_eq!(id, WATCH_TASK_ID);
@@ -188,7 +188,7 @@ fn with_delegate(
     let test = common::wallet();
     let group_key = test.group_key();
     host.hold(&test);
-    let mut c = policy::Cosigner::open(store.clone(), group_key.clone(), host)
+    let mut c = policy::Cosigner::open(store.clone(), group_key.clone())
         .expect("open");
     c.accept_vtxos(
         vec![VtxoInput {
@@ -230,8 +230,8 @@ fn a_watch_before_the_deadline_does_not_wake() {
         serde_json::from_slice::<Outcome>(&out).unwrap(),
         Outcome::NotDue { .. }
     ));
-    assert!(host.woken.lock().unwrap().is_empty());
-    assert!(host.cancelled.lock().unwrap().is_empty(), "still worth watching");
+    assert!(host.woken().is_empty());
+    assert!(host.cancelled().is_empty(), "still worth watching");
 }
 
 /// Past the deadline it wakes — the one call a background task may make, spending an enrolment an
@@ -253,11 +253,11 @@ fn a_due_watch_wakes_the_owner() {
         Outcome::Woke { deadline_secs: 1 }
     );
 
-    let woken = host.woken.lock().unwrap();
+    let woken = host.woken();
     assert_eq!(woken.len(), 1, "one wake per due occurrence");
     assert_eq!(woken[0].0, CATEGORY_SETTLE_DUE);
     assert!(
-        host.cancelled.lock().unwrap().is_empty(),
+        host.cancelled().is_empty(),
         "the delegate is still unsettled, so the watch stays armed"
     );
 }
@@ -356,8 +356,8 @@ fn a_delegate_the_asp_refuses_wakes_the_owner_and_keeps_the_watch() {
         serde_json::from_slice::<Outcome>(&out).unwrap(),
         Outcome::Woke { deadline_secs: 1 }
     );
-    assert_eq!(host.woken.lock().unwrap()[0].0, CATEGORY_SETTLE_DUE);
-    assert!(host.cancelled.lock().unwrap().is_empty(), "the delegate is still owed");
+    assert_eq!(host.woken()[0].0, CATEGORY_SETTLE_DUE);
+    assert!(host.cancelled().is_empty(), "the delegate is still owed");
 }
 
 /// A delegate waiting for its deadline is not a round. What a renewal reports is refused rather than
@@ -445,7 +445,7 @@ fn renewing_without_a_known_expiry_is_refused() {
         .map(|_| ())
         .expect_err("nothing to schedule against");
     assert!(err.message().contains("known expiry"), "unhelpful error: {err}");
-    assert!(host.enqueued.lock().unwrap().is_empty(), "and no watch is armed against a guess");
+    assert!(host.enqueued().is_empty(), "and no watch is armed against a guess");
 }
 
 /// Renewing the delegate re-arms the watch for its own deadline. The runtime refuses an id reused
@@ -466,11 +466,11 @@ fn arming_again_for_a_new_deadline_replaces_the_watch() {
     // A new deadline replaces the watch.
     renew_expiring_at(&c, &kp_user, 2_100_000_000);
 
-    let enqueued = host.enqueued.lock().unwrap();
+    let enqueued = host.enqueued();
     assert_eq!(enqueued.len(), 2);
     assert_eq!(
         serde_json::from_slice::<Task>(&enqueued[1].1).unwrap(),
         Task::SettleDue { deadline_secs: deadline(&store, 2_100_000_000) }
     );
-    assert_eq!(*host.cancelled.lock().unwrap(), vec![WATCH_TASK_ID]);
+    assert_eq!(host.cancelled(), vec![WATCH_TASK_ID]);
 }

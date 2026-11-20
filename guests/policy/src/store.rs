@@ -324,6 +324,12 @@ pub(crate) fn restore_snapshot(
 mod tests {
     use super::*;
 
+    /// A directory of its own under `/tmp`, the scratch space the fake host gives a test. Named
+    /// rather than asked for: wasm's `std::env::temp_dir` has no answer.
+    fn scratch() -> tempfile::TempDir {
+        tempfile::tempdir_in("/tmp").expect("tempdir")
+    }
+
     /// Run `check` against both backends.
     ///
     /// Not a convenience: every case below is about namespace isolation, and isolation is a
@@ -331,7 +337,7 @@ mod tests {
     /// free and proves nothing about the store that actually runs. The directory backend is the
     /// one under test; the map is along to keep the two from drifting.
     fn both(check: impl Fn(&Store)) {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = scratch();
         check(&Store::open(dir.path().to_str().unwrap(), 1800).expect("open dir store"));
         check(&Store::open(":memory:", 1800).expect("open memory store"));
     }
@@ -438,7 +444,7 @@ mod tests {
 
     #[test]
     fn reopening_a_file_store_sees_prior_writes() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = scratch();
         let path = dir.path().to_str().unwrap();
         {
             let s = Store::open(path, 1800).unwrap();
@@ -453,7 +459,7 @@ mod tests {
     /// A write that died between the temporary and the rename must not come back as a value.
     #[test]
     fn a_half_written_temporary_is_not_a_key() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = scratch();
         let s = Store::open(dir.path().to_str().unwrap(), 1800).unwrap();
         s.put("t", "real", "value").unwrap();
 
@@ -469,7 +475,7 @@ mod tests {
     /// A key too long to name a file fails with something that says which key.
     #[test]
     fn an_overlong_key_is_refused_by_name() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = scratch();
         let s = Store::open(dir.path().to_str().unwrap(), 1800).unwrap();
         let err = s.put("t", &"k".repeat(MAX_NAME_BYTES), "v").unwrap_err();
         assert!(

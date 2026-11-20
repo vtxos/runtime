@@ -1,0 +1,24 @@
+// A guest that serves gRPC and runs background tasks, with every capability the runtime offers.
+//
+// Its own package so `enclave:rpc` parses on its own: the runtime and a guest that only serves
+// calls read `rpc/` alone.
+//
+// Taking everything costs nothing: an interface the code never calls is not an import of the built
+// component, so a guest that sends no wakes still instantiates on a runtime without push.
+package enclave:guest@0.1.0;
+
+world guest {
+    include enclave:rpc/server@0.1.0;
+
+    // `run-task`, and the queue to arm it with.
+    include enclave:tasks/background@0.1.0;
+
+    // Waking the tenant's devices, through an enrolment an interactive call made.
+    import enclave:notify/notify@0.1.0;
+
+    // The wallet key, held by the runtime: its FROST rounds, asked for.
+    import enclave:signer/wallet@0.1.0;
+
+    // Spans and metrics, attributed by the runtime to the tenant this invocation runs for.
+    include enclave:telemetry/observed@0.1.0;
+}

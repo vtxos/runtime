@@ -52,10 +52,11 @@
       };
       craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-      # `cleanCargoSource` drops everything that is not Rust. One thing here
-      # is not Rust and is not optional: `.pem`, the AWS Nitro root, embedded
-      # by `include_str!`. Losing it fails deep in the build naming something
-      # else entirely.
+      # `cleanCargoSource` drops everything that is not Rust. Two things here
+      # are not Rust and are not optional: `.pem`, the AWS Nitro root, embedded
+      # by `include_str!`, and `.wit`, which `bindgen!` reads to call an
+      # `enclave:rpc` guest. Losing either fails deep in the build naming
+      # something else entirely.
       srcFilter = path: type:
         let
           p = toString path;
@@ -73,7 +74,7 @@
         !(under "examples" || under "guests/fake-host" || under "clients")
         && !(manifestOnly "guests/policy" || manifestOnly "crates/ark"
           || manifestOnly "crates/enclave-client")
-        && ((lib.hasSuffix ".pem" path)
+        && ((lib.hasSuffix ".pem" path) || (lib.hasSuffix ".wit" path)
         || (craneLib.filterCargoSources path type));
 
       workspaceSrc = lib.cleanSourceWith {
@@ -208,6 +209,47 @@
       policy = policyCraneLib.buildPackage (policyArgs // {
         cargoArtifacts = policyCraneLib.buildDepsOnly policyArgs;
       });
+
+      # ---- the fake host's runner ------------------------------------------
+      # cargo's runner for the policy's tests, which are wasm and call the
+      # runtime's interfaces: it runs each test binary against the fake host.
+      # The fake host is its own workspace, built from inside the tree because
+      # its path dependencies are.
+      fake-host-run = craneLib.buildPackage {
+        pname = "fake-host-run";
+        version = "0.1.0";
+        # Only the fake host and its path dependencies, so a change to the
+        # runtime does not rebuild it.
+        src = lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            let
+              p = toString path;
+              root = toString ./.;
+              dirs = [ "guests" "guests/fake-host" "guests/policy" "crates" "crates/ark"
+                "crates/threshold" "wit" "protocol" "protocol/protos" ];
+              within = d: lib.hasPrefix "${root}/${d}/" p || p == "${root}/${d}";
+            in
+            (lib.elem (lib.removePrefix "${root}/" p) dirs
+              || lib.any within [ "guests/fake-host" "guests/policy" "crates/ark"
+                "crates/threshold" "wit" "protocol/protos" ])
+            && (lib.hasSuffix ".proto" path || lib.hasSuffix ".wit" path
+              || craneLib.filterCargoSources path type);
+          name = "fake-host-source";
+        };
+        cargoLock = ./guests/fake-host/Cargo.lock;
+        cargoToml = ./guests/fake-host/Cargo.toml;
+        postUnpack = ''
+          cd $sourceRoot/guests/fake-host
+          sourceRoot="."
+        '';
+        cargoExtraArgs = "--locked --bin fake-host-run";
+        # Only the runner: the fake host's dev-dependencies are the policy and
+        # its protos, which the runner never links.
+        cargoArtifacts = null;
+        strictDeps = true;
+        doCheck = false;
+      };
 
       # What an operator uploads to the roots bucket, and the PCR16 a key policy
       # pins for it. The guest is not in the enclave image: the runtime fetches
@@ -557,7 +599,7 @@
       lib.${system} = { inherit eifQemu mkEif; };
 
       packages.${system} = {
-        inherit enclave-runtime guest-http guest-release policy nsm-selftest nitro-attest eif-build blobs;
+        inherit enclave-runtime guest-http guest-release policy fake-host-run nsm-selftest nitro-attest eif-build blobs;
 
         # Both ends of the vsock from one package: `make build` emits gvproxy
         # for the parent and gvforwarder for the enclave, so they cannot drift.
@@ -613,19 +655,36 @@
         default = self.packages.${system}.eif;
       };
 
-      devShells.${system}.default = pkgs.mkShell {
-        inputsFrom = [ enclave-runtime ];
-        packages = with pkgs; [
-          rustToolchain
-          cmake
-          pkg-config
-          gvproxy
-          cpio
-          jq
-          eif-build
-          opentofu
-          packer
-        ];
+      devShells.${system} = {
+        default = pkgs.mkShell {
+          inputsFrom = [ enclave-runtime ];
+          packages = with pkgs; [
+            rustToolchain
+            cmake
+            pkg-config
+            gvproxy
+            cpio
+            jq
+            eif-build
+            opentofu
+            packer
+          ];
+        };
+
+        # The policy's own shell: `nix develop .#policy -c cargo test`, inside
+        # guests/policy. Its tests are wasm, so they need the clang secp256k1-sys
+        # compiles to wasm with, and `fake-host-run` to run them against the
+        # fake host (guests/policy/.cargo/config.toml).
+        policy = pkgs.mkShell {
+          packages = [
+            (policyPkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+            pkgs.protobuf
+            fake-host-run
+          ];
+          PROTOC = "${pkgs.protobuf}/bin/protoc";
+          CC_wasm32_wasip2 = "${policyClang}/bin/clang";
+          AR_wasm32_wasip2 = "${pkgs.llvmPackages.bintools-unwrapped}/bin/llvm-ar";
+        };
       };
 
       checks.${system} = {

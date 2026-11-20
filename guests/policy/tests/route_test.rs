@@ -1,12 +1,12 @@
-//! The router, over real frames: routing, the five-byte frames, and the `grpc-status` trailer a
-//! client actually reads a failure from.
+//! The router, over messages: routing, one message per reply, and the status a client reads a
+//! failure from (the runtime sends it as the `grpc-status` trailer).
 //!
-//! Driven through `route` with real framed bodies rather than handlers directly: only the wire
-//! shows what a client actually reads.
+//! Driven through `route` with the messages a call carries rather than handlers directly: only
+//! that shows what a client actually reads.
 
 mod common;
 
-use policy::grpc::Code;
+use policy::status::Code;
 use policy::session::proto;
 use policy::wallet_proto::{GetServerInfoRequest, GetServerInfoResponse};
 use policy::Cosigner;
@@ -53,15 +53,14 @@ fn a_stream_that_ends_mid_ceremony_is_a_cancellation() {
     assert_eq!(answer.messages.len(), 1, "the commitments round went out before the client vanished");
 }
 
-/// An unknown method is a gRPC status and not an HTTP one — a client reading
-/// only the head would otherwise see a perfectly successful call.
+/// An unknown method is the call's status, which the runtime sends in the trailers: a client
+/// reading only the head would otherwise see a perfectly successful call.
 #[test]
 fn an_unknown_method_is_unimplemented_in_the_trailers() {
     let Some((cosigner, _)) = seeded() else { return };
     let resp = block_on(
         service(cosigner).route(request::<GetServerInfoRequest>("Nope", &[])),
     );
-    assert_eq!(resp.status(), 200, "gRPC reports failure in the trailers");
     assert_eq!(collect::<GetServerInfoResponse>(resp).code, Code::Unimplemented as u32);
 }
 

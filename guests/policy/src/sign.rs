@@ -34,19 +34,17 @@
 //! check. The cosigner only ever offers script-path sighashes on these streams, so that is the
 //! right trade — but it is a property, not an accident.
 
-use std::sync::Arc;
+use enclave_wit::enclave::signer::wallet;
 
-use crate::host::{Host, SigningHandle};
 use crate::types::Commitment;
 
 /// A FROST round the runtime is halfway through, for every message in one batch.
 ///
-/// Held by the `Sign`, `Send` or `Renew` handler across a single round trip — never by the
+/// Held by the `Sign`, `Send` or `Renew` handler across a single round trip, never by the
 /// cosigner, so a dropped stream drops the runtime's round with it. Not `Clone`: each message's
 /// nonce is single-use, and [`SigningSession::finish`] takes the session by value.
 pub struct SigningSession {
-    host: Arc<dyn Host>,
-    signing: SigningHandle,
+    signing: wallet::Signing,
 }
 
 /// The wallet's half of one message's round: its commitment, and its share over both commitments.
@@ -58,22 +56,26 @@ pub struct WalletHalf {
 
 impl SigningSession {
     /// Round one, the cosigner's half: the runtime's commitment for each message.
-    pub fn begin(host: Arc<dyn Host>, messages: &[Vec<u8>]) -> Result<(Self, Vec<Commitment>), String> {
-        let identifier_hex = hex::encode(host.wallet_key()?.signer_identifier);
-        let (signing, commitments) = host.signing_begin(messages)?;
+    pub fn begin(messages: &[Vec<u8>]) -> Result<(Self, Vec<Commitment>), String> {
+        let identifier_hex = hex::encode(wallet::wallet_key()?.signer_identifier);
+        let (signing, commitments) = wallet::Signing::begin(messages)?;
         let commitments = commitments
             .into_iter()
             .map(|c| Commitment { identifier_hex: identifier_hex.clone(), hiding: c.hiding, binding: c.binding })
             .collect();
-        Ok((Self { host, signing }, commitments))
+        Ok((Self { signing }, commitments))
     }
 
     /// Round two: the wallet's commitment and share for each message in, BIP-340 signatures out.
     ///
-    /// [`WalletHalf`]s must be in the order the messages were — index `i` is a statement about
+    /// [`WalletHalf`]s must be in the order the messages were: index `i` is a statement about
     /// message `i`, and nothing else ties them together. The runtime refuses a count that does not
     /// match, and a share that does not verify.
     pub fn finish(self, halves: Vec<WalletHalf>) -> Result<Vec<Vec<u8>>, String> {
-        self.host.signing_finish(self.signing, &halves)
+        let rounds: Vec<_> = halves
+            .into_iter()
+            .map(|h| wallet::WalletRound { hiding: h.hiding, binding: h.binding, share: h.share })
+            .collect();
+        self.signing.finish(&rounds)
     }
 }

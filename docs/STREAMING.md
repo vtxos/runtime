@@ -11,12 +11,27 @@ settled before a key depends on either.
 
 ## What works
 
-A guest holds the request body and the response body at the same time and
-answers each message as it arrives. This is specified behaviour rather than a
-trick: `wasi:http`'s `response-outparam.set` is documented to *"allow execution
-to continue after the response has been sent"*, and `incoming-request.consume`
-borrows the request rather than consuming it, so the two resource trees are
-independent.
+There are two ways to serve one, by what the guest exports.
+
+**`enclave:rpc/service`: the runtime ends gRPC** ([`wit/rpc`](../wit/rpc/rpc.wit)).
+The guest's `call` gets the method and a stream of the client's messages,
+already deframed, and returns a stream of replies and a future for its status.
+The runtime frames the replies, sends the status as `grpc-status` and
+`grpc-message` trailers, and refuses a compressed, oversized or truncated frame
+itself. The guest has no HTTP or gRPC code at all.
+[`examples/guest-grpc`](../examples/guest-grpc/) and the policy guest are built
+this way. It is the component model's async ABI (WASI 0.3's streams and
+futures), which the runtime's engine enables for every guest.
+
+**`wasi:http/incoming-handler`: the guest serves HTTP itself.** It holds the
+request body and the response body at the same time and answers each message as
+it arrives. This is specified behaviour rather than a trick: `wasi:http`'s
+`response-outparam.set` is documented to *"allow execution to continue after
+the response has been sent"*, and `incoming-request.consume` borrows the request
+rather than consuming it, so the two resource trees are independent.
+
+Either way, the response head goes out before the first message, and the end of
+the response (the trailers) waits until the tenant's writes are anchored.
 
 The runtime negotiates HTTP/2 by ALPN, per connection. There is no
 configuration for it, and HTTP/1.1 clients are unaffected.
@@ -99,21 +114,22 @@ life**, and that tenant's next request waits behind it. Different tenants are
 unaffected and run concurrently.
 
 Anonymous callers share a single lock, so a stream with no gate configured
-would starve every other anonymous caller. **Streams are refused outright when
-no gate is configured.**
+holds every other anonymous caller behind it until it ends. Nothing refuses
+it: a deployment without a gate is a development arrangement, and says so at
+startup.
 
 ## Lifetime and failure
 
 | event | what happens |
 |---|---|
-| **half-close** (client sends END_STREAM) | the orderly end: the guest finishes and emits `grpc-status` trailers |
+| **half-close** (client sends END_STREAM) | the orderly end: the guest's request stream ends, it finishes, and its status goes out as `grpc-status` trailers |
 | **client cancels or disconnects** | the guest's next write fails, the call ends, the instance is dropped and never reused, the tenant lock frees |
 | **head timeout** (`request_timeout`) | bounds only the *response head*. It does not apply once the head is out, so it never ends a healthy stream |
 | **no traffic either way** | the epoch watchdog asks whether bytes moved, not how long the call ran. Sustained silence while executing wasm ends the call |
 | **interaction deadline** (300s) | a wall clock, checked whether or not wasm is executing — so it reaches a guest blocked in a host call, which the epoch never can. Ends the interaction and frees the tenant |
 | **guest spins** | trapped by the epoch, on the same schedule as before streams existed |
 | **guest traps** | the instance is discarded, never reused — a partially-executed call leaves a store that cannot be re-entered |
-| **`grpc-timeout` header** | **not enforced by the runtime.** Forwarded to the guest, which owns it. The runtime's deadlines are its own, so a client cannot lengthen them |
+| **`grpc-timeout` header** | **not enforced by the runtime.** A `wasi:http` guest gets the header and owns it; an `enclave:rpc` guest never sees headers. The runtime's deadlines are its own, so a client cannot lengthen them |
 | **`wasi:http` 600s between-bytes** | hardcoded in `wasmtime-wasi-http` and not configurable. A ceiling above ours |
 
 ## Sessions, retries, duplicates
@@ -144,13 +160,14 @@ results.
 
 ## Known limits
 
-- **One task, alternating.** The guest reads and writes in turn rather than
-  truly simultaneously. Sufficient for a request/response signing protocol; a
-  guest needing to emit unsolicited frames while blocked on a read would need
-  more.
+- **The policy guest alternates.** Its ceremonies read and write in turn,
+  which a request/response signing protocol is. An `enclave:rpc` guest has two
+  independent streams and may write while a read is pending; a `wasi:http`
+  guest written as one body polling the other cannot.
 - **Per-message authorization is not built.** See above.
-- **`grpc-timeout` is forwarded, never enforced.** The runtime's deadlines are
-  its own so a client cannot lengthen them by asking; interpreting a client's
-  deadline is the guest's, because only the guest knows what its work is worth.
+- **`grpc-timeout` is never enforced.** The runtime's deadlines are its own so a
+  client cannot lengthen them by asking. A `wasi:http` guest may interpret a
+  client's deadline; an `enclave:rpc` guest is not told it.
 - **HTTP/1.1 trailers need a `Trailer:` header** or hyper drops them silently.
-  The guest sets one. HTTP/2 needs no such thing.
+  The runtime sends one for an `enclave:rpc` guest; a `wasi:http` guest must
+  set its own. HTTP/2 needs no such thing.

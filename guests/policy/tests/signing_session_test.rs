@@ -86,9 +86,9 @@ fn seeded() -> Option<(policy::Cosigner, Vec<KeyPackage>, PublicKeyPackage)> {
     Some((cosigner.into_inner().unwrap(), vec![wallet.user], pkp))
 }
 
-/// Round one over [messages], through the runtime.
-fn begin(cosigner: &policy::Cosigner, messages: &[Vec<u8>]) -> (SigningSession, Vec<Commitment>) {
-    SigningSession::begin(cosigner.host(), messages).expect("round one")
+/// Round one over [messages], through the runtime [cosigner] runs inside.
+fn begin(_cosigner: &policy::Cosigner, messages: &[Vec<u8>]) -> (SigningSession, Vec<Commitment>) {
+    SigningSession::begin(messages).expect("round one")
 }
 
 /// Three sighashes, one round trip, three signatures the chain would accept.

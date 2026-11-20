@@ -35,6 +35,7 @@ The runtime links the standard WASI 0.2 interfaces and serves each one from insi
 | `getrandom`, `OsRng`, key generation | `wasi:random/random` | The **Nitro Security Module**, read directly on every call with no DRBG in between |
 | Hash-table seeding | `wasi:random/insecure-seed` | A fresh NSM draw for every instance |
 | An HTTP handler | `wasi:http/incoming-handler` | TLS terminated **inside** the enclave, behind a gate that admits only requests signed with the tenant's wallet share; the runtime sets the caller's tenant in `x-enclave-tenant` |
+| A gRPC service | `enclave:rpc/service` ([this runtime's WIT](wit/rpc/rpc.wit)) | The same TLS and gate, with gRPC ended by the runtime: the guest gets each call's messages as a stream and answers on another, and never sees HTTP |
 | An outbound HTTP request | `wasi:http/outgoing-handler` | **Denied by default.** Exact origins named in the measured image are allowed, verified against web PKI roots compiled into the image |
 | `std::fs` | `wasi:filesystem` | A per-tenant ZFS dataset on an encrypted disk, anchored in S3 ([how](docs/STORAGE.md)) |
 | `println!`, `eprintln!` | `wasi:cli/stdout`, `stderr` | Bounded, structured log records tagged `guest`, optionally forwarded to CloudWatch |
@@ -43,7 +44,7 @@ The runtime links the standard WASI 0.2 interfaces and serves each one from insi
 
 `wasi:clocks/monotonic-clock` and `wasi:random/insecure` keep wasmtime's host-backed defaults. They measure durations and drive non-cryptographic generators; they never supply a timestamp or a secret.
 
-Inbound HTTP/2 is negotiated per connection, so a guest can answer a bidirectional gRPC stream while it is still arriving ([streaming](docs/STREAMING.md), [`guest-grpc`](examples/guest-grpc/)).
+Inbound HTTP/2 is negotiated per connection, so a guest can answer a bidirectional gRPC stream while it is still arriving ([streaming](docs/STREAMING.md), [`guest-grpc`](examples/guest-grpc/), which exports `enclave:rpc/service`).
 
 There is no enclave SDK. The [example guest](examples/guest-http/src/main.rs) is `std`, `wstd` and `wit-bindgen`, and the same component bytes, and therefore the same PCR16, run in the QEMU development enclave and on Nitro.
 
@@ -269,7 +270,7 @@ deploy/qemu-nitro/dev-enclave.sh \
   --guest-env SERVICE_URL=http://192.168.127.254:7070
 ```
 
-The guest must export `wasi:http/incoming-handler`, and may use the [WIT capabilities](wit/). Background tasks run if the guest exports `run-task`. `192.168.127.254` reaches the development host through gvproxy, on every port but the runtime's own; otherwise a guest reaches the public internet and nothing else.
+The guest must export `wasi:http/incoming-handler` or `enclave:rpc/service`, and may use the [WIT capabilities](wit/). Background tasks run if the guest exports `run-task`. `192.168.127.254` reaches the development host through gvproxy, on every port but the runtime's own; otherwise a guest reaches the public internet and nothing else.
 
 There is no bare laptop mode: the runtime measures its guest into PCR16 before it boots, and that needs an NSM. Host integration tests use a fake NSM; QEMU provides an emulated one.
 

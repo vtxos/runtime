@@ -1,0 +1,17 @@
+[package]
+name = "enclave-wit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The runtime's WIT, and a guest's Rust bindings to it."
+
+# The `.wit` files live in this crate's directory so they travel with it: a guest in another
+# repository depends on this crate by git and gets the interfaces with it, with no copies and no
+# symlinks to keep in step.
+
+[features]
+# The interface a test inside guests/fake-host drives its fakes through. Tests only.
+fake-host = []
+
+[dependencies]
+wit-bindgen = { version = "0.51", features = ["async-spawn"] }

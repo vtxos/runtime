@@ -1,0 +1,33 @@
+// gRPC, ended by the runtime.
+//
+// A guest that exports `service` never sees HTTP: the runtime takes the request, strips the
+// 5-byte framing from each message, and hands the guest the protobuf bytes in order. What the
+// guest writes back is framed the same way, and its status becomes the `grpc-status` and
+// `grpc-message` trailers. A guest exporting `wasi:http/incoming-handler` instead is served as
+// before.
+package enclave:rpc@0.1.0;
+
+interface service {
+    // A gRPC status: the code from the gRPC spec and a message for whoever reads the trailers.
+    record status {
+        code: u32,
+        message: string,
+    }
+
+    // One call. `method` is the request path, `/<package>.<Service>/<Method>`.
+    //
+    // `requests` carries the client's messages, one protobuf each, and ends when the client
+    // half-closes. The guest returns at once with the two ends it will write: its replies on the
+    // stream, which it closes first, and then its status on the future. The runtime sends the
+    // status only after the replies, and only once the guest's writes to its filesystem are
+    // anchored.
+    //
+    // A frame the runtime cannot read ends `requests` early, and the runtime's own status
+    // (invalid argument) replaces the guest's.
+    call: async func(method: string, requests: stream<list<u8>>)
+        -> tuple<stream<list<u8>>, future<result<_, status>>>;
+}
+
+world server {
+    export service;
+}

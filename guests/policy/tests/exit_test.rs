@@ -24,57 +24,6 @@ use threshold::scalar::scalar_to_bytes;
 use threshold::commitment::SigningPackage;
 use threshold::signing;
 
-/// A host that accepts whatever the renewal schedules. Renewing arms the settle watch, and that
-/// needs somewhere to enqueue it; outside the enclave there is no runtime, so this stands in — and
-/// signs with the wallet's key as the runtime would, through a `Recorder` holding it.
-struct Accepting(common::Recorder);
-
-impl policy::host::Host for Accepting {
-    fn enqueue(&self, _: &str, _: &[u8], _: u64, _: Option<u64>) -> Result<(), String> {
-        Ok(())
-    }
-    fn status(&self, _: &str) -> Result<String, String> {
-        Ok("{}".into())
-    }
-    fn cancel(&self, _: &str) -> Result<(), String> {
-        Ok(())
-    }
-    fn forget(&self, _: &str) -> Result<(), String> {
-        Ok(())
-    }
-    fn register_device(&self, _: &str) -> Result<(), String> {
-        Ok(())
-    }
-    fn forget_device(&self, _: &str) -> Result<(), String> {
-        Ok(())
-    }
-    fn devices(&self) -> Result<u32, String> {
-        Ok(0)
-    }
-    fn wake(&self, _: &str, _: Option<&str>) -> Result<(), String> {
-        Ok(())
-    }
-    fn wallet_key(&self) -> Result<policy::host::WalletKey, String> {
-        self.0.wallet_key()
-    }
-    fn dealt_share(&self, identifier: &[u8]) -> Result<Vec<u8>, String> {
-        self.0.dealt_share(identifier)
-    }
-    fn signing_begin(
-        &self,
-        messages: &[Vec<u8>],
-    ) -> Result<(policy::host::SigningHandle, Vec<policy::host::Commitment>), String> {
-        self.0.signing_begin(messages)
-    }
-    fn signing_finish(
-        &self,
-        signing: policy::host::SigningHandle,
-        rounds: &[WalletHalf],
-    ) -> Result<Vec<Vec<u8>>, String> {
-        self.0.signing_finish(signing, rounds)
-    }
-}
-
 /// A P2TR output somewhere else entirely — an exit pays a wallet this one does not control.
 fn destination() -> Vec<u8> {
     let mut spk = vec![0x51, 0x20];
@@ -169,12 +118,9 @@ fn reopen_at(
     store: &std::sync::Arc<policy::store::Store>,
     test: &common::TestWallet,
 ) -> policy::Cosigner {
-    policy::Cosigner::open(
-        store.clone(),
-        test.group_key(),
-        std::sync::Arc::new(Accepting(common::Recorder::holding(test))),
-    )
-    .expect("open")
+    // Renewing arms the settle watch, so the runtime must hold the key and take the task.
+    common::Recorder::holding(test);
+    policy::Cosigner::open(store.clone(), test.group_key()).expect("open")
 }
 
 /// Run a whole renewal on [w]: open it, answer its round as the wallet would, and finish.

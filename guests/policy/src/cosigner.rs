@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::grpc::Status;
+use crate::status::Status;
 
 use crate::types::{BoardingSettleSubmitted, SendVtxoStep1, SnapshotState, VtxoEntry, VtxoInput};
 
@@ -15,7 +15,10 @@ use ark::client::{exit_delay_value, Info};
 
 use crate::asp::{AspApi, EventSource};
 use crate::boarding::BoardingSettleSession;
-use crate::host::valid_task_id;
+use crate::util::valid_task_id;
+use enclave_wit::enclave::notify::notify;
+use enclave_wit::enclave::signer::wallet;
+use enclave_wit::enclave::tasks::queue;
 use crate::renew::{AspCall, RenewSession, RenewStep};
 use crate::store::Store;
 
@@ -84,10 +87,6 @@ pub struct Cosigner {
     pub(crate) boarding_session: Option<BoardingSettleSession>,
     /// Where the seal lives.
     pub(crate) store: Arc<Store>,
-    /// The runtime this cosigner runs inside: its task queue, its push channel and the wallet key.
-    /// `Detached` when it runs as a plain process, where every call fails rather than quietly doing
-    /// nothing.
-    pub(crate) host: Arc<dyn crate::host::Host>,
     /// The name the seal is filed under — configuration, and not the wallet's group key, which is
     /// the runtime's. See `main.rs`.
     pub(crate) group_key: String,
@@ -97,8 +96,8 @@ pub struct Cosigner {
 }
 
 impl Cosigner {
-    /// Load this cosigner's state, then hand back something callable, running inside [host] —
-    /// `crate::host::Detached` when there is no runtime.
+    /// Load this cosigner's state, then hand back something callable. The runtime it runs inside
+    /// (its task queue, its push channel and the wallet key) is reached through `enclave_wit`.
     ///
     /// Eagerly, not on first use: per-request there is no later use to amortise a lazy restore
     /// into. Storage is the whole of the state — read on entry, sealed on mutation.
@@ -107,9 +106,8 @@ impl Cosigner {
     pub fn open(
         store: Arc<Store>,
         group_key: String,
-        host: Arc<dyn crate::host::Host>,
     ) -> Result<Self, Status> {
-        let mut cosigner = Self::new(store.clone(), group_key.clone(), host);
+        let mut cosigner = Self::new(store.clone(), group_key.clone());
         // A seal that is there and cannot be read is not the same as no seal: opening as an empty
         // wallet would forget its VTXOs and its delegate, and the seal is the only copy of them.
         crate::store::restore_snapshot(&mut cosigner, &store, &group_key).map_err(|e| {
@@ -125,12 +123,11 @@ impl Cosigner {
         &self.group_key
     }
 
-    fn new(store: Arc<Store>, group_key: String, host: Arc<dyn crate::host::Host>) -> Self {
+    fn new(store: Arc<Store>, group_key: String) -> Self {
         Self {
             renew_session: None,
             boarding_session: None,
             store,
-            host,
             group_key,
             vtxos: Vec::new(),
         }
@@ -309,7 +306,7 @@ impl Cosigner {
         // cancel is best-effort (a background run may not mutate the queue); the next renewal
         // re-arms.
         if self.renew_session.is_none() {
-            self.host.cancel(WATCH_TASK_ID).ok();
+            queue::cancel(WATCH_TASK_ID).ok();
             return Ok(Outcome::NothingToSettle);
         }
 
@@ -420,7 +417,7 @@ impl Cosigner {
             match run {
                 Ok(commitment_txid) => {
                     // Best-effort: the refresh happened either way.
-                    self.host.wake(CATEGORY_DELEGATE_SETTLED, None).ok();
+                    notify::wake(CATEGORY_DELEGATE_SETTLED, None).ok();
                     return Ok(Outcome::Settled { commitment_txid });
                 }
                 Err(e) => eprintln!("the sealed delegate could not be run: {e}"),
@@ -429,8 +426,7 @@ impl Cosigner {
 
         // The one call a task may make that an interactive call had to earn first. It spends the
         // enrolment; it authorizes nothing.
-        self.host
-            .wake(CATEGORY_SETTLE_DUE, None)
+        notify::wake(CATEGORY_SETTLE_DUE, None)
             .map_err(|e| format!("wake: {e}"))?;
         Ok(Outcome::Woke { deadline_secs })
     }
@@ -470,7 +466,7 @@ impl Cosigner {
 
     /// The wallet's group x-only pubkey (hex) — the VTXO owner key, from the runtime's wallet key.
     pub fn owner_pk_hex(&self) -> Result<String, String> {
-        let key = self.host.wallet_key()?;
+        let key = wallet::wallet_key()?;
         match key.group_key.as_slice() {
             [_, x @ ..] if x.len() == 32 => Ok(hex::encode(x)),
             _ => Err("the runtime's group key is not 33 bytes".into()),
@@ -514,7 +510,7 @@ impl Cosigner {
         req: crate::session::proto::RecoverRequest,
     ) -> Result<crate::session::proto::RecoverResponse, Status> {
         let dealt_share = self.dealt_share_for(&req.identifier)?;
-        let key = self.host.wallet_key().map_err(Status::failed_precondition)?;
+        let key = wallet::wallet_key().map_err(Status::failed_precondition)?;
         println!("Recover: returning the dealt share to the wallet's own identifier");
         Ok(crate::session::proto::RecoverResponse {
             dealt_share,
@@ -536,7 +532,7 @@ impl Cosigner {
     /// that answers differently, derives another identifier and is told so instead of being handed
     /// a share that would not add up.
     pub(crate) fn dealt_share_for(&self, identifier: &[u8]) -> Result<Vec<u8>, Status> {
-        let key = self.host.wallet_key().map_err(|e| {
+        let key = wallet::wallet_key().map_err(|e| {
             Status::failed_precondition(format!(
                 "this wallet has no key ({e}): there is nothing to recover, create one instead"
             ))
@@ -553,15 +549,7 @@ impl Cosigner {
                  not be able to sign",
             ));
         }
-        self.host.dealt_share(identifier).map_err(Status::unavailable)
-    }
-
-    /// The runtime this instance is running inside.
-    ///
-    /// Cloned out rather than borrowed so a caller can hold it across an await without holding the
-    /// wallet's lock.
-    pub fn host(&self) -> Arc<dyn crate::host::Host> {
-        self.host.clone()
+        wallet::dealt_share(identifier).map_err(Status::unavailable)
     }
 }
 

@@ -1,10 +1,16 @@
 //! A small host for `policy.wasm`: the runtime's part, played by fakes, so a test can drive the
 //! very component a release ships, and not a native build of its library.
 //!
-//! It links the component as the runtime does: all of WASI, `wasi:http` both ways, and the four
-//! interfaces the runtime adds (tasks, notify, telemetry, cosign). Each call gets a fresh instance
+//! It links the component as the runtime does: all of WASI, `wasi:http` outgoing, and the four
+//! interfaces the runtime adds (tasks, notify, telemetry, signer). Each call gets a fresh instance
 //! over one tenant directory preopened as `/`, so state survives only through what the cosigner
-//! seals, as in an enclave.
+//! seals, as in an enclave. A call is made the way the runtime makes it: through the component's
+//! `enclave:rpc/service` export, with the messages as a stream, so the framing a client sees is
+//! the runtime's business and not this host's.
+//!
+//! It also runs the policy's own tests ([`run_command`], the `fake-host-run` binary): a test
+//! binary built for `wasm32-wasip2` calls the runtime's interfaces directly, and these fakes answer
+//! it, set up and read back through `enclave:fake-host/control`.
 //!
 //! What it fakes, and how:
 //!
@@ -31,16 +37,16 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use wasmtime::component::{
-    Component, ComponentType, InstancePre, Lift, Linker, Lower, Resource, ResourceTable,
-    ResourceType,
+    Component, ComponentType, Destination, FutureConsumer, InstancePre, Lift, Linker, Lower,
+    Resource, ResourceTable, ResourceType, Source, StreamConsumer, StreamProducer, StreamReader,
+    StreamResult,
 };
-use wasmtime::{Engine, Store};
+use wasmtime::{Config, Engine, Store, StoreContextMut};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-use wasmtime_wasi_http::p2::bindings::http::types::{ErrorCode, Scheme};
-use wasmtime_wasi_http::p2::bindings::ProxyPre;
+use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 use wasmtime_wasi_http::p2::types::{
     HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig,
@@ -65,6 +71,10 @@ pub struct Task {
 #[derive(Default)]
 pub struct Runtime {
     pub tasks: Mutex<BTreeMap<String, Task>>,
+    /// Each task the first time it was armed, in order, as it was armed.
+    pub enqueued: Mutex<Vec<(String, Task)>>,
+    /// Every cancel asked for, in order, whether or not there was a task to cancel.
+    pub cancelled: Mutex<Vec<String>>,
     pub devices: Mutex<Vec<String>>,
     pub wakes: Mutex<Vec<(String, Option<String>)>>,
     pub asp: Mutex<Asp>,
@@ -90,11 +100,14 @@ impl Runtime {
             }
             return Ok(());
         }
-        tasks.insert(id, Task { payload, run_at_ms, interval_ms, cancelled: false, runs: 0 });
+        let task = Task { payload, run_at_ms, interval_ms, cancelled: false, runs: 0 };
+        self.enqueued.lock().unwrap().push((id.clone(), task.clone()));
+        tasks.insert(id, task);
         Ok(())
     }
 
     fn cancel(&self, interactive: bool, id: &str) -> Result<(), String> {
+        self.cancelled.lock().unwrap().push(id.to_string());
         if !interactive {
             return Err(NOT_INTERACTIVE.into());
         }
@@ -162,6 +175,22 @@ impl Runtime {
         let group_key = key.group_key();
         *self.key.lock().unwrap() = Some(key);
         Ok(group_key)
+    }
+
+    /// Hold [key] from now on, as a DKG leaves the runtime: a key a test dealt itself.
+    pub fn hold(&self, key: key::WalletKey) {
+        *self.key.lock().unwrap() = Some(key);
+    }
+
+    /// Back to a tenant that never registered: no key, no tasks, no devices, nothing recorded.
+    pub fn reset(&self) {
+        self.tasks.lock().unwrap().clear();
+        self.enqueued.lock().unwrap().clear();
+        self.cancelled.lock().unwrap().clear();
+        self.devices.lock().unwrap().clear();
+        self.wakes.lock().unwrap().clear();
+        *self.key.lock().unwrap() = None;
+        *self.pending.lock().unwrap() = None;
     }
 
     fn wallet_key(&self, interactive: bool) -> Result<key::WalletKey, String> {
@@ -243,6 +272,19 @@ pub struct State {
     interactive: bool,
 }
 
+impl State {
+    fn new(wasi: WasiCtx, runtime: Arc<Runtime>, interactive: bool) -> Self {
+        State {
+            wasi,
+            table: ResourceTable::new(),
+            http: WasiHttpCtx::new(),
+            hooks: Egress(runtime.clone()),
+            runtime,
+            interactive,
+        }
+    }
+}
+
 impl WasiView for State {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView { ctx: &mut self.wasi, table: &mut self.table }
@@ -295,11 +337,31 @@ impl WasiHttpHooks for Egress {
     }
 }
 
+/// The component's `enclave:rpc/service`, as the runtime calls it.
+mod rpc {
+    wasmtime::component::bindgen!({ path: "../../wit/rpc", world: "enclave:rpc/server" });
+}
+
+/// `enclave:fake-host/control`, which a test inside this host sets its fakes up through.
+mod control {
+    wasmtime::component::bindgen!({ path: "../../wit/fake-host", world: "enclave:fake-host/tester" });
+}
+
+use control::enclave::fake_host::control as ctl;
+use rpc::exports::enclave::rpc::service::Status;
+
+/// An engine as the runtime configures one: async exports, streams and futures on.
+fn engine() -> Result<Engine> {
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    Ok(Engine::new(&config)?)
+}
+
 /// The host: one component, one tenant, and the fakes it runs against.
 pub struct Host {
     engine: Engine,
     pre: InstancePre<State>,
-    proxy: ProxyPre<State>,
+    server: rpc::ServerPre<State>,
     dir: tempfile::TempDir,
     settings: Vec<(String, String)>,
     pub runtime: Arc<Runtime>,
@@ -309,15 +371,15 @@ impl Host {
     /// Load [wasm], deployed with [settings]: the guest's environment, as the runtime gives a
     /// guest the settings measured with it. `ASP_URL` is [`ASP_ORIGIN`] unless [settings] say.
     pub fn new(wasm: &Path, settings: &[(&str, &str)]) -> Result<Self> {
-        let engine = Engine::default();
+        let engine = engine()?;
         let component = Component::from_file(&engine, wasm)
             .map_err(|e| anyhow!("loading {}: {e}", wasm.display()))?;
         let linker = linker(&engine)?;
         let pre = linker
             .instantiate_pre(&component)
             .map_err(|e| anyhow!("linking the component: {e}"))?;
-        let proxy = ProxyPre::new(pre.clone())
-            .map_err(|e| anyhow!("the component serves no wasi:http: {e}"))?;
+        let server = rpc::ServerPre::new(pre.clone())
+            .map_err(|e| anyhow!("the component exports no enclave:rpc/service: {e}"))?;
         let mut settings: Vec<(String, String)> =
             settings.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         if !settings.iter().any(|(k, _)| k == "ASP_URL") {
@@ -326,7 +388,7 @@ impl Host {
         Ok(Self {
             engine,
             pre,
-            proxy,
+            server,
             dir: tempfile::tempdir()?,
             settings,
             runtime: Arc::default(),
@@ -339,38 +401,38 @@ impl Host {
         wasi.envs(&self.settings);
         // The guest's own logs, in the test's output.
         wasi.inherit_stdout().inherit_stderr();
-        Ok(Store::new(
-            &self.engine,
-            State {
-                wasi: wasi.build(),
-                table: ResourceTable::new(),
-                http: WasiHttpCtx::new(),
-                hooks: Egress(self.runtime.clone()),
-                runtime: self.runtime.clone(),
-                interactive,
-            },
-        ))
+        Ok(Store::new(&self.engine, State::new(wasi.build(), self.runtime.clone(), interactive)))
     }
 
-    /// Open the gRPC stream [method] of `cosigner.v1.Cosigner`, on a fresh instance.
+    /// Open the call [method] of `cosigner.v1.Cosigner`, on a fresh instance.
     pub async fn call(&self, method: &str) -> Result<Call> {
         let mut store = self.store(true)?;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let request = hyper::Request::builder()
-            .method("POST")
-            .uri(format!("http://cosigner.test/cosigner.v1.Cosigner/{method}"))
-            .header("content-type", "application/grpc+proto")
-            .body(Inbound(rx))?;
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let req = store.data_mut().http().new_incoming_request(Scheme::Http, request)?;
-        let out = store.data_mut().http().new_response_outparam(sender)?;
-        let proxy = self.proxy.instantiate_async(&mut store).await?;
-        let guest = tokio::spawn(async move {
-            proxy.wasi_http_incoming_handler().call_handle(&mut store, req, out).await
+        let guest = self.server.instantiate_async(&mut store).await?;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (replies_tx, replies_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+        let path = format!("/cosigner.v1.Cosigner/{method}");
+        // The store's event loop is what moves the streams, so it runs for the whole call.
+        let task = tokio::spawn(async move {
+            store
+                .run_concurrent(async move |a| -> wasmtime::Result<()> {
+                    let requests = a.with(|mut s| StreamReader::new(&mut s, Requests(rx)))?;
+                    let (replies, outcome) =
+                        guest.enclave_rpc_service().call_call(a, path, requests).await?;
+                    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                    a.with(|mut s| -> wasmtime::Result<()> {
+                        replies.pipe(&mut s, Replies(replies_tx))?;
+                        outcome.pipe(&mut s, Outcome(Some(done_tx)))?;
+                        Ok(())
+                    })?;
+                    if let Ok(outcome) = done_rx.await {
+                        let _ = status_tx.send(outcome);
+                    }
+                    Ok(())
+                })
+                .await?
         });
-        // Not awaited here: a unary call answers only once it has read the whole request, so the
-        // head arrives after the test has sent it, not before.
-        Ok(Call { tx: Some(tx), head: Some(receiver), body: None, buf: BytesMut::new(), _guest: guest })
+        Ok(Call { tx: Some(tx), replies: replies_rx, status: Some(status_rx), _guest: task })
     }
 
     /// A unary call: one message in, one out.
@@ -431,27 +493,19 @@ impl Host {
     }
 }
 
-/// The client's end of one gRPC stream.
+/// The client's end of one call.
 pub struct Call {
-    tx: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
-    head: Option<
-        tokio::sync::oneshot::Receiver<Result<hyper::Response<HyperOutgoingBody>, ErrorCode>>,
-    >,
-    body: Option<HyperOutgoingBody>,
-    buf: BytesMut,
+    tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    replies: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    status: Option<tokio::sync::oneshot::Receiver<Result<(), Status>>>,
     _guest: tokio::task::JoinHandle<wasmtime::Result<()>>,
 }
 
 impl Call {
-    /// Send one message, framed.
+    /// Send one message.
     pub fn send<M: prost::Message>(&self, message: &M) {
-        let encoded = message.encode_to_vec();
-        let mut frame = BytesMut::with_capacity(5 + encoded.len());
-        frame.extend_from_slice(&[0]);
-        frame.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&encoded);
         if let Some(tx) = &self.tx {
-            let _ = tx.send(frame.freeze());
+            let _ = tx.send(message.encode_to_vec());
         }
     }
 
@@ -460,80 +514,203 @@ impl Call {
         self.tx = None;
     }
 
-    /// The response's body, once the guest has answered with its head.
-    async fn body(&mut self) -> Result<&mut HyperOutgoingBody> {
-        if let Some(head) = self.head.take() {
-            let response = tokio::time::timeout(Duration::from_secs(60), head)
-                .await
-                .context("the guest did not answer for a minute")?
-                .map_err(|_| anyhow!("the guest never answered"))?
-                .map_err(|e| anyhow!("the guest failed the request: {e:?}"))?;
-            self.body = Some(response.into_body());
-        }
-        self.body.as_mut().ok_or_else(|| anyhow!("no response"))
-    }
-
-    /// The guest's next message. Its trailers instead are an error carrying them.
+    /// The guest's next message. Its status instead is an error carrying it.
     pub async fn next<M: prost::Message + Default>(&mut self) -> Result<M> {
-        loop {
-            if self.buf.len() >= 5 {
-                let len = u32::from_be_bytes(self.buf[1..5].try_into().unwrap()) as usize;
-                if self.buf.len() >= 5 + len {
-                    self.buf.advance(5);
-                    let message = self.buf.split_to(len);
-                    return Ok(M::decode(message)?);
-                }
-            }
-            let body = self.body().await?;
-            let frame = tokio::time::timeout(Duration::from_secs(60), body.frame())
-                .await
-                .context("the guest said nothing for a minute")?
-                .ok_or_else(|| anyhow!("the stream ended before its next message"))?
-                .map_err(|e| anyhow!("the stream failed: {e:?}"))?;
-            match frame.into_data() {
-                Ok(data) => self.buf.extend_from_slice(&data),
-                Err(frame) => {
-                    let trailers = frame.into_trailers().unwrap_or_default();
-                    bail!("the stream ended instead: {}", status_of(&trailers).join(": "));
-                }
+        let next = tokio::time::timeout(Duration::from_secs(60), self.replies.recv())
+            .await
+            .context("the guest said nothing for a minute")?;
+        match next {
+            Some(message) => Ok(M::decode(message.as_slice())?),
+            None => {
+                let (status, message) = self.status().await?;
+                bail!("the stream ended instead: {status}: {message}")
             }
         }
     }
 
-    /// How the stream ended: `grpc-status` and `grpc-message`.
+    /// How the call ended: its status code and message, as `grpc-status` and `grpc-message`
+    /// would carry them.
     pub async fn finish(mut self) -> Result<(String, String)> {
         self.close();
-        let body = self.body().await?;
-        while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|e| anyhow!("the stream failed: {e:?}"))?;
-            if let Ok(trailers) = frame.into_trailers() {
-                let [status, message] = status_of(&trailers);
-                return Ok((status, message));
-            }
-        }
-        bail!("the stream ended without trailers")
+        // Whatever was still coming is skipped, as a client reading for trailers would.
+        while tokio::time::timeout(Duration::from_secs(60), self.replies.recv())
+            .await
+            .context("the guest said nothing for a minute")?
+            .is_some()
+        {}
+        self.status().await
+    }
+
+    async fn status(&mut self) -> Result<(String, String)> {
+        let status = self.status.take().ok_or_else(|| anyhow!("the status was already read"))?;
+        let outcome = tokio::time::timeout(Duration::from_secs(60), status)
+            .await
+            .context("the guest gave no status for a minute")?
+            .map_err(|_| anyhow!("the guest ended the call without a status"))?;
+        Ok(match outcome {
+            Ok(()) => ("0".into(), String::new()),
+            Err(s) => (s.code.to_string(), s.message),
+        })
     }
 }
 
-fn status_of(trailers: &hyper::HeaderMap) -> [String; 2] {
-    let read = |name: &str| {
-        trailers.get(name).map(|v| v.to_str().unwrap_or("").to_string()).unwrap_or_default()
-    };
-    [read("grpc-status"), read("grpc-message")]
-}
+/// The client's messages, as the guest's request stream: nothing yet is `Pending`, as on a live
+/// connection, and a closed sender is the client's half-close.
+struct Requests(tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>);
 
-/// A request body fed by the test as it goes: nothing yet is `Pending`, as on a live connection.
-struct Inbound(tokio::sync::mpsc::UnboundedReceiver<Bytes>);
+impl<D> StreamProducer<D> for Requests {
+    type Item = Vec<u8>;
+    type Buffer = Option<Vec<u8>>;
 
-impl http_body::Body for Inbound {
-    type Data = Bytes;
-    type Error = ErrorCode;
-
-    fn poll_frame(
+    fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<http_body::Frame<Bytes>, ErrorCode>>> {
-        self.0.poll_recv(cx).map(|bytes| bytes.map(|b| Ok(http_body::Frame::data(b))))
+        mut store: StoreContextMut<'a, D>,
+        mut destination: Destination<'a, Vec<u8>, Option<Vec<u8>>>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        if destination.remaining(&mut store) == Some(0) {
+            return Poll::Ready(Ok(StreamResult::Completed));
+        }
+        match self.0.poll_recv(cx) {
+            Poll::Ready(Some(message)) => {
+                destination.set_buffer(Some(message));
+                Poll::Ready(Ok(StreamResult::Completed))
+            }
+            Poll::Ready(None) => Poll::Ready(Ok(StreamResult::Dropped)),
+            Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// The guest's replies, handed to the test as they come.
+struct Replies(tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
+
+impl<D> StreamConsumer<D> for Replies {
+    type Item = Vec<u8>;
+
+    fn poll_consume(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        mut store: StoreContextMut<D>,
+        mut source: Source<'_, Vec<u8>>,
+        _: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        let mut one = None;
+        source.read(&mut store, &mut one)?;
+        let gone = one.is_some_and(|message| self.0.send(message).is_err());
+        Poll::Ready(Ok(if gone { StreamResult::Dropped } else { StreamResult::Completed }))
+    }
+}
+
+/// The guest's status, once it writes one.
+struct Outcome(Option<tokio::sync::oneshot::Sender<Result<(), Status>>>);
+
+impl<D> FutureConsumer<D> for Outcome {
+    type Item = Result<(), Status>;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        mut store: StoreContextMut<D>,
+        mut source: Source<'_, Self::Item>,
+        _: bool,
+    ) -> Poll<wasmtime::Result<()>> {
+        let mut value = None;
+        source.read(&mut store, &mut value)?;
+        if let (Some(tx), Some(value)) = (self.0.take(), value) {
+            let _ = tx.send(value);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Run [wasm], a `wasi:cli` command such as a test binary built for `wasm32-wasip2`, with [args],
+/// against these fakes. What `fake-host-run` is: cargo's runner for the policy's tests.
+///
+/// The command sees this process's stdio and environment, and a fresh temporary directory as
+/// `/tmp` (`TMPDIR`). Returns the command's exit code.
+pub async fn run_command(wasm: &Path, args: &[String]) -> Result<i32> {
+    let engine = engine()?;
+    let component = Component::from_file(&engine, wasm)
+        .map_err(|e| anyhow!("loading {}: {e}", wasm.display()))?;
+    let mut linker = linker(&engine)?;
+    control::Tester::add_to_linker::<State, wasmtime::component::HasSelf<State>>(
+        &mut linker,
+        |s| s,
+    )?;
+
+    let tmp = tempfile::tempdir()?;
+    let mut wasi = WasiCtxBuilder::new();
+    let name = wasm.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    wasi.arg(name).args(args);
+    wasi.inherit_stdio().inherit_env().env("TMPDIR", "/tmp");
+    wasi.preopened_dir(tmp.path(), "/tmp", DirPerms::all(), FilePerms::all())?;
+    let mut store =
+        Store::new(&engine, State::new(wasi.build(), Arc::new(Runtime::default()), true));
+
+    let command =
+        wasmtime_wasi::p2::bindings::Command::instantiate_async(&mut store, &component, &linker)
+            .await
+            .map_err(|e| anyhow!("instantiating {}: {e}", wasm.display()))?;
+    match command.wasi_cli_run().call_run(&mut store).await {
+        Ok(Ok(())) => Ok(0),
+        Ok(Err(())) => Ok(1),
+        // `std::process::exit`, which is how a failing test binary ends.
+        Err(e) => match e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+            Some(exit) => Ok(exit.0),
+            None => Err(e.into()),
+        },
+    }
+}
+
+impl ctl::Host for State {
+    fn hold(
+        &mut self,
+        key_package: String,
+        public_key_package: String,
+        wallet_identifier: Vec<u8>,
+        dealt: Vec<u8>,
+    ) {
+        let identifier: [u8; 32] =
+            wallet_identifier.try_into().expect("a wallet identifier is 32 bytes");
+        self.runtime.hold(key::WalletKey {
+            key_package: threshold::keys::KeyPackage::from_json(&key_package)
+                .expect("threshold's key package JSON"),
+            public_key_package: threshold::keys::PublicKeyPackage::from_json(&public_key_package)
+                .expect("threshold's public key package JSON"),
+            wallet: threshold::identifier::Identifier::deserialize(&identifier)
+                .expect("a wallet identifier"),
+            dealt,
+        });
+    }
+
+    fn reset(&mut self) {
+        self.runtime.reset();
+    }
+
+    fn enqueued(&mut self) -> Vec<ctl::Task> {
+        self.runtime
+            .enqueued
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, task)| ctl::Task {
+                id: id.clone(),
+                payload: task.payload.clone(),
+                run_at: task.run_at_ms,
+                interval_ms: task.interval_ms,
+            })
+            .collect()
+    }
+
+    fn woken(&mut self) -> Vec<(String, Option<String>)> {
+        self.runtime.wakes()
+    }
+
+    fn cancelled(&mut self) -> Vec<String> {
+        self.runtime.cancelled.lock().unwrap().clone()
     }
 }
 

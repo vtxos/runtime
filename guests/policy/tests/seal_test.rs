@@ -7,12 +7,13 @@
 
 mod common;
 
-/// Open from the seal, with no runtime around it.
+/// Open from the seal, in a runtime holding no wallet key.
 fn open(
     store: std::sync::Arc<policy::store::Store>,
     group_key: String,
-) -> Result<policy::Cosigner, policy::grpc::Status> {
-    policy::Cosigner::open(store, group_key, std::sync::Arc::new(policy::host::Detached))
+) -> Result<policy::Cosigner, policy::status::Status> {
+    common::Recorder::default();
+    policy::Cosigner::open(store, group_key)
 }
 
 /// A seal that is there and cannot be read refuses to open as an empty wallet.

@@ -20,7 +20,7 @@
 
 mod common;
 
-use policy::grpc::Code;
+use policy::status::Code;
 use policy::session::proto;
 use policy::wallet_proto as wp;
 use policy::Cosigner;
@@ -254,6 +254,9 @@ fn an_identifier_the_ceremony_never_saw_is_refused_on_every_stream() {
     for stream in STREAMS {
         let Some(w) = wallet() else { return };
         let Some(stranger) = wallet() else { return };
+        // The call runs in `w`'s runtime, holding `w`'s key. The fake host holds one tenant's key
+        // at a time, the last one made, so it is named.
+        common::Recorder::holding(&w.test);
         let first = open(stream, w, stranger.identifier());
         assert_eq!(
             first.code(),
@@ -275,10 +278,14 @@ fn one_tenants_instance_does_not_answer_for_another_tenants_wallet() {
         };
         let (id_a, id_b) = (a.identifier(), b.identifier());
 
+        // Each call runs in its own tenant's runtime, holding that tenant's key. The fake host
+        // holds one at a time, so each is named.
+        common::Recorder::holding(&a.test);
         let b_on_a = open(stream, a, id_b);
         assert_eq!(b_on_a.code(), Code::PermissionDenied as u32, "{stream}: {}", b_on_a.message());
         assert_eq!(b_on_a.answered(), 0);
 
+        common::Recorder::holding(&b.test);
         let a_on_b = open(stream, b, id_a);
         assert_eq!(a_on_b.code(), Code::PermissionDenied as u32, "{stream}: {}", a_on_b.message());
         assert_eq!(a_on_b.answered(), 0);

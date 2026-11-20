@@ -1,0 +1,9 @@
+# The policy is a wasm component, and so are its tests: they run inside the fake host, which plays
+# the runtime they call. `cargo test` here builds them for wasm32-wasip2 and hands each binary to
+# `fake-host-run` (guests/fake-host). `nix develop .#policy` puts it on PATH, with the clang that
+# secp256k1-sys needs for wasm.
+[build]
+target = "wasm32-wasip2"
+
+[target.wasm32-wasip2]
+runner = "fake-host-run"

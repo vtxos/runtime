@@ -1,4 +1,5 @@
-//! Dispatching an incoming HTTP request into a `wasi:http/proxy` guest.
+//! Dispatching an incoming HTTP request into the guest: a `wasi:http/proxy` guest as HTTP, or an
+//! `enclave:rpc/service` guest as gRPC ended here (see [`crate::serve::grpc`]).
 //!
 //! **One instance per request. No two requests ever share one.**
 //!
@@ -18,12 +19,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
-use wasmtime::component::{Component, InstancePre};
+use wasmtime::component::{Component, InstancePre, Resource};
 use wasmtime::{Engine, Store, UpdateDeadline};
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+use wasmtime_wasi_http::p2::types::{HostIncomingRequest, HostResponseOutparam};
 use wasmtime_wasi_http::p2::WasiHttpView;
 
 use crate::auth::{AuthEndpoints, Gate};
@@ -31,6 +33,7 @@ use crate::linker::build_linker;
 use crate::run::GuestEnvironment;
 use crate::serve::attest::{nonce_from_headers, ResponseAttestor};
 use crate::serve::client::apply_tenant;
+use crate::serve::grpc;
 use crate::serve::pool::{PoolLimits, TenantPool};
 use crate::serve::progress::{Counting, StreamProgress};
 use crate::serve::tls::TlsIdentity;
@@ -148,16 +151,64 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// holds it until the process ends.
 const DEFAULT_MAX_INTERACTION: Duration = Duration::from_secs(300);
 
-/// A guest instance and the store it is bound to, for one call.
-///
-/// The two travel together because `instantiate_async` binds a `Proxy` to one
-/// store: separating them would produce a handle that looks usable and
-/// resolves against the wrong memory.
+/// The store one call runs in.
 struct GuestInstance {
     store: Store<State>,
-    proxy: wasmtime_wasi_http::p2::bindings::Proxy,
     /// Shared with this store's epoch callback.
     progress: Arc<StreamProgress>,
+}
+
+/// What the guest is, by what it exports.
+enum GuestShape {
+    /// `wasi:http/incoming-handler`: the guest serves HTTP itself.
+    Http(ProxyPre<State>),
+    /// `enclave:rpc/service`: the runtime ends gRPC, and the guest sees messages.
+    Rpc(grpc::ServerPre<State>),
+}
+
+/// Where a guest's response head arrives.
+type Head = std::result::Result<
+    hyper::Response<HyperOutgoingBody>,
+    wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
+>;
+
+/// One call, ready to run in the store it was prepared in.
+///
+/// An HTTP guest's instance and request already live in that store, as guest resources: an
+/// instance binds to one store, and separating them would produce a handle that looks usable and
+/// resolves against the wrong memory. An rpc guest is instantiated inside the call, where its
+/// streams can run.
+// One per request, made and moved once: boxing either variant would buy nothing.
+#[allow(clippy::large_enum_variant)]
+enum Call<B> {
+    Http {
+        proxy: wasmtime_wasi_http::p2::bindings::Proxy,
+        req: Resource<HostIncomingRequest>,
+        out: Resource<HostResponseOutparam>,
+    },
+    Rpc {
+        pre: grpc::ServerPre<State>,
+        req: hyper::Request<Counting<B>>,
+        head: tokio::sync::oneshot::Sender<Head>,
+    },
+}
+
+impl<B> Call<B>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
+    B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
+{
+    async fn run(self, store: &mut Store<State>) -> wasmtime::Result<()> {
+        match self {
+            Call::Http { proxy, req, out } => {
+                proxy
+                    .wasi_http_incoming_handler()
+                    .call_handle(store, req, out)
+                    .await
+            }
+            Call::Rpc { pre, req, head } => grpc::serve(store, &pre, req, head).await,
+        }
+    }
 }
 
 /// A compiled guest plus the environment its instances are built from.
@@ -167,7 +218,7 @@ struct GuestInstance {
 /// component that will not compile fails at boot rather than on the first
 /// request to arrive.
 pub struct ServeHandle {
-    pre: ProxyPre<State>,
+    shape: GuestShape,
     background_pre: InstancePre<State>,
     tasks: Option<Arc<crate::tasks::TaskQueue>>,
     notify: Option<Arc<crate::notify::Notifier>>,
@@ -244,6 +295,9 @@ impl ServeHandle {
     pub fn engine_with_watchdog() -> Result<Engine> {
         let mut config = wasmtime::Config::new();
         config.epoch_interruption(true);
+        // Async exports, streams and futures: what an `enclave:rpc/service` guest is made of.
+        // A `wasi:http` guest uses none of it and is served as before.
+        config.wasm_component_model_async(true);
         let engine = Engine::new(&config)?;
 
         let ticker = engine.weak();
@@ -279,9 +333,15 @@ impl ServeHandle {
             .instantiate_pre(&component)
             .map_err(|e| anyhow::anyhow!(e.to_string()))
             .context("pre-instantiating guest component")?;
-        let pre = ProxyPre::new(instance_pre.clone())
-            .map_err(|e| anyhow::anyhow!(e.to_string()))
-            .context("guest does not export wasi:http/incoming-handler")?;
+        let shape = match grpc::ServerPre::new(instance_pre.clone()) {
+            Ok(pre) => GuestShape::Rpc(pre),
+            Err(rpc) => GuestShape::Http(ProxyPre::new(instance_pre.clone()).map_err(|http| {
+                anyhow::anyhow!(
+                    "the guest exports neither enclave:rpc/service ({rpc}) nor \
+                     wasi:http/incoming-handler ({http})"
+                )
+            })?),
+        };
 
         Ok(ServeHandle {
             background_pre: instance_pre,
@@ -289,7 +349,7 @@ impl ServeHandle {
             notify: None,
             signer_keys: None,
             telemetry: Default::default(),
-            pre,
+            shape,
             guest: Arc::new(guest),
             anonymous: Arc::new(tokio::sync::Mutex::new(())),
             timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -355,7 +415,7 @@ impl ServeHandle {
     ) -> Result<Vec<u8>> {
         let work = async {
             let state = self.tenant_state(job.tenant).await?;
-            let mut store = Store::new(self.pre.engine(), state);
+            let mut store = Store::new(self.background_pre.engine(), state);
             // Yield every tick, even in CPU-only loops, so the wall deadline
             // can cancel both guest code and async host calls.
             store.set_epoch_deadline(1);
@@ -540,7 +600,7 @@ impl ServeHandle {
         // a release reaches no tenant's data any other way.
         let dir = self.guest.zfs().attached_dir(tenant_id)?;
 
-        let mut instance = self.instantiate(&dir).await?;
+        let mut instance = self.store_for(&dir)?;
         instance.store.data_mut().tasks =
             self.tasks.as_ref().map(|queue| crate::tasks::TaskContext {
                 queue: queue.clone(),
@@ -569,20 +629,10 @@ impl ServeHandle {
                     tenant: tenant_id,
                 });
         let progress = instance.progress.clone();
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        // Wrapped before it becomes a guest resource, which is the last point
-        // the runtime holds it.
+        // Wrapped before it becomes the guest's, which is the last point the
+        // runtime holds it.
         let req = req.map(|body| Counting::new(body, progress.clone()));
-        let req = instance
-            .store
-            .data_mut()
-            .http()
-            .new_incoming_request(scheme, req)?;
-        let out = instance
-            .store
-            .data_mut()
-            .http()
-            .new_response_outparam(sender)?;
+        let (call, receiver) = self.prepare(&mut instance.store, scheme, req).await?;
 
         let zfs = self.guest.zfs().clone();
         let notify = self.notify.clone();
@@ -597,11 +647,7 @@ impl ServeHandle {
             let _guard = guard;
             let _checkout = checkout;
             let mut instance = instance;
-            let result = instance
-                .proxy
-                .wasi_http_incoming_handler()
-                .call_handle(&mut instance.store, req, out)
-                .await;
+            let result = call.run(&mut instance.store).await;
             if result.is_err() {
                 tracing::warn!("guest trapped; its instance dies with the call");
             }
@@ -632,25 +678,53 @@ impl ServeHandle {
         self.guest.new_state(Some(&dir))
     }
 
-    /// Build an instance whose guest sees `dir` as `/`.
+    /// A store whose guest sees `dir` as `/`, watched by the epoch.
     ///
     /// Every tenant request gets one, used for that call and dropped with it.
-    async fn instantiate(&self, dir: &std::path::Path) -> Result<GuestInstance> {
-        let mut store = Store::new(self.pre.engine(), self.guest.new_state(Some(dir))?);
+    fn store_for(&self, dir: &std::path::Path) -> Result<GuestInstance> {
+        let mut store = Store::new(
+            self.background_pre.engine(),
+            self.guest.new_state(Some(dir))?,
+        );
         let progress = Arc::new(StreamProgress::new());
         store.set_epoch_deadline(self.watchdog());
         self.arm_watchdog(&mut store, progress.clone());
-        let proxy = self
-            .pre
-            .instantiate_async(&mut store)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))
-            .context("instantiating the guest")?;
-        Ok(GuestInstance {
-            store,
-            proxy,
-            progress,
-        })
+        Ok(GuestInstance { store, progress })
+    }
+
+    /// Ready one call in `store`, and where its response head will arrive.
+    ///
+    /// An HTTP guest is instantiated here, so one that will not start fails
+    /// before anything is spawned; an rpc guest is instantiated inside the call.
+    async fn prepare<B>(
+        &self,
+        store: &mut Store<State>,
+        scheme: Scheme,
+        req: hyper::Request<Counting<B>>,
+    ) -> Result<(Call<B>, tokio::sync::oneshot::Receiver<Head>)>
+    where
+        B: hyper::body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
+        B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
+    {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let call = match &self.shape {
+            GuestShape::Http(pre) => {
+                let proxy = pre
+                    .instantiate_async(&mut *store)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+                    .context("instantiating the guest")?;
+                let req = store.data_mut().http().new_incoming_request(scheme, req)?;
+                let out = store.data_mut().http().new_response_outparam(sender)?;
+                Call::Http { proxy, req, out }
+            }
+            GuestShape::Rpc(pre) => Call::Rpc {
+                pre: pre.clone(),
+                req,
+                head: sender,
+            },
+        };
+        Ok((call, receiver))
     }
 
     /// Let a call that is moving bytes outlive the budget; keep one that is not
@@ -710,19 +784,16 @@ impl ServeHandle {
         // dataset: never anything that would hand an unauthenticated guest a
         // tenant's records.
         let dir = self.guest.zfs().anonymous_dir().await?;
-        let mut store = Store::new(self.pre.engine(), self.guest.new_state(Some(&dir))?);
+        let GuestInstance {
+            mut store,
+            progress,
+        } = self.store_for(&dir)?;
         store.data_mut().telemetry = Some(
             self.telemetry
                 .context(ANONYMOUS, crate::telemetry::Invocation::Request),
         );
-        let progress = Arc::new(StreamProgress::new());
-        store.set_epoch_deadline(self.watchdog());
-        self.arm_watchdog(&mut store, progress.clone());
-        let (sender, receiver) = tokio::sync::oneshot::channel();
         let req = req.map(|body| Counting::new(body, progress.clone()));
-        let req = store.data_mut().http().new_incoming_request(scheme, req)?;
-        let out = store.data_mut().http().new_response_outparam(sender)?;
-        let pre = self.pre.clone();
+        let (call, receiver) = self.prepare(&mut store, scheme, req).await?;
         let zfs = self.guest.zfs().clone();
         let (anchored_tx, anchored_rx) = tokio::sync::oneshot::channel();
 
@@ -731,11 +802,8 @@ impl ServeHandle {
         // it is held for the whole call rather than released at the head.
         let task = tokio::task::spawn(async move {
             let _anonymous = anonymous;
-            let proxy = pre.instantiate_async(&mut store).await?;
-            let result = proxy
-                .wasi_http_incoming_handler()
-                .call_handle(store, req, out)
-                .await;
+            let mut store = store;
+            let result = call.run(&mut store).await;
             let _ = anchored_tx.send(zfs.anchor_tenant(ANONYMOUS).await);
             result
         });
@@ -758,13 +826,15 @@ impl ServeHandle {
     /// which is nothing new: [`ServeHandle::in_fresh_instance`] runs it on
     /// every request already.
     pub async fn verify_instantiates(&self) -> Result<()> {
-        let mut store = Store::new(self.pre.engine(), self.guest.new_state(None)?);
+        let mut store = Store::new(self.background_pre.engine(), self.guest.new_state(None)?);
         // A deadline of its own, or a guest that hangs in `start` would hang
         // the boot rather than failing it.
         store.set_epoch_deadline(self.watchdog());
-        self.pre
-            .instantiate_async(&mut store)
-            .await
+        let started = match &self.shape {
+            GuestShape::Http(pre) => pre.instantiate_async(&mut store).await.map(drop),
+            GuestShape::Rpc(pre) => pre.instantiate_async(&mut store).await.map(drop),
+        };
+        started
             .map_err(|e| anyhow::anyhow!(e.to_string()))
             .context("instantiating the guest")?;
         if self.tasks.is_some() {
