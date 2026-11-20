@@ -57,13 +57,14 @@ and not committed. Generate them, with the libraries, for one platform or both:
 
 ```sh
 yarn                # Node from .nvmrc; Yarn through corepack
-yarn ubrn:android   # the four ABIs, with cargo-ndk and NDK 27 (ANDROID_NDK_HOME)
+yarn ubrn:android   # arm64-v8a and x86_64, with cargo-ndk and NDK 27 (ANDROID_NDK_HOME)
 yarn ubrn:ios       # devices and the simulator, into an xcframework; macOS only
 yarn typecheck
 ```
 
-Both need `protoc` and the Rust targets: `aarch64-linux-android`, `armv7-linux-androideabi`,
-`i686-linux-android` and `x86_64-linux-android`, or `aarch64-apple-ios` and `aarch64-apple-ios-sim`.
+Both need `protoc` and the Rust targets: `aarch64-linux-android` and `x86_64-linux-android`, or
+`aarch64-apple-ios` and `aarch64-apple-ios-sim`. Android is 64-bit only, so an app using the package
+must build just `arm64-v8a` and `x86_64` (`reactNativeArchitectures` in its `gradle.properties`).
 [`scripts/ci-mobile-android.sh`](../../scripts/ci-mobile-android.sh) and
 [`scripts/ci-mobile-ios.sh`](../../scripts/ci-mobile-ios.sh) do exactly what CI does.
 

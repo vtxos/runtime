@@ -4,11 +4,10 @@ rust:
   directory: ../mobile
   manifestPath: vtxos-uniffi/Cargo.toml
 android:
-  # The four ABIs React Native apps ship.
+  # 64-bit only: phones (arm64-v8a), and emulators and Chromebooks (x86_64). An app using the
+  # package must build the same two (`reactNativeArchitectures`): the C++ links this per ABI.
   targets:
     - arm64-v8a
-    - armeabi-v7a
-    - x86
     - x86_64
   # React Native 0.86's own floor.
   apiLevel: 24
