@@ -16,8 +16,8 @@
 name: React Native release
 
 # To try a release without making one, push a branch named release-trial/<anything>, or run
-# this workflow by hand: both platforms are built exactly as for a release, and nothing is
-# published. Only a tag publishes.
+# this workflow by hand: both platforms are built and the package is put together and checked
+# exactly as for a release, and nothing is published. Only a tag publishes.
 on:
   push:
     tags: ["react-native-wallet-v*"]
@@ -96,9 +96,8 @@ jobs:
             clients/react-native/*.podspec
 
   publish:
-    name: Publish to npm
+    name: Package, and publish on a tag
     needs: [android, ios]
-    if: startsWith(github.ref, 'refs/tags/react-native-wallet-v')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -124,6 +123,7 @@ jobs:
           path: clients/react-native
       - run: corepack enable && yarn install --immutable
       - name: The version, from the tag
+        if: startsWith(github.ref, 'refs/tags/react-native-wallet-v')
         run: |
           version="${GITHUB_REF_NAME#react-native-wallet-v}"
           if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
@@ -132,8 +132,16 @@ jobs:
           fi
           node -e 'const fs = require("fs"); const p = JSON.parse(fs.readFileSync("package.json", "utf8")); p.version = process.argv[1]; fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");' "$version"
           case "$version" in *-*) echo "DIST_TAG=next" ;; *) echo "DIST_TAG=latest" ;; esac >> "$GITHUB_ENV"
-      # What goes out, in the log: both platforms' files must be in it.
-      - run: npm pack --dry-run
-      - run: npm publish --provenance --access public --tag "$DIST_TAG"
+      # What goes out, in the log, and a check that both platforms' libraries are in it.
+      # 0.1.0-rc.2 was published without the iOS framework: both builds had passed, and the
+      # list of files to publish did not reach inside the framework's folder.
+      - name: What goes out, and that both platforms are in it
+        run: |
+          npm run prepare
+          npm pack --dry-run --json --ignore-scripts > "$RUNNER_TEMP/pack.json"
+          node ../../scripts/check-react-native-package.js "$RUNNER_TEMP/pack.json"
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/react-native-wallet-v')
+        run: npm publish --provenance --access public --tag "$DIST_TAG"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
