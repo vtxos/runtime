@@ -10,7 +10,6 @@ The runtime's interfaces, and the `enclave-wit` crate that carries them to a gue
 | [`enclave:telemetry`](telemetry/telemetry.wit) | Spans and metrics, attributed to the tenant |
 | [`enclave:rpc`](rpc/rpc.wit) | gRPC ended by the runtime: a guest exports `service` and sees only messages |
 | [`enclave:guest`](guest/guest.wit) | World `guest`: serves `enclave:rpc`, runs tasks, may import everything above |
-| [`enclave:fake-host`](fake-host/control.wit) | Tests only: what a test inside `guests/fake-host` sets its fakes up through |
 
 ## For a guest in Rust
 
@@ -20,6 +19,6 @@ Depend on this directory as a crate: by path inside this repository, by git from
 enclave-wit = { git = "https://github.com/vtxos/runtime", rev = "<commit>" }
 ```
 
-It generates the `guest` world's bindings: call `enclave_wit::enclave::signer::wallet::wallet_key()` and the rest directly, implement `enclave_wit::exports::enclave::rpc::service::Guest` and `enclave_wit::Guest`, then `enclave_wit::export!(YourType)`. The WIT files are read from this crate's own directory, so a guest keeps no copy. The `fake-host` feature adds `enclave_wit::fake_host`, for tests.
+It generates the `guest` world's bindings: call `enclave_wit::enclave::signer::wallet::wallet_key()` and the rest directly, implement `enclave_wit::exports::enclave::rpc::service::Guest` and `enclave_wit::Guest`, then `enclave_wit::export!(YourType)`. The WIT files are read from this crate's own directory, so a guest keeps no copy.
 
 `examples/guest-http` keeps copies under its `wit/deps/`, checked by `scripts/wit-drift.sh`; it is its own workspace and predates the crate.

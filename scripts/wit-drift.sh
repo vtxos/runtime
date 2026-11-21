@@ -51,12 +51,12 @@ while IFS= read -r copy; do
         diff -u "${canonical[0]}" "$copy" >&2 || true
         status=1
     fi
-done < <(find examples guests -type f -path '*/wit/deps/*.wit' -not -path '*/target/*' | sort)
+done < <(find examples -type f -path '*/wit/deps/*.wit' -not -path '*/target/*' | sort)
 
 # A check that silently covers nothing is worse than no check, because it still
 # reports green. If the vendored copies move, this says so instead.
 if (( found == 0 )); then
-    echo "no vendored WIT found under examples/*/wit/deps/ or guests/*/wit/deps/ — this check has stopped checking anything" >&2
+    echo "no vendored WIT found under examples/*/wit/deps/ — this check has stopped checking anything" >&2
     exit 1
 fi
 

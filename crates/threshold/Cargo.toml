@@ -21,7 +21,7 @@ hkdf = { version = "0.12", default-features = false, optional = true }
 default = []
 std = ["k256/std", "sha2/std", "serde/std", "serde_json/std", "rand_core/std"]
 # Two-party threshold ECDH: RFC 9380 hash-to-curve and HKDF. A feature, so a
-# crate that only signs (the fake host, the cosigner's tests) resolves neither.
+# crate that only signs resolves neither.
 ecdh = ["k256/hash2curve", "dep:hkdf"]
 
 [dev-dependencies]

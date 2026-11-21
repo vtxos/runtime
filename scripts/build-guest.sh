@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build one example guest to a wasm32-wasip2 component.
 #
-#   build-guest.sh http | grpc | sqlite
+#   build-guest.sh http | grpc | signer | sqlite
 #
 # Each example is its own cargo workspace, so these do not share the root
 # target/ directory and have to be built by name rather than swept up by
@@ -9,7 +9,7 @@
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-guest="${1:?which guest: http, grpc or sqlite}"
+guest="${1:?which guest: http, grpc, signer or sqlite}"
 dir="$REPO/examples/guest-$guest"
 [[ -d "$dir" ]] || fail "no such guest: examples/guest-$guest"
 

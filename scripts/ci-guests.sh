@@ -18,6 +18,7 @@ say "WIT drift"
 
 "$REPO/scripts/build-guest.sh" http
 "$REPO/scripts/build-guest.sh" grpc
+"$REPO/scripts/build-guest.sh" signer
 
 # Built before the suites rather than between them: one of serve_auth's tests
 # drives this real binary as a subprocess instead of a stand-in, and skips
@@ -64,6 +65,10 @@ cargo test -p enclave-runtime --test serve_grpc_wire -- --include-ignored
 # connection it arrived on.
 say "interaction tokens, end to end"
 cargo test -p enclave-runtime --test serve_auth -- --include-ignored
+
+# `enclave:signer` is wired by hand, so a guest that imports it has to link.
+say "a guest that signs"
+cargo test -p enclave-runtime --test signer_guest -- --include-ignored
 
 say "guest logging"
 cargo test -p enclave-runtime --test guest_logs -- --include-ignored

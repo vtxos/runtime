@@ -23,17 +23,9 @@
     };
 
     crane.url = "github:ipetkov/crane";
-
-    # The policy guest's compiler: the exact release rust-toolchain.toml names,
-    # which needs a newer overlay than the runtime's `stable.latest` is pinned
-    # to. Its own input, so moving one never moves the other's bytes.
-    cosigner-rust-overlay = {
-      url = "github:oxalica/rust-overlay/e9d12b9d8266ed9afdc5add5537ec8b5f789645c";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, crane, cosigner-rust-overlay }:
+  outputs = { self, nixpkgs, rust-overlay, crane }:
     let
       # An EIF is x86_64 only. Nothing here is meant to build elsewhere, and
       # pretending otherwise would just produce a confusing failure.
@@ -62,18 +54,15 @@
           p = toString path;
           root = toString ./.;
           under = d: lib.hasPrefix "${root}/${d}/" p || p == "${root}/${d}";
-          # Workspace members the runtime does not build: their manifests stay
-          # (cargo loads every member), their code does not, so editing the
-          # policy guest or the crates only it and the services use leaves the
-          # runtime's store path, and its image's PCR0, alone. Their target
-          # paths are explicit, which is what lets cargo load them without it.
+          # A workspace member the runtime does not build: its manifest stays
+          # (cargo loads every member), its code does not, so editing it leaves
+          # the runtime's store path, and its image's PCR0, alone. Its target
+          # paths are explicit, which is what lets cargo load it without them.
           manifestOnly = d: under d && p != "${root}/${d}" && p != "${root}/${d}/Cargo.toml";
         in
-        # The example guests are separate workspaces, and so are the fake host and
-        # the mobile client.
-        !(under "examples" || under "guests/fake-host" || under "clients")
-        && !(manifestOnly "guests/policy" || manifestOnly "crates/ark"
-          || manifestOnly "crates/enclave-client")
+        # The example guests are separate workspaces, and so is the client.
+        !(under "examples" || under "clients")
+        && !(manifestOnly "crates/enclave-client")
         && ((lib.hasSuffix ".pem" path) || (lib.hasSuffix ".wit" path)
         || (craneLib.filterCargoSources path type));
 
@@ -157,99 +146,6 @@
       guest-http = craneLib.buildPackage (guestArgs // {
         cargoArtifacts = guestDeps;
       });
-
-      # ---- the policy guest ------------------------------------------------
-      # policy.wasm is what PCR16 measures for the guest, so anyone must be
-      # able to rebuild a release and get the same bytes. It is a member of this
-      # workspace, so its path dependencies hash by relative path; the compiler
-      # is the exact one rust-toolchain.toml names; the clang that compiles
-      # secp256k1-sys's C to wasm is pinned by flake.lock; and the build
-      # directory is mapped out of the binary.
-      policyPkgs = import nixpkgs {
-        inherit system;
-        overlays = [ (import cosigner-rust-overlay) ];
-      };
-      policyCraneLib = (crane.mkLib policyPkgs).overrideToolchain
-        (p: p.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml);
-      # Unwrapped: the wrapper's flags are the host's. secp256k1-sys brings its
-      # own wasm headers, so a clang with a wasm backend is all it needs.
-      policyClang = pkgs.llvmPackages.clang-unwrapped;
-      policyArgs = {
-        pname = "policy";
-        version = "0.1.0";
-        # The whole workspace's Rust, plus the protos its build scripts compile
-        # and the WIT its bindings come from.
-        src = lib.cleanSourceWith {
-          src = ./.;
-          filter = path: type:
-            let p = toString path; root = toString ./.; in
-            !(lib.hasPrefix "${root}/examples" p || lib.hasPrefix "${root}/guests/fake-host" p
-              || lib.hasPrefix "${root}/clients" p)
-            && (lib.hasSuffix ".proto" path || lib.hasSuffix ".wit" path
-              || lib.hasSuffix ".pem" path || policyCraneLib.filterCargoSources path type);
-          name = "policy-source";
-        };
-        cargoExtraArgs = "--locked -p policy --bin policy";
-        # Sized for the enclave; the runtime's own release profile is untouched.
-        CARGO_PROFILE = "wasm-release";
-        CARGO_BUILD_TARGET = "wasm32-wasip2";
-        strictDeps = true;
-        doCheck = false;
-        nativeBuildInputs = [ pkgs.protobuf ];
-        PROTOC = "${pkgs.protobuf}/bin/protoc";
-        CC_wasm32_wasip2 = "${policyClang}/bin/clang";
-        AR_wasm32_wasip2 = "${pkgs.llvmPackages.bintools-unwrapped}/bin/llvm-ar";
-        # Where the build ran must not reach the binary: a sandboxed Nix builds
-        # in /build, one without a sandbox in a temporary directory.
-        preBuild = ''
-          export RUSTFLAGS="''${RUSTFLAGS:-} --remap-path-prefix=$NIX_BUILD_TOP=/build"
-          export CFLAGS_wasm32_wasip2="-ffile-prefix-map=$NIX_BUILD_TOP=/build"
-        '';
-      };
-      policy = policyCraneLib.buildPackage (policyArgs // {
-        cargoArtifacts = policyCraneLib.buildDepsOnly policyArgs;
-      });
-
-      # ---- the fake host's runner ------------------------------------------
-      # cargo's runner for the policy's tests, which are wasm and call the
-      # runtime's interfaces: it runs each test binary against the fake host.
-      # The fake host is its own workspace, built from inside the tree because
-      # its path dependencies are.
-      fake-host-run = craneLib.buildPackage {
-        pname = "fake-host-run";
-        version = "0.1.0";
-        # Only the fake host and its path dependencies, so a change to the
-        # runtime does not rebuild it.
-        src = lib.cleanSourceWith {
-          src = ./.;
-          filter = path: type:
-            let
-              p = toString path;
-              root = toString ./.;
-              dirs = [ "guests" "guests/fake-host" "guests/policy" "crates" "crates/ark"
-                "crates/threshold" "wit" "protocol" "protocol/protos" ];
-              within = d: lib.hasPrefix "${root}/${d}/" p || p == "${root}/${d}";
-            in
-            (lib.elem (lib.removePrefix "${root}/" p) dirs
-              || lib.any within [ "guests/fake-host" "guests/policy" "crates/ark"
-                "crates/threshold" "wit" "protocol/protos" ])
-            && (lib.hasSuffix ".proto" path || lib.hasSuffix ".wit" path
-              || craneLib.filterCargoSources path type);
-          name = "fake-host-source";
-        };
-        cargoLock = ./guests/fake-host/Cargo.lock;
-        cargoToml = ./guests/fake-host/Cargo.toml;
-        postUnpack = ''
-          cd $sourceRoot/guests/fake-host
-          sourceRoot="."
-        '';
-        cargoExtraArgs = "--locked --bin fake-host-run";
-        # Only the runner: the fake host's dev-dependencies are the policy and
-        # its protos, which the runner never links.
-        cargoArtifacts = null;
-        strictDeps = true;
-        doCheck = false;
-      };
 
       # What an operator uploads to the roots bucket, and the PCR16 a key policy
       # pins for it. The guest is not in the enclave image: the runtime fetches
@@ -599,7 +495,7 @@
       lib.${system} = { inherit eifQemu mkEif; };
 
       packages.${system} = {
-        inherit enclave-runtime guest-http guest-release policy fake-host-run nsm-selftest nitro-attest eif-build blobs;
+        inherit enclave-runtime guest-http guest-release nsm-selftest nitro-attest eif-build blobs;
 
         # Both ends of the vsock from one package: `make build` emits gvproxy
         # for the parent and gvforwarder for the enclave, so they cannot drift.
@@ -669,21 +565,6 @@
             opentofu
             packer
           ];
-        };
-
-        # The policy's own shell: `nix develop .#policy -c cargo test`, inside
-        # guests/policy. Its tests are wasm, so they need the clang secp256k1-sys
-        # compiles to wasm with, and `fake-host-run` to run them against the
-        # fake host (guests/policy/.cargo/config.toml).
-        policy = pkgs.mkShell {
-          packages = [
-            (policyPkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-            pkgs.protobuf
-            fake-host-run
-          ];
-          PROTOC = "${pkgs.protobuf}/bin/protoc";
-          CC_wasm32_wasip2 = "${policyClang}/bin/clang";
-          AR_wasm32_wasip2 = "${pkgs.llvmPackages.bintools-unwrapped}/bin/llvm-ar";
         };
       };
 

@@ -25,5 +25,5 @@ deploy/tofu/.terraform/
 /bench.txt
 /runtime.log
 
-# `nix build .#policy` and friends leave their output link here.
+# `nix build` leaves its output link here.
 /result

@@ -71,29 +71,6 @@ jobs:
           comment-on-alert: true
           fail-on-alert: false
 
-  # The policy guest: its component's and crates' tests, clippy, and the component
-  # exactly as a release builds it (Nix), run by the fake host.
-  policy:
-    name: policy
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      # The policy guest's and ark's build scripts generate protobuf code.
-      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: ./.github/actions/rust
-        with:
-          shared-key: policy
-          workspaces: |
-            . -> target
-            guests/fake-host -> target
-      - run: scripts/ci-policy.sh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: policy.wasm
-          path: result/bin/policy.wasm
-
   # There is deliberately no SQLite job. The runtime measures its guest into
   # PCR16 before it will serve, and that reads the NSM — which a hosted runner
   # does not have, so the binary refuses to start there at all. The workload
@@ -120,6 +97,7 @@ jobs:
             . -> target
             examples/guest-http -> target
             examples/guest-grpc -> target
+            examples/guest-signer -> target
       - uses: actions/cache@v4
         with:
           path: target/qemu-nitro/tools
@@ -143,20 +121,18 @@ jobs:
             target/qemu-nitro/e2e/*.log
           if-no-files-found: ignore
 
-  # The React Native package (clients/react-native) over the vtxos client
-  # (clients/mobile), one job per platform: iOS builds only on macOS.
+  # The React Native package (clients/react-native) over the vtxos client in
+  # Rust (clients/react-native/rust), one job per platform: iOS builds only on macOS.
   mobile-android:
     name: React Native, Android
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      # vtxos-client's build script generates protobuf code.
-      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: ./.github/actions/rust
         with:
           shared-key: mobile-android
-          workspaces: clients/mobile -> target
+          workspaces: clients/react-native/rust -> target
       - uses: actions/setup-node@v4
         with:
           node-version-file: clients/react-native/.nvmrc
@@ -168,11 +144,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - run: brew install protobuf
       - uses: ./.github/actions/rust
         with:
           shared-key: mobile-ios
-          workspaces: clients/mobile -> target
+          workspaces: clients/react-native/rust -> target
       - uses: actions/setup-node@v4
         with:
           node-version-file: clients/react-native/.nvmrc

@@ -19,8 +19,8 @@ already deframed, and returns a stream of replies and a future for its status.
 The runtime frames the replies, sends the status as `grpc-status` and
 `grpc-message` trailers, and refuses a compressed, oversized or truncated frame
 itself. The guest has no HTTP or gRPC code at all.
-[`examples/guest-grpc`](../examples/guest-grpc/) and the policy guest are built
-this way. It is the component model's async ABI (WASI 0.3's streams and
+[`examples/guest-grpc`](../examples/guest-grpc/) and
+[`examples/guest-signer`](../examples/guest-signer/) are built this way. It is the component model's async ABI (WASI 0.3's streams and
 futures), which the runtime's engine enables for every guest.
 
 **`wasi:http/incoming-handler`: the guest serves HTTP itself.** It holds the
@@ -160,7 +160,7 @@ results.
 
 ## Known limits
 
-- **The policy guest alternates.** Its ceremonies read and write in turn,
+- **A signing guest alternates.** A signing round reads and writes in turn,
   which a request/response signing protocol is. An `enclave:rpc` guest has two
   independent streams and may write while a read is pending; a `wasi:http`
   guest written as one body polling the other cannot.

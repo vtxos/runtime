@@ -1,0 +1,24 @@
+# A workspace of its own, with its own lock file and its own target directory, as the other
+# example guests are.
+[workspace]
+
+[package]
+name = "guest-signer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "guest-signer"
+path = "src/main.rs"
+
+[dependencies]
+# The runtime's WIT and a guest's bindings to it: `enclave:rpc/service` to export, and
+# `enclave:signer` to sign with.
+enclave-wit = { path = "../../wit" }
+wit-bindgen = { version = "0.51", features = ["async-spawn"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

@@ -27,9 +27,3 @@ pub mod bindings {
         default_bindings_module: "enclave_wit::bindings",
     });
 }
-
-/// What a test inside `guests/fake-host` sets up and reads back. Never in a release.
-#[cfg(feature = "fake-host")]
-pub mod fake_host {
-    wit_bindgen::generate!({ path: "fake-host", world: "enclave:fake-host/tester" });
-}

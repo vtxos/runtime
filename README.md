@@ -4,9 +4,18 @@
 
 Write the guest with plain `std`. `SystemTime::now()` reads the Nitro PTP hardware clock, `getrandom` reads the Nitro Security Module, `std::fs` writes to a store that is encrypted before anything reaches S3, and requests arrive over TLS terminated inside the enclave. The guest never touches a device path, a key or a certificate.
 
-WASI has no way to reach a person between requests, so the runtime adds [WIT capabilities](#capabilities-beyond-wasi): **`enclave:notify`** wakes the owner's phone without revealing why, and **`enclave:tasks`** runs durable work while no client is connected, scheduled through AWS and run inside the enclave.
+WASI has no way to reach a person between requests, or to sign with a key the code never holds, so the runtime adds [WIT capabilities](#capabilities-beyond-wasi): **`enclave:notify`** wakes the owner's phone without revealing why, **`enclave:tasks`** runs durable work while no client is connected, scheduled through AWS and run inside the enclave, and **`enclave:signer`** signs with a wallet key split between the owner's app and the enclave, so neither signs alone.
 
 Every party that relies on the enclave checks the same two measurements: PCR0 for the runtime image and its configuration, PCR16 for the guest. KMS checks them before releasing a release's own key, and a native app before sending its half of the key that opens its tenant's data.
+
+**What is in this repository.** The runtime, and what a product needs to build on it:
+
+- the [WIT contracts](wit/), also as a crate a Rust guest depends on for its bindings;
+- small [example guests](examples/): HTTP with tasks and notify, bidirectional gRPC, a guest that signs, and SQLite;
+- a [development enclave](#try-it-locally) that boots the real image in QEMU with any guest;
+- a [client library for native apps](#a-client-for-native-apps): the attested connection, sign-in, and the app's half of the wallet key.
+
+It holds no application guest. A product's guest, and the messages it speaks with its app, live with the product.
 
 > **Pre-1.0, under active correctness review.** The runtime, its capabilities, the KMS recipient flow and the deployment tooling are implemented and tested, including end to end in an emulated enclave. Validation on real Nitro hardware and against live KMS and AWS End User Messaging Push is outstanding, as is storage garbage collection. This is not a production-readiness claim.
 
@@ -19,6 +28,7 @@ Every party that relies on the enclave checks the same two measurements: PCR0 fo
 - [Trust boundaries](#trust-boundaries)
 - [Measured boot and key release](#measured-boot-and-key-release)
 - [Verifying the enclave from a client](#verifying-the-enclave-from-a-client)
+- [A client for native apps](#a-client-for-native-apps)
 - [Storage](#storage)
 - [Configuration](#configuration)
 - [Build, test, and deploy](#build-test-and-deploy)
@@ -107,7 +117,7 @@ world app {
 }
 ```
 
-Guests vendor the canonical definitions from [`wit/`](wit/), and `scripts/wit-drift.sh` fails if a copy drifts.
+A Rust guest depends on [`wit/`](wit/) as a crate, `enclave-wit`, whose bindings are generated from the canonical files, so it keeps no copy ([`guest-signer`](examples/guest-signer/) does this). A guest may also vendor the definitions, as `guest-http` does; `scripts/wit-drift.sh` fails if a copy drifts.
 
 ### `enclave:notify` — wake a phone without saying why
 
@@ -164,6 +174,8 @@ resource signing {
 
 Each tenant's wallet key is a 2-of-2 FROST key between the owner's app and the cosigner, made by a DKG across registration's two calls: the app commits in `register/options`, whose answer carries the cosigner's commitment and the share it deals, and `register/verify` completes it ([client integration](docs/CLIENT_INTEGRATION.md#registering)). The runtime signs with the cosigner's share here, one round trip per batch; nothing returns it.
 
+A round has two halves. The guest calls `begin` and relays the enclave's commitments to the app; the app answers with its own half, which the [client library](#a-client-for-native-apps) makes from its share (`signRound`); the guest calls `finish` and gets BIP-340 signatures. Whether a message deserves a signature is the guest's decision, made before it calls `begin`: that check is the guest's policy. [`examples/guest-signer`](examples/guest-signer/) is the smallest guest that does this, about ninety lines, and it signs whatever it is sent.
+
 The cosigner's share is the operator's. Its DKG polynomial is derived from an operator master and a handle the registration mints, and the finished share is sealed under a key from the same master into the tenant's write-once record in the roots bucket. So every release reads it, and nothing is migrated. Neither the master nor the share signs anything alone, and neither opens the tenant's data: both need the app's share too. The master is an SSM SecureString the operator writes once the enclave is up (`ENCLAVE_OPERATOR_MASTER_PARAMETER`), read on the first registration or sign-in. It must never change or be lost, since every cosigner share is sealed under it.
 
 ### Who may call what
@@ -176,7 +188,7 @@ The runtime marks each invocation as either interactive (a signed request) or ba
 | `tasks.status` | ✓ | ✓ |
 | `notify.register-device`, `forget-device` | ✓ | |
 | `notify.wake`, `devices` | ✓ | ✓ |
-| `cosign.*` | ✓ | |
+| `signer.*` | ✓ | |
 | `wasi:http` to the public internet | ✓ | ✓ |
 
 Background work cannot grant itself more work or devices. It can only use what an approved request already set up.
@@ -343,6 +355,19 @@ POST /auth/request/verify    {challenge_id, signature, ecdh}    → single-use t
 
 The signature is BIP-340 by the app's share of the wallet key, over the challenge, the interaction and the hash of the certificate the connection was served, so a signature relayed to any other connection is refused. The approval binds method, path and query, not the body or each message of a stream. Registration is open and creates a new, empty tenant. The runtime refuses to start if a document would exceed 16 KiB; client transports should allow at least 32 KiB for the whole response head, certificate chain included. Browser JavaScript cannot inspect the TLS peer certificate this flow depends on, so clients are native apps. See [client integration](docs/CLIENT_INTEGRATION.md) and the standalone [`nitro-attest`](crates/nitro-attestation/src/bin/nitro-attest.rs) verifier.
 
+## A client for native apps
+
+[`clients/react-native`](clients/react-native/) is that client as a library: `@vtxos/react-native-wallet`, Rust underneath, exported to React Native through UniFFI. It is two parts and nothing else.
+
+| Part | What it does |
+|---|---|
+| `net` | The attested connection. It checks the enclave's document against the app's pins (the trust root, PCR0 and PCR16) before anything secret is sent, pins the certificate, signs in for each call, and carries a guest's calls as bytes: `Session.call` for one message each way, `Session.stream` for messages both ways |
+| `core` | The app's half of the wallet key: made from a passkey's PRF output at registration, kept as a record the app stores, and used by `signRound` for the app's half of a signing round |
+
+It knows nothing of any guest's messages and generates no code from them. An app writes and reads its own guest's messages, and decides what it is willing to sign before it calls `signRound`. Clients are native apps; nothing here is built for a browser.
+
+For an app's own tests the same API runs outside a phone: the `bridge` example speaks it as JSON lines on stdin and stdout, over the runtime in process or over an enclave that is already up, such as the development enclave. See the [package's README](clients/react-native/README.md).
+
 ## Storage
 
 Each tenant has its own ZFS pool, on its own 64 MiB region of a disk the parent serves over vsock and cannot read: dm-crypt sits underneath, under a key derived from the tenant's key, which only the owner's share and the cosigner's can derive, together. The guest sees the pool's `data` dataset as `/`, through `wasmtime-wasi`'s filesystem, and nothing above it is reachable. The tenant's device records are on the same pool, outside `data`; its background tasks are in DynamoDB, signed and sealed with its key. Each tenant's wallet key record, with the cosigner's share sealed under the operator master, and which region is whose are in the roots bucket, written once. SQLite runs unmodified in rollback-journal mode ([`guest-sqlite`](examples/guest-sqlite/)).
@@ -394,18 +419,19 @@ The emulator's alternatives exist only in the `testing` build, which the emulato
 ```bash
 cargo build --locked --release -p enclave-runtime
 cargo build --locked --release -p nitro-attestation --features cli --bin nitro-attest
-scripts/build-guest.sh http          # also grpc; sqlite after scripts/wasi-sdk.sh
+scripts/build-guest.sh http          # also grpc and signer; sqlite after scripts/wasi-sdk.sh
 cargo build --release -p enclave-runtime --features testing --bin wallet-client   # development only
 ```
 
 | Command | Coverage |
 |---|---|
-| `scripts/ci-check.sh` | Formatting, Clippy with warnings denied, workspace library tests, boot-origin tests |
-| `scripts/ci-guests.sh` | Builds the guests; tests tasks, dispatch, TLS binding, HTTP/2, gRPC, authentication and logging |
+| `scripts/ci-check.sh` | Formatting, Clippy with warnings denied, workspace library tests, boot-origin tests, and the tests of the two crates shared with the client (`threshold`, `enclave-client`) |
+| `scripts/ci-guests.sh` | Builds the guests; tests tasks, dispatch, TLS binding, HTTP/2, gRPC, authentication and logging, and that a guest which signs links against the runtime |
 | `scripts/ci-storage.sh` | Real MinIO/S3: retention, remount, corruption, rollback and competing claims (needs Docker) |
 | `scripts/ci-e2e.sh` | The stages above, then the full QEMU stack (needs KVM, Docker and Nix) |
 | `scripts/wit-drift.sh` | Vendored guest WIT matches [`wit/`](wit/) |
 | `scripts/ci-bench.sh` | Criterion storage and instance-cost benchmarks |
+| `scripts/ci-mobile-android.sh`, `scripts/ci-mobile-ios.sh` | The client library on each platform: built, its bindings and Turbo Module generated, the TypeScript checked, and the example app built against them |
 
 `cargo test --workspace` alone does not replace these: ignored tests need `--include-ignored`, guests build separately, and some binaries need features. Keep the `testing` feature out of production images.
 
@@ -451,14 +477,14 @@ The [roadmap](docs/ROADMAP.md) records milestone history.
 | Path | Contents |
 |---|---|
 | [`runtime`](runtime/) | WASI wiring ([`run.rs`](runtime/src/run.rs), [`linker.rs`](runtime/src/linker.rs)), [clock](runtime/src/clock.rs), [entropy](runtime/src/random.rs), measured boot, key sources, TLS and auth, tenancy, [tasks](runtime/src/tasks.rs), [notify](runtime/src/notify/), logging |
-| [`wit`](wit/) | Capability contracts: [`notify`](wit/notify/notify.wit), [`tasks`](wit/tasks/tasks.wit), [`telemetry`](wit/telemetry/telemetry.wit), [`signer`](wit/signer/signer.wit) |
+| [`wit`](wit/) | Capability contracts: [`notify`](wit/notify/notify.wit), [`tasks`](wit/tasks/tasks.wit), [`telemetry`](wit/telemetry/telemetry.wit), [`signer`](wit/signer/signer.wit), [`rpc`](wit/rpc/rpc.wit), and the [`guest`](wit/guest/guest.wit) world that composes them. Also the `enclave-wit` crate: a Rust guest's bindings to all of it |
 | [`crates/nitro-nsm`](crates/nitro-nsm/) | NSM device access: entropy, PCRs, attestation requests |
 | [`crates/nitro-attestation`](crates/nitro-attestation/) | Attestation verification and the `nitro-attest` client |
-| [`crates/threshold`](crates/threshold/), [`crates/ark`](crates/ark/), [`crates/enclave-client`](crates/enclave-client/) | FROST/DKG for the runtime's [wallet key](runtime/src/signer/), the Ark sessions the policy guest drives, on top of Arkade's `ark-core`, and attestation verification for the guest's clients |
-| [`guests/policy`](guests/policy/), [`protocol/protos`](protocol/protos/) | The policy component, and its wire ([README](guests/policy/README.md)) |
+| [`crates/threshold`](crates/threshold/), [`crates/enclave-client`](crates/enclave-client/) | FROST/DKG for the runtime's [wallet key](runtime/src/signer/), and attestation verification for a guest's clients |
 | [`runtime/src/store/zfs.rs`](runtime/src/store/zfs.rs), [`nix/kernel-zfs.nix`](nix/kernel-zfs.nix) | Storage: the pool, its disk, the anchor ([docs/STORAGE.md](docs/STORAGE.md)) |
 | [`runtime/src/store`](runtime/src/store/) | The roots bucket's S3 backend, the key hierarchy and signing |
-| [`examples`](examples/) | HTTP (tasks and notify), bidirectional gRPC, and SQLite guests |
+| [`examples`](examples/) | Guests: HTTP (tasks and notify), bidirectional gRPC, one that signs with `enclave:signer`, and SQLite |
+| [`clients/react-native`](clients/react-native/) | The client library for native apps, `@vtxos/react-native-wallet`: [`net`](clients/react-native/rust/vtxos-client/src/net/) and [`core`](clients/react-native/rust/vtxos-client/src/core/) in Rust, the UniFFI exports, the React Native package and its example app |
 | [`deploy/qemu-nitro`](deploy/qemu-nitro/) | Development enclave, emulator self-test, end-to-end harness |
 | [`deploy/nix`](deploy/nix/), [`nix`](nix/) | Measured configuration and reproducible EIF assembly |
 | [`deploy/ami`](deploy/ami/), [`deploy/tofu`](deploy/tofu/) | Parent AMI and AWS infrastructure |

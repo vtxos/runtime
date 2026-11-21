@@ -45,7 +45,7 @@ Then, with your component:
 
 ```bash
 cargo build --release --target wasm32-wasip2   # in your guest's crate
-deploy/qemu-nitro/dev-enclave.sh --guest target/wasm32-wasip2/release/policy.wasm
+deploy/qemu-nitro/dev-enclave.sh --guest target/wasm32-wasip2/release/<your-guest>.wasm
 ```
 
 The script:
