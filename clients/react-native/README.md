@@ -1,58 +1,71 @@
 # @vtxos/react-native-wallet
 
-A vtxos wallet for React Native, on Android and iOS: the Rust client in
-[`clients/mobile`](../mobile) (attested TLS to the enclave runtime, share-signed sign-in, FROST, the
-policy guest's ceremonies and the ASP calls they relay), exposed to JavaScript by
+The phone's side of a vtxos enclave, for React Native on Android and iOS. It is two things:
+
+- **The key.** A 2-of-2 between the phone and the enclave. The phone's half is made from a
+  passkey, never stored, and signs its half of a round inside the library.
+- **Calls.** An attested connection to the enclave runtime, a sign-in for each call, and the call
+  itself, to any method the enclave serves, as bytes.
+
+It knows nothing of what a call's messages mean. Those belong to whoever wrote the policy the
+enclave runs, and so to the app: the app writes and reads them itself.
+
+It is the Rust client in [`rust/`](rust), exposed to JavaScript by
 [uniffi-bindgen-react-native](https://github.com/jhugman/uniffi-bindgen-react-native) as a Turbo
-Module. Every call returns a Promise. The app needs no Rust toolchain: the package ships the built
-libraries.
+Module. The app needs no Rust toolchain: the package ships the built libraries.
 
 ## Usage
 
 ```ts
-import { Vtxos, prfSalt, encodeRecord, decodeRecord } from '@vtxos/react-native-wallet';
+import { Enclave, prfSalt, encodeRecord, decodeRecord } from '@vtxos/react-native-wallet';
 
-const vtxos = new Vtxos(enclaveUrl, aspUrl, {
+const enclave = new Enclave(enclaveUrl, {
   pcr0, // the runtime image, hex
-  pcr16, // the policy guest, hex
+  pcr16, // the policy the enclave runs, hex
   maxAgeSecs: 300n,
   // trustRootPem: omitted for AWS Nitro's root
 });
 
-// The passkey's PRF output, evaluated at prfSalt(), makes the wallet's key.
-const record = await vtxos.register(prfOutput);
+// The passkey's PRF output, evaluated at prfSalt(), makes the key.
+const record = await enclave.register(prfOutput);
 await storage.save(encodeRecord(record)); // not secret without the passkey; back it up
 
-const wallet = vtxos.open(decodeRecord(stored), prfOutput);
-await wallet.arkAddress();
-await wallet.board({ txid, vout, amountSats }, undefined);
-await wallet.send(address, 10_000n, { exitAddress, deviceToken });
-wallet.close(); // drops the share
+const session = enclave.open(decodeRecord(stored), prfOutput);
+
+// One message each way.
+const reply = await session.call('/acme.v1.Limits/Set', request);
+
+// Messages both ways.
+const stream = await session.stream('/acme.v1.Vault/Approve');
+await stream.send(first);
+const answer = await stream.next(); // undefined once the enclave ends the call
+stream.finish(); // nothing more from this side
+
+// The phone's half of a signature, when the policy opens a round: its commitments in, and what
+// goes back to it. The share never leaves the library.
+const rounds = session.signRound(messages, commitments);
+
+session.close(); // drops the share
 ```
 
-### Exits
+- Each call makes the whole trip: the attested connection, a sign-in for exactly that method, and
+  the call with the token the sign-in returned. An enclave that is not the one pinned is refused
+  before anything secret goes out.
+- A call the enclave ends with an error throws `VtxosError.Status` with gRPC's `code` and the
+  policy's `message`.
+- One call at a time: a second waits for the first to end, and a stream holds its turn until it
+  ends or is cancelled (`stream.cancel()`). The enclave serves a key one call at a time anyway.
+- A message is at most 4 MiB.
+- `signRound` returns one `{ hiding, binding, share }` per message. It is half a signature and no
+  more: the enclave makes the other half, and only as its policy allows. It signs what it is
+  given, so the app checks what a policy asks it to sign before it calls this.
 
-A renewal with an `exitAddress` returns one signed `Exit` per VTXO. Store each one, including
-`unroll`: with it, the user can leave even if the ASP has disappeared.
-
-To leave:
-1. Put each transaction in `unroll` on chain in order, then `rawTx` once the last of them has
-   confirmed and `sequence` has passed.
-2. Each one pays no fee and carries a P2A anchor. Broadcast it as a package with a child from the
-   app's own on-chain wallet that spends the anchor and pays for both.
-3. Do one per block: TRUC allows only one unconfirmed parent.
-
-The provider must accept packages, e.g. Esplora's `POST /txs/package`. The regtest electrs doesn't
-have that endpoint; on regtest, use bitcoind's `submitpackage`.
-
-An exit holds until its VTXO is spent or refreshed, or its batch expires; a newer one replaces it.
-
-Errors are `VtxosError`s: check `VtxosError.Attestation.instanceOf(e)`, and so on for `Pinning`,
-`Auth`, `Enclave`, `Asp`, `WrongPasskey`, `Protocol` and `Transport`.
+In Rust these are the client's two modules: `net` (the connection, sign-in and calls) and `core`
+(the key from the passkey, the record, and the phone's half of a signing round).
 
 ## Building
 
-`android/`, `ios/`, `cpp/`, `src/` and the podspec are generated from `clients/mobile/vtxos-uniffi`
+`android/`, `ios/`, `cpp/`, `src/` and the podspec are generated from `rust/vtxos-uniffi`
 and not committed. Generate them, with the libraries, for one platform or both:
 
 ```sh
@@ -70,20 +83,26 @@ must build just `arm64-v8a` and `x86_64` (`reactNativeArchitectures` in its `gra
 
 ## The example app
 
-The example talks to the runtime running in process on this machine, serving the policy guest, and
-to a regtest arkd on `127.0.0.1:7070`:
+The example talks to the runtime running in process on this machine, serving your policy guest.
+This repository holds no policy: build your own, and name its component here.
 
 ```sh
-nix build .#policy
-(cd clients/mobile && POLICY_WASM=<path to policy.wasm> cargo run -p vtxos-uniffi --example dev_enclave)
+(cd clients/react-native/rust && POLICY_WASM=<path to your policy's wasm> cargo run -p vtxos-uniffi --example dev_enclave)
 ```
 
-It prints an `adb reverse` command, which lets an emulator reach both, and a line of settings
-(URLs and pins). Then:
+It prints an `adb reverse` command, which lets an emulator reach it, and a line of settings (the
+URL and pins). Then:
 
 ```sh
 yarn example android
 ```
 
-Paste the settings line into the app and register. To board, pay the boarding address on regtest,
-mine a block, and enter the output as `txid:vout:sats`.
+Paste the settings line into the app and register. It then calls whatever method you name with
+whatever bytes you give it, as hex, and shows the reply.
+
+## Testing an app's own messages
+
+An app that runs a policy's conversations in TypeScript cannot load this library's native half in
+Node. `cargo run -p vtxos-uniffi --example bridge` is the same exported API with one JSON object
+per line on stdin and stdout, over the runtime in process and the app's own policy guest
+(`POLICY_WASM`), so the app's code can be tested against what it meets on a phone.

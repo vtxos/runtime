@@ -1,5 +1,5 @@
-//! The enclave: one HTTP/2 connection over [`crate::tls`], attested on every options call, and
-//! the sign-in that precedes every guest call.
+//! The enclave: one HTTP/2 connection over [`super::tls`], attested on every options call, and
+//! the sign-in that precedes every call to what the enclave runs.
 //!
 //! The order is the protocol's. An options call carries a fresh `x-enclave-nonce` and comes back
 //! with an attestation document, which must verify under the pins and name the certificate this
@@ -20,11 +20,11 @@ use rand_core::{OsRng, RngCore};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tonic::body::BoxBody;
 
+use super::h2::Body;
+use crate::core::keys::{Polynomial, WalletRecord};
 use crate::error::{Error, Result};
-use crate::keys::{Polynomial, WalletRecord};
-use crate::tls;
+use crate::net::tls;
 
 /// AWS Nitro's root, which a real enclave's documents chain to.
 pub use enclave_client::AWS_NITRO_ROOT_G1_PEM;
@@ -67,7 +67,7 @@ pub struct Enclave {
 /// One HTTP/2 connection to the enclave, and the certificate it served.
 #[derive(Clone)]
 pub struct Connection {
-    send: SendRequest<BoxBody>,
+    send: SendRequest<Body>,
     origin: Uri,
     certificate: Arc<Vec<u8>>,
 }
@@ -105,7 +105,7 @@ impl Enclave {
         }
         let connected = tls::connect(&self.host, self.port, &self.host).await?;
         let certificate = Arc::new(connected.certificate);
-        let send = crate::h2::handshake(connected.stream, "the enclave").await?;
+        let send = crate::net::h2::handshake(connected.stream, "the enclave").await?;
         let c = Connection {
             send,
             origin: self.origin.clone(),
@@ -162,8 +162,8 @@ impl Enclave {
 }
 
 impl Connection {
-    /// The HTTP/2 handle and the origin, for a gRPC client on this connection.
-    pub fn parts(&self) -> (SendRequest<BoxBody>, Uri) {
+    /// The HTTP/2 handle and the origin, for a call on this connection.
+    pub fn parts(&self) -> (SendRequest<Body>, Uri) {
         (self.send.clone(), self.origin.clone())
     }
 
@@ -244,7 +244,7 @@ impl Connection {
         Ok((parts.headers, bytes))
     }
 
-    fn uri(&self, path: &str) -> Result<Uri> {
+    pub(super) fn uri(&self, path: &str) -> Result<Uri> {
         let mut parts = self.origin.clone().into_parts();
         parts.path_and_query = Some(
             path.parse()
@@ -254,8 +254,6 @@ impl Connection {
     }
 }
 
-fn boxed(bytes: Vec<u8>) -> BoxBody {
-    Full::new(Bytes::from(bytes))
-        .map_err(|never| match never {})
-        .boxed_unsync()
+fn boxed(bytes: Vec<u8>) -> Body {
+    Full::new(Bytes::from(bytes)).boxed_unsync()
 }

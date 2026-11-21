@@ -1,7 +1,7 @@
 {
   "name": "@vtxos/react-native-wallet",
   "version": "0.1.0",
-  "description": "A vtxos wallet for React Native: the Rust client, through UniFFI.",
+  "description": "The phone's side of a vtxos enclave for React Native: its half of the key, and calls to whatever the enclave runs, as bytes. The Rust client, through UniFFI.",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
   "exports": {

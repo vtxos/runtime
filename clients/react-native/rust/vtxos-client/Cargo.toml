@@ -1,0 +1,45 @@
+[package]
+name = "vtxos-client"
+description = "The phone's side of an enclave: its half of a 2-of-2 key (made from a passkey, signing its half of a round), the attested connection to the enclave runtime, share-signed sign-in, and calls to whatever the enclave runs, as bytes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+enclave-auth = { path = "../../../../crates/enclave-auth" }
+enclave-client = { path = "../../../../crates/enclave-client" }
+threshold = { path = "../../../../crates/threshold", features = ["std", "ecdh"] }
+
+k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+sha2 = "0.10"
+hkdf = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
+hex = "0.4"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# Transport: rustls with ring (pure Rust and assembly, no CMake for the NDK or iOS) and hyper's
+# HTTP/2 client. gRPC's framing is a five-byte prefix, written out in `net/session.rs`.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+hyper = { version = "1", features = ["client", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+tokio-stream = "0.1"
+
+[dev-dependencies]
+rcgen = "0.13"
+# The runtime itself, in process (`enclave_runtime::testing`), for the tests against a guest.
+enclave-runtime = { path = "../../../../runtime", features = ["testing"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+# The tests write a guest's messages out by hand, as an app does, and check a signature.
+prost = "0.13"
+bitcoin = "0.32"

@@ -1,7 +1,7 @@
-# uniffi-bindgen-react-native: builds clients/mobile/vtxos-uniffi for each platform and generates
+# uniffi-bindgen-react-native: builds rust/vtxos-uniffi for each platform and generates
 # the TypeScript, the C++ between Hermes and Rust, and the Turbo Module around them.
 rust:
-  directory: ../mobile
+  directory: rust
   manifestPath: vtxos-uniffi/Cargo.toml
 android:
   # 64-bit only: phones (arm64-v8a), and emulators and Chromebooks (x86_64). An app using the

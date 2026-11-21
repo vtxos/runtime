@@ -8,10 +8,9 @@ import {
   View,
 } from 'react-native';
 import {
-  Vtxos,
+  Enclave,
   type Pins,
-  type Vtxo,
-  type WalletLike,
+  type SessionLike,
 } from '@vtxos/react-native-wallet';
 
 // Hermes has it; React Native's types don't declare it.
@@ -20,7 +19,6 @@ declare function atob(data: string): string;
 /** What `cargo run -p vtxos-uniffi --example dev_enclave` prints, decoded. */
 type Settings = {
   enclaveUrl: string;
-  aspUrl: string;
   pins: {
     trustRootPem: string;
     pcr0: string;
@@ -35,7 +33,7 @@ function decodeSettings(line: string): Settings {
 }
 
 /**
- * A stand-in for a passkey's PRF output, which is what makes the wallet's key in an app. Regtest
+ * A stand-in for a passkey's PRF output, which is what makes the key in an app. For a dev enclave
  * only: Math.random is no source for a real key.
  */
 function devPrfOutput(): ArrayBuffer {
@@ -51,16 +49,31 @@ function describe(e: unknown): string {
   return err.tag ? `${err.tag}: ${err.inner?.message ?? ''}` : String(err.message ?? e);
 }
 
+function hex(bytes: ArrayBuffer): string {
+  return Array.from(new Uint8Array(bytes), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function fromHex(text: string): ArrayBuffer {
+  const clean = text.replace(/\s+/g, '');
+  const bytes = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes.buffer;
+}
+
+/**
+ * The library carries calls as bytes and holds the phone's half of the key. What a call's bytes
+ * mean is the app's, which knows the policy its enclave runs. So this example knows none: it
+ * registers a key, opens a session, and sends whatever bytes it is given to whatever method it is
+ * given.
+ */
 export default function App() {
   const [settings, setSettings] = useState('');
-  const [wallet, setWallet] = useState<WalletLike>();
-  const [arkAddress, setArkAddress] = useState('');
-  const [boardingAddress, setBoardingAddress] = useState('');
-  const [balance, setBalance] = useState<bigint>();
-  const [vtxos, setVtxos] = useState<Vtxo[]>([]);
-  const [utxo, setUtxo] = useState('');
-  const [to, setTo] = useState('');
-  const [amount, setAmount] = useState('');
+  const [session, setSession] = useState<SessionLike>();
+  const [method, setMethod] = useState('/cosigner.v1.Cosigner/GetServerInfo');
+  const [request, setRequest] = useState('');
+  const [reply, setReply] = useState('');
   const [status, setStatus] = useState('Paste the dev enclave’s line.');
 
   async function run(what: string, step: () => Promise<string>) {
@@ -72,11 +85,6 @@ export default function App() {
     }
   }
 
-  async function show(w: WalletLike) {
-    setBalance(await w.balance());
-    setVtxos(await w.vtxos());
-  }
-
   const register = () =>
     run('Registering', async () => {
       const s = decodeSettings(settings);
@@ -86,40 +94,18 @@ export default function App() {
         pcr16: s.pins.pcr16,
         maxAgeSecs: BigInt(s.pins.maxAgeSecs),
       };
-      const vtxosClient = new Vtxos(s.enclaveUrl, s.aspUrl, pins);
+      const enclave = new Enclave(s.enclaveUrl, pins);
       const prf = devPrfOutput();
-      const record = await vtxosClient.register(prf);
-      const w = vtxosClient.open(record, prf);
-      setWallet(w);
-      setArkAddress(await w.arkAddress());
-      setBoardingAddress(await w.boardingAddress());
-      await show(w);
+      const record = await enclave.register(prf);
+      setSession(enclave.open(record, prf));
       return `Registered tenant ${record.tenantId}`;
     });
 
-  const board = () =>
-    run('Boarding', async () => {
-      const [txid, vout, sats] = utxo.trim().split(':');
-      const settled = await wallet!.board(
-        { txid: txid!, vout: Number(vout), amountSats: BigInt(sats!) },
-        undefined
-      );
-      await show(wallet!);
-      return `Boarded ${settled.amountSats} sats in ${settled.commitmentTxid}`;
-    });
-
-  const send = () =>
-    run('Sending', async () => {
-      const sent = await wallet!.send(to.trim(), BigInt(amount), undefined);
-      await show(wallet!);
-      return `Sent in ${sent.arkTxid}`;
-    });
-
-  const refresh = () =>
-    run('Refreshing', async () => {
-      const settled = await wallet!.refresh(undefined);
-      await show(wallet!);
-      return `Refreshed into ${settled.vtxoTxid}:${settled.vtxoVout}`;
+  const call = () =>
+    run('Calling', async () => {
+      const answer = await session!.call(method.trim(), fromHex(request));
+      setReply(hex(answer));
+      return `${method.trim()} answered ${answer.byteLength} bytes`;
     });
 
   return (
@@ -128,7 +114,7 @@ export default function App() {
         <Text testID="status" style={styles.status}>
           {status}
         </Text>
-        {wallet === undefined ? (
+        {session === undefined ? (
           <>
             <TextInput
               testID="settings"
@@ -143,45 +129,28 @@ export default function App() {
           </>
         ) : (
           <>
-            <Text selectable testID="ark-address">
-              Ark: {arkAddress}
-            </Text>
-            <Text selectable testID="boarding-address">
-              Boarding: {boardingAddress}
-            </Text>
-            <Text testID="balance">Balance: {balance?.toString()} sats</Text>
-            {vtxos.map((v) => (
-              <Text key={`${v.txid}:${v.vout}`} style={styles.vtxo}>
-                {v.txid}:{v.vout} {v.amountSats.toString()} sats
-              </Text>
-            ))}
             <TextInput
-              testID="utxo"
+              testID="method"
               style={styles.input}
-              placeholder="txid:vout:sats paid to the boarding address"
+              placeholder="/package.Service/Method"
               autoCapitalize="none"
-              value={utxo}
-              onChangeText={setUtxo}
+              autoCorrect={false}
+              value={method}
+              onChangeText={setMethod}
             />
-            <Button testID="board" title="Board" onPress={board} />
             <TextInput
-              testID="to"
+              testID="request"
               style={styles.input}
-              placeholder="Ark address to send to"
+              placeholder="The request, as hex (empty for an empty message)"
               autoCapitalize="none"
-              value={to}
-              onChangeText={setTo}
+              autoCorrect={false}
+              value={request}
+              onChangeText={setRequest}
             />
-            <TextInput
-              testID="amount"
-              style={styles.input}
-              placeholder="sats"
-              keyboardType="number-pad"
-              value={amount}
-              onChangeText={setAmount}
-            />
-            <Button testID="send" title="Send" onPress={send} />
-            <Button testID="refresh" title="Refresh" onPress={refresh} />
+            <Button testID="call" title="Call" onPress={call} />
+            <Text selectable testID="reply" style={styles.bytes}>
+              {reply}
+            </Text>
           </>
         )}
       </ScrollView>
@@ -194,5 +163,5 @@ const styles = StyleSheet.create({
   content: { padding: 16, gap: 12 },
   status: { fontWeight: 'bold' },
   input: { borderWidth: 1, borderColor: '#888', padding: 8 },
-  vtxo: { fontFamily: 'monospace', fontSize: 12 },
+  bytes: { fontFamily: 'monospace', fontSize: 12 },
 });

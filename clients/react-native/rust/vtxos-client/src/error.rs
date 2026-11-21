@@ -1,5 +1,5 @@
 //! What can go wrong, by whose fault: the enclave's proof, the connection, the sign-in, the
-//! enclave's answer, the ASP, the passkey, or a message that does not follow the protocol.
+//! enclave's answer, the passkey, or a message that does not follow the protocol.
 
 /// One error type for every call, so the bindings carry one.
 #[derive(Debug, thiserror::Error)]
@@ -13,12 +13,9 @@ pub enum Error {
     /// A sign-in or registration was refused.
     #[error("refused ({status}): {message}")]
     Auth { status: u16, message: String },
-    /// The enclave or its guest answered with an error.
-    #[error("the enclave: {0}")]
-    Enclave(String),
-    /// The ASP refused or could not be reached.
-    #[error("the ASP: {0}")]
-    Asp(String),
+    /// A call the enclave ended with an error: gRPC's status code, and what the policy said.
+    #[error("the enclave answered {code}: {message}")]
+    Status { code: u32, message: String },
     /// The passkey's PRF output does not rebuild this wallet's share.
     #[error("this passkey does not open this wallet")]
     WrongPasskey,
