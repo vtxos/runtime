@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795296704715,
+  "lastUpdate": 1795298662995,
   "repoUrl": "https://github.com/vtxos/runtime",
   "entries": {
     "Benchmark": [
@@ -365,6 +365,48 @@ window.BENCHMARK_DATA = {
             "name": "guest/dispatch/committing",
             "value": 963821,
             "range": "± 1260268",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "joshuaaruokhaitech@gmail.com",
+            "name": "Aruokhai Joshua",
+            "username": "aruokhai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b747e84415dca8eb89a7ad15e7872d558ce6f276",
+          "message": "Merge pull request #10 from vtxos/release-trial/ios\n\nThe React Native library's release builds on both platforms, and can be tried without publishing",
+          "timestamp": "2026-11-21T23:55:39+02:00",
+          "tree_id": "1520551326e52f6d04678ac2320ed63e5c97916e",
+          "url": "https://github.com/vtxos/runtime/commit/b747e84415dca8eb89a7ad15e7872d558ce6f276"
+        },
+        "date": 1795298662408,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "guest/instantiate",
+            "value": 50903,
+            "range": "± 8935",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/trivial",
+            "value": 240066,
+            "range": "± 6456",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/committing",
+            "value": 1097640,
+            "range": "± 65084",
             "unit": "ns/iter"
           }
         ]
