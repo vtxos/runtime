@@ -16,7 +16,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# Four stages, each a checkout, a toolchain, and one script. The scripts are the
+# Three stages, each a checkout, a toolchain, and one script. The scripts are the
 # recipes: they live in scripts/ so a job can be run locally with the same
 # command CI uses, and so deploy/qemu-nitro/run-e2e.sh can share them instead of
 # keeping a second copy that has to agree.
@@ -120,35 +120,3 @@ jobs:
           path: |
             target/qemu-nitro/e2e/*.log
           if-no-files-found: ignore
-
-  # The React Native package (clients/react-native) over the vtxos client in
-  # Rust (clients/react-native/rust), one job per platform: iOS builds only on macOS.
-  mobile-android:
-    name: React Native, Android
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/rust
-        with:
-          shared-key: mobile-android
-          workspaces: clients/react-native/rust -> target
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: clients/react-native/.nvmrc
-      - run: scripts/ci-mobile-android.sh
-
-  mobile-ios:
-    name: React Native, iOS
-    runs-on: macos-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/rust
-        with:
-          shared-key: mobile-ios
-          workspaces: clients/react-native/rust -> target
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: clients/react-native/.nvmrc
-      - run: scripts/ci-mobile-ios.sh

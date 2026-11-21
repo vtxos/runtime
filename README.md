@@ -431,7 +431,7 @@ cargo build --release -p enclave-runtime --features testing --bin wallet-client 
 | `scripts/ci-e2e.sh` | The stages above, then the full QEMU stack (needs KVM, Docker and Nix) |
 | `scripts/wit-drift.sh` | Vendored guest WIT matches [`wit/`](wit/) |
 | `scripts/ci-bench.sh` | Criterion storage and instance-cost benchmarks |
-| `scripts/ci-mobile-android.sh`, `scripts/ci-mobile-ios.sh` | The client library on each platform: built, its bindings and Turbo Module generated, the TypeScript checked, and the example app built against them |
+| `scripts/ci-mobile-android.sh`, `scripts/ci-mobile-ios.sh` | The client library on each platform: built, its bindings and Turbo Module generated, the TypeScript checked, and the example app built against them. Not CI jobs: the package's release workflow runs them |
 
 `cargo test --workspace` alone does not replace these: ignored tests need `--include-ignored`, guests build separately, and some binaries need features. Keep the `testing` feature out of production images.
 

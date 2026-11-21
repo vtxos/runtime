@@ -5,7 +5,7 @@
 # any other goes out as `latest`. The tag names the version: package.json is not
 # bumped by hand.
 #
-# Android builds on Linux and iOS on macOS, each with the script CI uses
+# Android builds on Linux and iOS on macOS, each with its build script
 # (scripts/ci-mobile-*.sh: the library, its bindings and Turbo Module, the
 # TypeScript, and the example app built against them), and each hands its
 # generated files to one publish job, which assembles the package and publishes
