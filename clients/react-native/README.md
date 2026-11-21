@@ -63,6 +63,22 @@ session.close(); // drops the share
 In Rust these are the client's two modules: `net` (the connection, sign-in and calls) and `core`
 (the key from the passkey, the record, and the phone's half of a signing round).
 
+## In an app
+
+- **Android** is 64-bit only: build just `arm64-v8a` and `x86_64` (`reactNativeArchitectures` in
+  the app's `gradle.properties`).
+- **iOS** needs one more package named in the app itself:
+
+  ```sh
+  npm install uniffi-bindgen-react-native@0.31.0-7
+  ```
+
+  This library's pod depends on that package's pod at exactly the version this library was
+  generated with. React Native links only the pods of an app's own dependencies, and CocoaPods
+  does not always have that version, so the app names it and the pod comes from `node_modules`.
+  Use the version in this package's `dependencies`. The example app does the same from its
+  `react-native.config.js`.
+
 ## Building
 
 `android/`, `ios/`, `cpp/`, `src/` and the podspec are generated from `rust/vtxos-uniffi`
@@ -75,11 +91,19 @@ yarn ubrn:ios       # devices and the simulator, into an xcframework; macOS only
 yarn typecheck
 ```
 
-Both need `protoc` and the Rust targets: `aarch64-linux-android` and `x86_64-linux-android`, or
-`aarch64-apple-ios` and `aarch64-apple-ios-sim`. Android is 64-bit only, so an app using the package
-must build just `arm64-v8a` and `x86_64` (`reactNativeArchitectures` in its `gradle.properties`).
+Each needs its Rust targets: `aarch64-linux-android` and `x86_64-linux-android`, or
+`aarch64-apple-ios` and `aarch64-apple-ios-sim`.
 [`scripts/ci-mobile-android.sh`](../../scripts/ci-mobile-android.sh) and
-[`scripts/ci-mobile-ios.sh`](../../scripts/ci-mobile-ios.sh) do exactly what CI does.
+[`scripts/ci-mobile-ios.sh`](../../scripts/ci-mobile-ios.sh) do exactly what a release does, and
+build the example app against the result.
+
+## Releasing
+
+A tag named `react-native-wallet-v<version>` on `main` publishes that version to npm
+([the workflow](../../.github/workflows/react-native-release.yml)): both platforms are built, and
+only if both pass is the package published. A version with a hyphen, such as `0.1.0-rc.2`, goes
+out under the `next` tag. To try the builds without publishing, push a branch named
+`release-trial/<anything>`.
 
 ## The example app
 
