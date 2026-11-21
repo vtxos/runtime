@@ -39,10 +39,10 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::crypto::keys::{KeyMaterial, MasterSecret};
+    use crate::tenant::{KeyMaterial, TenantKey};
 
-    fn material(master: u8) -> KeyMaterial {
-        KeyMaterial::derive(&MasterSecret::from_bytes([master; 32]), [0u8; 16]).unwrap()
+    fn material(b: u8) -> KeyMaterial {
+        KeyMaterial::for_pool(&TenantKey::from_bytes([b; 32]), [0u8; 16], &[0u8; 16]).unwrap()
     }
 
     #[test]

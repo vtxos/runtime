@@ -3,7 +3,7 @@
 #
 # Tenant data on ZFS, over a disk image the "parent" serves on vsock
 # (nbd-stub.py, standing in for nbdkit and EBS), anchored in the roots bucket
-# after every request (runtime/src/zfs.rs). This plays the hostile host against
+# after every request (runtime/src/store/zfs.rs). This plays the hostile host against
 # it — rolling the disk back, killing the enclave between a sync and its
 # anchor, serving an abandoned fork — measures what an anchor costs, and shows
 # two tenants' pools anchoring independently.

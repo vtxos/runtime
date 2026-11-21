@@ -17,12 +17,12 @@
 //! hides it from `get_blob`, `head_blob` and `list_blobs`, exactly as S3 does,
 //! while the bytes remain reachable through [`Backend::get_retained_blob`].
 //!
-//! Still *not* modelled, deliberately: a plain `put_blob` over a retained
-//! object, which real S3 accepts as a new version. Every such object here is
-//! content-verified — a root record by its Ed25519 signature, a receipt by the
-//! NSM's — so substituted bytes are refused a layer up. It is the *absence*
-//! that has nothing to verify, which is why that half is modelled and this one
-//! is named instead.
+//! Also modelled: **a plain `put_blob` over a retained object**, which real S3
+//! accepts as a new current version while the retained one stays beneath it.
+//! The tenant registry and region claims are not signed — no key outlives a
+//! release to sign them with — so a forged newer version is exactly what they
+//! must survive, and a fake that refused the write could not show they do.
+//! Readers that matter take [`Backend::get_retained_blob`], the oldest version.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -273,11 +273,11 @@ impl Backend for MemoryBackend {
         };
         let key = input.key;
         let mut g = self.state.write();
-        // This fake models a non-versioned bucket, so an overwrite replaces
-        // the retained version rather than adding a new one. Refuse it.
-        if g.objects.get(&key).is_some_and(|b| b.is_retained(now)) {
-            return Err(StoreError::AccessDenied);
-        }
+        // A new current version on top. The retained one is set aside, not
+        // replaced: what Object Lock pinned stays readable as the retained
+        // version, as it does in S3.
+        g.pin_before_overwrite(&key, now);
+        g.delete_markers.remove(&key);
         g.objects.insert(key.clone(), stored.clone());
         Ok(self.meta_from_stored(&key, &stored))
     }
@@ -999,21 +999,38 @@ mod tests {
             .expect("a delete marker makes the key look untaken");
     }
 
+    /// A plain PUT over a retained object is a new version, as in S3: the
+    /// current read moves, the retained read does not.
     #[tokio::test]
-    async fn retained_object_cannot_be_overwritten() {
+    async fn a_plain_put_over_a_retained_object_stacks_a_version() {
         let b = MemoryBackend::new();
         b.put_blob(locked("roots/0001", b"root", 3600))
             .await
             .unwrap();
 
-        assert!(matches!(
-            b.put_blob(PutBlobInput::new(
-                "roots/0001",
-                Bytes::from_static(b"forged")
-            ))
-            .await,
-            Err(StoreError::AccessDenied)
-        ));
+        b.put_blob(PutBlobInput::new(
+            "roots/0001",
+            Bytes::from_static(b"forged"),
+        ))
+        .await
+        .expect("S3 accepts a new version");
+        assert_eq!(
+            b.get_blob("roots/0001", None).await.unwrap().body,
+            Bytes::from_static(b"forged")
+        );
+        assert_eq!(
+            b.get_retained_blob("roots/0001").await.unwrap().body,
+            Bytes::from_static(b"root")
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_object_cannot_be_copied_over() {
+        let b = MemoryBackend::new();
+        b.put_blob(locked("roots/0001", b"root", 3600))
+            .await
+            .unwrap();
+
         assert!(matches!(
             b.copy_blob(CopyBlobInput {
                 source_key: "roots/0001".into(),

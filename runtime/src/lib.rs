@@ -27,53 +27,37 @@ pub mod clock;
 pub mod env;
 pub mod flag;
 pub mod guest;
-pub mod guest_io;
 pub mod keys;
 pub mod linker;
-pub mod mount;
 pub mod net;
 pub mod notify;
 pub mod random;
 pub mod run;
 pub mod serve;
+pub mod signer;
 pub mod state;
 pub mod store;
-pub mod stream;
 pub mod tasks;
 pub mod telemetry;
 pub mod tenant;
-pub mod zfs;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-#[cfg(any(test, feature = "testing"))]
-pub use auth::SoftwareAuthenticator;
 pub use auth::{
-    build_relying_party, AuthEndpoints, ChallengeStore, FilesystemCredentials, Gate,
-    InteractionScope, TokenStore, AUTH_PREFIX, DEFAULT_CAPACITY, DEFAULT_TOKEN_CAPACITY,
+    AuthEndpoints, Gate, InteractionScope, TokenStore, AUTH_PREFIX, DEFAULT_TOKEN_CAPACITY,
 };
-pub use boot::{boot, BootConfig, BootMode, Booted, Pair, ReceiptTrust};
+pub use boot::{boot, BootConfig, BootMode, Booted, Pair};
 pub use clock::{open_clock, ClockSource, HostClock, PtpClock, TrustedClock, DEFAULT_PTP_DEVICE};
 pub use flag::parse_bool_flag;
 pub use guest::{fetch_guest, measure_guest, GuestSource, MAX_GUEST_BYTES};
-pub use guest_io::cloudwatch::{
-    boot_marker as guest_log_boot_marker, open_stream as open_guest_log_stream,
-    start as start_guest_log_forwarder, CloudWatchConfig, CloudWatchDestination, CloudWatchLogSink,
-    LogDestination, LogForwarder, PutError, PutOutcome, STARTUP_PROBE_TIMEOUT,
-};
-pub use guest_io::{
-    FanOutSink, GuestLogCollector, GuestLogRecord, GuestLogSink, GuestLogs, GuestStream,
-    TracingLogSink, GUEST_LOG_TARGET,
-};
 #[cfg(any(test, feature = "testing"))]
 pub use keys::StaticKey;
 pub use keys::{
-    open_key_source, KeyPointer, KmsAttestedKey, KmsKeyConfig, MasterKeyConfig, MasterKeySource,
-    MasterKeySourceKind, SealedKey,
+    open_key_source, open_operator_master, KeyPointer, KmsAttestedKey, KmsKeyConfig,
+    MasterKeyConfig, MasterKeySource, MasterKeySourceKind, OperatorMaster, SealedKey,
 };
 pub use linker::build_linker;
-pub use mount::{connect, parse_fs_id, MountConfig, DEFAULT_ROOT_RETENTION};
 pub use net::{bring_up, Network, NetworkConfig, NetworkMode, DEFAULT_GVFORWARDER};
 pub use nitro_nsm::{Nsm, NsmDevice, DEFAULT_NSM_DEVICE};
 pub use notify::{
@@ -83,10 +67,19 @@ pub use notify::{
 pub use random::{open_entropy, GuestRandom, HostEntropy, RandomSource};
 pub use run::{read_component, GuestEnvironment, GuestOutcome, EXIT_RUNTIME_FAILURE};
 pub use serve::{
-    apply_tenant, serve_component, AcmeConfig, CertificateSlot, GuestEgress, PoolLimits,
-    SealedAcmeCache, ServeConfig, ServeHandle, Server, Tenancy, TenantPool, TlsIdentity, TlsMode,
-    X_ENCLAVE_TENANT,
+    apply_tenant, serve_component, GuestEgress, PoolLimits, ServeConfig, ServeHandle, Server,
+    Tenancy, TenantPool, TlsIdentity, X_ENCLAVE_TENANT,
 };
 pub use state::State;
-pub use tenant::Arrival;
-pub use zfs::{Disk, Zfs};
+pub use store::mount::{connect, parse_fs_id, MountConfig, DEFAULT_ROOT_RETENTION};
+pub use store::registry::{Place, Registry};
+pub use store::zfs::{Arrival, AttachError, Disk, Release, Zfs};
+pub use telemetry::cloudwatch::{
+    boot_marker as guest_log_boot_marker, open_stream as open_guest_log_stream,
+    start as start_guest_log_forwarder, CloudWatchConfig, CloudWatchDestination, CloudWatchLogSink,
+    LogDestination, LogForwarder, PutError, PutOutcome, STARTUP_PROBE_TIMEOUT,
+};
+pub use telemetry::logs::{
+    FanOutSink, GuestLogCollector, GuestLogRecord, GuestLogSink, GuestLogs, GuestStream,
+    TracingLogSink, GUEST_LOG_TARGET,
+};

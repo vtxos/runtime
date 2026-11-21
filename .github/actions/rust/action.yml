@@ -31,8 +31,9 @@ runs:
       with:
         shared-key: ${{ inputs.shared-key }}
         workspaces: ${{ inputs.workspaces }}
-        # Pull requests restore but never save. Four jobs each saving a
-        # multi-gigabyte cache is what pushes the repository past the 10 GB
-        # limit, and the eviction that follows throws away the entry the next
-        # run needed. main writes the cache every branch then restores.
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        # Saved by every run, on every branch, and when the job failed: a pull
+        # request whose first run fails late must not pay for the whole build
+        # again on its second. It used to be saved from main only, to stay under
+        # the repository's 10 GB of cache. If entries start being evicted before
+        # they are used, that is the limit to look at.
+        cache-on-failure: true

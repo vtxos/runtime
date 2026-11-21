@@ -13,7 +13,7 @@
 //! # async fn f() -> anyhow::Result<()> {
 //! use enclave_runtime::testing::Enclave;
 //!
-//! let enclave = Enclave::builder(std::fs::read("cosigner.wasm")?)
+//! let enclave = Enclave::builder(std::fs::read("guest.wasm")?)
 //!     .background_tasks()
 //!     .notify()
 //!     .start()
@@ -24,10 +24,11 @@
 //! # Ok(()) }
 //! ```
 //!
-//! Everything below the guest is real: a real TLS handshake, a real WebAuthn
-//! ceremony, real interaction tokens scoped to one route, real tenant
-//! isolation, the real task scheduler, and attestation documents that verify
-//! against a chain this harness mints.
+//! Everything below the guest is real: a real TLS handshake, a real registration
+//! (the wallet key's DKG, and the tenant's pool made under the key it derives),
+//! real signed sign-ins and interaction tokens scoped to one route, real tenant
+//! isolation, and attestation documents that verify against a chain this harness
+//! mints.
 //!
 //! # What it is not
 //!
@@ -42,8 +43,8 @@
 //! QEMU harness in `deploy/qemu-nitro/` covers as much of them as an emulator
 //! can, and real hardware covers the rest.
 //!
-//! Behind the `testing` feature, like [`crate::SoftwareAuthenticator`], because
-//! it mints assertions and signs attestations. Nothing here may reach an image.
+//! Behind the `testing` feature, like [`crate::auth::client`], because it signs
+//! approvals and attestations. Nothing here may reach an image.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -51,7 +52,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::auth::SoftwareAuthenticator;
+use crate::auth::client::{Client, Registering};
 
 mod cosign;
 mod nsm;
@@ -60,10 +61,11 @@ mod stub;
 pub use cosign::CosigningNsm;
 pub use nsm::SigningNsm;
 
-/// The relying party this harness serves as.
-pub const RP_ID: &str = "enclave.test";
-/// The origin its assertions claim.
-pub const ORIGIN: &str = "https://enclave.test";
+/// The domain this harness's certificate names.
+pub const DOMAIN: &str = "enclave.test";
+
+/// The operator master this harness derives wallet keys from.
+pub const OPERATOR_MASTER: [u8; 32] = [7; 32];
 
 /// What `SigningNsm` reports as PCR0. A constant, and honest about it: nothing
 /// measured this.
@@ -77,20 +79,21 @@ pub struct Wake {
     pub token: String,
 }
 
-/// A registered passkey, ready to sign for requests.
+/// A registered wallet, ready to sign for requests.
 pub struct Credential {
-    authenticator: SoftwareAuthenticator,
+    client: Client,
     tenant: String,
 }
 
 impl Credential {
-    /// The tenant this passkey resolved to, hex encoded.
+    /// The tenant this wallet's key names, hex encoded.
     pub fn tenant(&self) -> &str {
         &self.tenant
     }
 
-    pub fn credential_id(&self) -> &[u8] {
-        self.authenticator.credential_id()
+    /// The wallet's side of its key, for signing alongside the runtime.
+    pub fn client(&self) -> &Client {
+        &self.client
     }
 }
 
@@ -139,6 +142,8 @@ pub struct Enclave {
     nsm: Arc<SigningNsm>,
     guest: Vec<u8>,
     push: Option<Arc<stub::Push>>,
+    /// The SHA-256 of the certificate it serves: what a client's signatures bind.
+    certificate: [u8; 32],
 }
 
 impl Enclave {
@@ -153,13 +158,13 @@ impl Enclave {
 
     async fn start(builder: EnclaveBuilder) -> Result<Enclave> {
         use crate::{
-            AuthEndpoints, ChallengeStore, FilesystemCredentials, Gate, GuestEnvironment,
-            HostClock, PoolLimits, ServeConfig, Tenancy, TlsIdentity,
+            AuthEndpoints, Gate, GuestEnvironment, HostClock, PoolLimits, ServeConfig, Tenancy,
+            TlsIdentity,
         };
 
         // A directory standing in for the pool: the harness runs without root
         // and without ZFS. What ZFS itself does is the emulator's to prove.
-        let fs = crate::zfs::Zfs::scratch().await;
+        let fs = crate::store::zfs::Zfs::scratch().await;
 
         let nsm = Arc::new(SigningNsm::new()?);
         // As `main` does, before anything could attest: the documents this
@@ -167,26 +172,27 @@ impl Enclave {
         crate::measure_guest(nsm.as_ref(), &builder.guest).context("measuring the guest")?;
         let entropy: Arc<dyn nitro_nsm::Nsm> = nsm.clone();
 
-        let credentials = Arc::new(FilesystemCredentials::new(fs.clone()));
-        let gate = Arc::new(Gate::new(
-            crate::build_relying_party(RP_ID, ORIGIN, &[])?,
-            ChallengeStore::new(std::time::Duration::from_secs(60), 256),
-            credentials.clone(),
-            crate::TokenStore::new(
-                std::time::Duration::from_secs(60),
-                crate::DEFAULT_TOKEN_CAPACITY,
-            ),
+        let keys = Arc::new(crate::signer::Keys::new(
+            fs.registry().clone(),
+            // A master from configuration, as the emulator has: the harness
+            // reaches no SSM.
+            Arc::new(crate::OperatorMaster::fixed(OPERATOR_MASTER)),
         ));
+        let gate = Arc::new(Gate::new(crate::TokenStore::new(
+            std::time::Duration::from_secs(60),
+            crate::DEFAULT_TOKEN_CAPACITY,
+        )));
         let auth = Arc::new(AuthEndpoints::new(
             gate.clone(),
-            credentials,
+            keys,
             fs.clone(),
             entropy.clone(),
+            crate::auth::ChallengeStore::new(std::time::Duration::from_secs(60), 256),
         ));
 
         // Detached: the collector runs as long as this environment can send,
         // which is what a harness wants. Production drains it explicitly.
-        let (logs, _collector) = crate::guest_io::start(Arc::new(crate::TracingLogSink));
+        let (logs, _collector) = crate::telemetry::logs::start(Arc::new(crate::TracingLogSink));
         // As the binary does it: what the guest file carries is the guest's environment.
         let env = crate::env::from_guest(&builder.guest)?;
         let guest_env = GuestEnvironment::new(fs, Arc::new(HostClock), entropy, &env, &[], logs)
@@ -202,7 +208,8 @@ impl Enclave {
             None => None,
         };
 
-        let tls = TlsIdentity::self_signed(&[RP_ID.to_string()])?;
+        let tls = TlsIdentity::self_signed(&[DOMAIN.to_string()])?;
+        let certificate = nitro_attestation::sha256(&tls.certificate_der);
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         drop(listener);
@@ -218,8 +225,7 @@ impl Enclave {
                     telemetry: builder.telemetry.clone(),
                     background_tasks: builder.background_tasks.then(Default::default),
                     addr,
-                    certificate: Some(crate::CertificateSlot::fixed(Arc::new(tls))),
-                    acme: None,
+                    certificate: Some(Arc::new(tls)),
                     attestation: Some(attestation),
                     request_timeout: std::time::Duration::from_secs(30),
                     max_interaction: std::time::Duration::from_secs(300),
@@ -237,6 +243,7 @@ impl Enclave {
                     nsm,
                     guest: builder.guest,
                     push,
+                    certificate,
                 });
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -277,39 +284,31 @@ impl Enclave {
         self.push.as_ref().map(|p| p.wakes()).unwrap_or_default()
     }
 
-    /// Register a passkey, and with it a new tenant.
+    /// Register a wallet, and with it a new tenant: the DKG in two calls, and
+    /// the tenant's pool made at the end of the second.
     pub async fn enrol(&self) -> Result<Credential> {
-        let authenticator = SoftwareAuthenticator::new(RP_ID);
+        let registering = Registering::new();
         let (status, options) = self
-            .post_json("/auth/register/options", serde_json::json!({}))
+            .post_json("/auth/register/options", registering.options_body())
             .await?;
         anyhow::ensure!(status == 200, "registration was refused: {options}");
-        let challenge = options["options"]["publicKey"]["challenge"]
-            .as_str()
-            .context("registration options carry no challenge")?;
-        let (status, body) = self
-            .post_json(
-                "/auth/register/verify",
-                serde_json::json!({
-                    "registration_id": options["registration_id"],
-                    "credential": authenticator.register(challenge, ORIGIN),
-                }),
-            )
-            .await?;
-        anyhow::ensure!(status == 200, "registration was refused: {body}");
+        let (body, pending) = registering
+            .verify_body(&options, &self.certificate)
+            .map_err(anyhow::Error::msg)?;
+        let (status, answer) = self.post_json("/auth/register/verify", body).await?;
+        anyhow::ensure!(status == 200, "registration was refused: {answer}");
+        let (client, _) = pending.finish(&answer).map_err(anyhow::Error::msg)?;
         Ok(Credential {
-            tenant: body["tenant_id"]
-                .as_str()
-                .context("no tenant id")?
-                .to_string(),
-            authenticator,
+            tenant: hex::encode(client.tenant()),
+            client,
         })
     }
 
-    /// A signed request: ask for a challenge bound to it, sign, then send it.
+    /// A signed request: a challenge for it, a signature over the challenge,
+    /// then the request itself with the token that bought.
     ///
-    /// Three round trips, because a passkey is a challenge and a response and
-    /// the approval names this exact method and path.
+    /// Three round trips: the sign-in is a challenge and a response, and the
+    /// approval names this exact method and path.
     pub async fn signed(
         &self,
         credential: &Credential,
@@ -330,40 +329,27 @@ impl Enclave {
     }
 
     async fn token_for(&self, credential: &Credential, method: &str, path: &str) -> Result<String> {
-        use base64::Engine as _;
-        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let (path_only, query) = match path.split_once('?') {
             Some((p, q)) => (p, Some(q)),
             None => (path, None),
         };
+        let client = &credential.client;
         let (status, options) = self
             .post_json(
                 "/auth/request/options",
-                serde_json::json!({
-                    "credential_id": b64.encode(credential.credential_id()),
-                    "method": method,
-                    "path": path_only,
-                    "query": query,
-                }),
+                client.options_body(method, path_only, query),
             )
             .await?;
         anyhow::ensure!(status == 200, "no challenge was issued: {options}");
-
-        let challenge = options["options"]["publicKey"]["challenge"]
-            .as_str()
-            .context("challenge options carry no challenge")?;
-        let assertion = credential.authenticator.assert(challenge, ORIGIN);
-        let (status, body) = self
-            .post_json(
-                "/auth/request/verify",
-                serde_json::json!({
-                    "challenge_id": options["challenge_id"],
-                    "assertion": b64.encode(assertion.to_string().as_bytes()),
-                }),
-            )
-            .await?;
-        anyhow::ensure!(status == 200, "the assertion was refused: {body}");
-        body["token"]
+        // The harness trusts the enclave it started, so it does not check the
+        // challenge's attestation before it signs.
+        let (body, sign_in) = client
+            .verify_body(&options, method, path_only, query, &self.certificate)
+            .map_err(anyhow::Error::msg)?;
+        let (status, answer) = self.post_json("/auth/request/verify", body).await?;
+        anyhow::ensure!(status == 200, "the sign-in was refused: {answer}");
+        sign_in.finish(&answer).map_err(anyhow::Error::msg)?;
+        answer["token"]
             .as_str()
             .map(str::to_string)
             .context("no token in the response")
@@ -411,18 +397,23 @@ impl Enclave {
         .with_custom_certificate_verifier(Arc::new(AcceptAny))
         .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let name = rustls::pki_types::ServerName::try_from(RP_ID)?;
+        let name = rustls::pki_types::ServerName::try_from(DOMAIN)?;
         let socket = tokio::net::TcpStream::connect(self.addr).await?;
         let mut stream = connector.connect(name, socket).await?;
 
-        let mut nonce = vec![0u8; 20];
-        getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("nonce: {e}"))?;
         let mut request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {RP_ID}\r\nConnection: close\r\n\
-             x-enclave-nonce: {}\r\nContent-Length: {}\r\n",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&nonce),
+            "{method} {path} HTTP/1.1\r\nHost: {DOMAIN}\r\nConnection: close\r\nContent-Length: {}\r\n",
             body.len()
         );
+        // A nonce on the options calls only: their answers carry a document that quotes it.
+        if crate::auth::ATTESTED_CALLS.contains(&path) {
+            let mut nonce = vec![0u8; 20];
+            getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("nonce: {e}"))?;
+            request.push_str(&format!(
+                "x-enclave-nonce: {}\r\n",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&nonce)
+            ));
+        }
         for (name, value) in headers {
             request.push_str(&format!("{name}: {value}\r\n"));
         }

@@ -1,10 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/enclave-auth",
+    "crates/enclave-client",
     "crates/nitro-attestation",
     "crates/nitro-nsm",
+    "crates/threshold",
     "runtime",
+    "wit",
 ]
+# The client is a workspace of its own (clients/react-native/rust): its networking and uniffi
+# stay out of this lock, and its rustls provider out of the runtime's builds.
+exclude = ["clients/react-native/rust"]
 
 [workspace.package]
 version = "0.1.0"

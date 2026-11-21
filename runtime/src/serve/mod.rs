@@ -16,21 +16,20 @@
 //!                       └──▶ everything else ──▶ guest
 //! ```
 
-pub mod acme;
 pub mod attest;
 pub mod client;
 pub mod egress;
+mod grpc;
 mod http;
 pub mod pool;
 pub mod progress;
 pub mod tls;
 
-pub use acme::{AcmeConfig, CertificateSlot, SealedAcmeCache};
 pub use client::{apply_tenant, X_ENCLAVE_TENANT};
 pub use egress::Origin;
 pub use http::{serve_component, ServeConfig, ServeHandle, Server, Tenancy};
 pub use pool::{Checkout, PoolLimits, Slot, TenantPool};
-pub use tls::{TlsIdentity, TlsMode};
+pub use tls::TlsIdentity;
 
 use wasmtime_wasi_http::p2::{
     bindings::http::types::ErrorCode, body::HyperOutgoingBody, types::HostFutureIncomingResponse,

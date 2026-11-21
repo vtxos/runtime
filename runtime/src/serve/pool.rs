@@ -15,11 +15,11 @@
 //! Serialised against itself, because a cosigner reserving a nonce must not
 //! race its own second request. Not against anyone else, because a client's
 //! dataset is theirs alone, so there is nothing for two clients to contend
-//! over in it. (Anchors are serialised across everyone — see [`crate::zfs`].)
+//! over in it. (Anchors are serialised across everyone — see [`crate::store::zfs`].)
 //!
 //! ## Keyed by tenant id
 //!
-//! The id the gate resolved from a passkey assertion. Callers with no tenant
+//! The id the gate resolved from the request's token. Callers with no tenant
 //! never get a slot; they share one lock of their own in the serving path.
 
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 ///
 /// A slot is a lock and two counters, so the cap bounds a map, not memory
 /// worth worrying about. It stays because registration is open: without one,
-/// every passkey that ever called would keep an entry for the life of the
+/// every wallet that ever called would keep an entry for the life of the
 /// process.
 #[derive(Debug, Clone)]
 pub struct PoolLimits {

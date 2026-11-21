@@ -1,4 +1,5 @@
-//! Dispatching an incoming HTTP request into a `wasi:http/proxy` guest.
+//! Dispatching an incoming HTTP request into the guest: a `wasi:http/proxy` guest as HTTP, or an
+//! `enclave:rpc/service` guest as gRPC ended here (see [`crate::serve::grpc`]).
 //!
 //! **One instance per request. No two requests ever share one.**
 //!
@@ -18,31 +19,33 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
-use wasmtime::component::{Component, InstancePre};
+use wasmtime::component::{Component, InstancePre, Resource};
 use wasmtime::{Engine, Store, UpdateDeadline};
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+use wasmtime_wasi_http::p2::types::{HostIncomingRequest, HostResponseOutparam};
 use wasmtime_wasi_http::p2::WasiHttpView;
 
 use crate::auth::{AuthEndpoints, Gate};
 use crate::linker::build_linker;
 use crate::run::GuestEnvironment;
-use crate::serve::acme::CertificateSlot;
 use crate::serve::attest::{nonce_from_headers, ResponseAttestor};
 use crate::serve::client::apply_tenant;
+use crate::serve::grpc;
 use crate::serve::pool::{PoolLimits, TenantPool};
 use crate::serve::progress::{Counting, StreamProgress};
+use crate::serve::tls::TlsIdentity;
 use crate::state::State;
 use nitro_nsm::Nsm;
 
 /// How the guest is served.
 #[derive(Debug)]
 pub struct ServeConfig {
-    /// Limits for tenant-bound durable tasks, which run when the guest exports `run-task`.
-    /// `None` turns them off whatever the guest exports.
-    pub background_tasks: Option<crate::tasks::TaskLimits>,
+    /// Tenant-bound durable tasks, which run when the guest exports `run-task`: their limits,
+    /// and where they are scheduled. `None` turns them off whatever the guest exports.
+    pub background_tasks: Option<crate::tasks::BackgroundTasks>,
     /// Opt-in push notifications. The registry and the forwarder are opened
     /// here rather than by the caller, because both need the mounted
     /// filesystem and the trusted clock, and this is where those exist.
@@ -52,16 +55,9 @@ pub struct ServeConfig {
     pub telemetry: crate::telemetry::Telemetry,
     /// Address to accept on.
     pub addr: SocketAddr,
-    /// Where TLS connections take their serving identity. `None` serves
-    /// plaintext.
-    ///
-    /// A renewal is a `set()` on it. Connections already established keep the
-    /// identity they loaded, which is the property per-response attestation
-    /// depends on and the only way to exercise it without driving a real ACME
-    /// order.
-    pub certificate: Option<CertificateSlot>,
-    /// A running ACME client, instead of a fixed certificate.
-    pub acme: Option<crate::serve::acme::Acme>,
+    /// The certificate every TLS connection is served: one the enclave made for
+    /// itself at boot. `None` serves plaintext.
+    pub certificate: Option<Arc<TlsIdentity>>,
     /// NSM to sign the attestation document on each `/auth/*` response.
     ///
     /// Only useful alongside `tls`: the document binds the serving
@@ -113,7 +109,6 @@ impl Default for ServeConfig {
             telemetry: Default::default(),
             addr: ([0, 0, 0, 0], 8080).into(),
             certificate: None,
-            acme: None,
             attestation: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_interaction: DEFAULT_MAX_INTERACTION,
@@ -156,16 +151,64 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// holds it until the process ends.
 const DEFAULT_MAX_INTERACTION: Duration = Duration::from_secs(300);
 
-/// A guest instance and the store it is bound to, for one call.
-///
-/// The two travel together because `instantiate_async` binds a `Proxy` to one
-/// store: separating them would produce a handle that looks usable and
-/// resolves against the wrong memory.
+/// The store one call runs in.
 struct GuestInstance {
     store: Store<State>,
-    proxy: wasmtime_wasi_http::p2::bindings::Proxy,
     /// Shared with this store's epoch callback.
     progress: Arc<StreamProgress>,
+}
+
+/// What the guest is, by what it exports.
+enum GuestShape {
+    /// `wasi:http/incoming-handler`: the guest serves HTTP itself.
+    Http(ProxyPre<State>),
+    /// `enclave:rpc/service`: the runtime ends gRPC, and the guest sees messages.
+    Rpc(grpc::ServerPre<State>),
+}
+
+/// Where a guest's response head arrives.
+type Head = std::result::Result<
+    hyper::Response<HyperOutgoingBody>,
+    wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
+>;
+
+/// One call, ready to run in the store it was prepared in.
+///
+/// An HTTP guest's instance and request already live in that store, as guest resources: an
+/// instance binds to one store, and separating them would produce a handle that looks usable and
+/// resolves against the wrong memory. An rpc guest is instantiated inside the call, where its
+/// streams can run.
+// One per request, made and moved once: boxing either variant would buy nothing.
+#[allow(clippy::large_enum_variant)]
+enum Call<B> {
+    Http {
+        proxy: wasmtime_wasi_http::p2::bindings::Proxy,
+        req: Resource<HostIncomingRequest>,
+        out: Resource<HostResponseOutparam>,
+    },
+    Rpc {
+        pre: grpc::ServerPre<State>,
+        req: hyper::Request<Counting<B>>,
+        head: tokio::sync::oneshot::Sender<Head>,
+    },
+}
+
+impl<B> Call<B>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
+    B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
+{
+    async fn run(self, store: &mut Store<State>) -> wasmtime::Result<()> {
+        match self {
+            Call::Http { proxy, req, out } => {
+                proxy
+                    .wasi_http_incoming_handler()
+                    .call_handle(store, req, out)
+                    .await
+            }
+            Call::Rpc { pre, req, head } => grpc::serve(store, &pre, req, head).await,
+        }
+    }
 }
 
 /// A compiled guest plus the environment its instances are built from.
@@ -175,12 +218,12 @@ struct GuestInstance {
 /// component that will not compile fails at boot rather than on the first
 /// request to arrive.
 pub struct ServeHandle {
-    pre: ProxyPre<State>,
+    shape: GuestShape,
     background_pre: InstancePre<State>,
     tasks: Option<Arc<crate::tasks::TaskQueue>>,
-    /// Connections this runtime holds for guests — see [`crate::stream`].
-    streams: Option<Arc<crate::stream::StreamRegistry>>,
     notify: Option<Arc<crate::notify::Notifier>>,
+    /// What each wallet's dealt share is recomputed from, for `enclave:signer`.
+    signer_keys: Option<Arc<crate::signer::Keys>>,
     /// Where each invocation's trace and metrics go. Every invocation gets a context, so a guest's
     /// telemetry calls always resolve.
     telemetry: crate::telemetry::Telemetry,
@@ -237,6 +280,11 @@ impl Tenancy {
 }
 
 impl ServeHandle {
+    /// The storage the guest's tenants live on.
+    pub fn zfs(&self) -> &Arc<crate::store::zfs::Zfs> {
+        self.guest.zfs()
+    }
+
     /// An `Engine` configured for the watchdog, plus the ticker that drives it.
     ///
     /// Epoch interruption is what makes a spinning guest interruptible at all:
@@ -247,6 +295,9 @@ impl ServeHandle {
     pub fn engine_with_watchdog() -> Result<Engine> {
         let mut config = wasmtime::Config::new();
         config.epoch_interruption(true);
+        // Async exports, streams and futures: what an `enclave:rpc/service` guest is made of.
+        // A `wasi:http` guest uses none of it and is served as before.
+        config.wasm_component_model_async(true);
         let engine = Engine::new(&config)?;
 
         let ticker = engine.weak();
@@ -282,17 +333,23 @@ impl ServeHandle {
             .instantiate_pre(&component)
             .map_err(|e| anyhow::anyhow!(e.to_string()))
             .context("pre-instantiating guest component")?;
-        let pre = ProxyPre::new(instance_pre.clone())
-            .map_err(|e| anyhow::anyhow!(e.to_string()))
-            .context("guest does not export wasi:http/incoming-handler")?;
+        let shape = match grpc::ServerPre::new(instance_pre.clone()) {
+            Ok(pre) => GuestShape::Rpc(pre),
+            Err(rpc) => GuestShape::Http(ProxyPre::new(instance_pre.clone()).map_err(|http| {
+                anyhow::anyhow!(
+                    "the guest exports neither enclave:rpc/service ({rpc}) nor \
+                     wasi:http/incoming-handler ({http})"
+                )
+            })?),
+        };
 
         Ok(ServeHandle {
             background_pre: instance_pre,
             tasks: None,
-            streams: None,
             notify: None,
+            signer_keys: None,
             telemetry: Default::default(),
-            pre,
+            shape,
             guest: Arc::new(guest),
             anonymous: Arc::new(tokio::sync::Mutex::new(())),
             timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -322,21 +379,6 @@ impl ServeHandle {
         Ok(self)
     }
 
-    /// Let the runtime hold outbound connections on a guest's behalf.
-    ///
-    /// Tenant isolation is required for the same reason tasks require it: a
-    /// connection belongs to a tenant, and the invocations its messages cause
-    /// run in that tenant's filesystem. Without tenancy there is nobody to
-    /// attribute either to.
-    pub fn with_streams(mut self, registry: Arc<crate::stream::StreamRegistry>) -> Result<Self> {
-        anyhow::ensure!(
-            self.tenancy.is_some(),
-            "held connections require tenant isolation"
-        );
-        self.streams = Some(registry);
-        Ok(self)
-    }
-
     /// Let the guest wake its tenant's devices.
     ///
     /// Tenant isolation is required for the same reason tasks require it: a
@@ -351,6 +393,13 @@ impl ServeHandle {
         Ok(self)
     }
 
+    /// Where `enclave:signer` reads each tenant's wallet key: the auth
+    /// endpoints' keys, since registration made them and sign-in opened them.
+    pub fn with_signer_keys(mut self, keys: Arc<crate::signer::Keys>) -> Self {
+        self.signer_keys = Some(keys);
+        self
+    }
+
     /// Ship guest spans and metrics. No tenancy requirement: an anonymous request is attributed
     /// to the anonymous tenant, as its filesystem is.
     pub fn with_telemetry(mut self, telemetry: crate::telemetry::Telemetry) -> Self {
@@ -358,114 +407,15 @@ impl ServeHandle {
         self
     }
 
-    /// An internal component export, never an HTTP route or a fabricated token.
-    /// One message from a held connection, as one guest invocation.
-    ///
-    /// The same shape as [`Self::run_background`] and for the same reasons: a
-    /// fresh instance, the tenant's lock, a wall deadline. What differs is only
-    /// what woke it — a counterparty rather than a clock — and that it may reply.
-    ///
-    /// `interactive` is FALSE. A message arriving over a connection is not its
-    /// owner asking for something, so it cannot open connections or schedule
-    /// work, exactly as a background run cannot.
-    pub(crate) async fn run_message(
-        &self,
-        streams: &Arc<crate::stream::StreamRegistry>,
-        tenant: [u8; 16],
-        id: &str,
-        message_id: &str,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        let tenancy = self
-            .tenancy
-            .as_ref()
-            .context("held connections require tenants")?;
-        let checkout = tenancy.pool.checkout(&tenant);
-        let _guard = checkout.slot().lock().clone().lock_owned().await;
-        let work = async {
-            let state = self.tenant_state(tenant).await?;
-            let mut store = Store::new(self.pre.engine(), state);
-            store.set_epoch_deadline(1);
-            store.epoch_deadline_async_yield_and_update(1);
-            let instance = self.background_pre.instantiate_async(&mut store).await?;
-            store.data_mut().streams = Some(crate::stream::StreamContext {
-                registry: streams.clone(),
-                tenant,
-                interactive: false,
-            });
-            store.data_mut().notify =
-                self.notify
-                    .as_ref()
-                    .map(|notifier| crate::notify::NotifyContext {
-                        notifier: notifier.clone(),
-                        tenant,
-                        interactive: false,
-                    });
-            store.data_mut().telemetry = Some(
-                self.telemetry
-                    .context(tenant, crate::telemetry::Invocation::Message),
-            );
-            let run = instance
-                .get_typed_func::<(String, String, Vec<u8>), (std::result::Result<Vec<u8>, String>,)>(
-                    &mut store,
-                    "on-message",
-                )
-                .map_err(|e| anyhow::anyhow!(e.to_string()))
-                .context("held connections require the on-message export")?;
-            let (result,) = run
-                .call_async(
-                    &mut store,
-                    (id.to_string(), message_id.to_string(), payload),
-                )
-                .await?;
-            let bytes = result.map_err(anyhow::Error::msg)?;
-            anyhow::ensure!(
-                bytes.len() <= crate::stream::MAX_MESSAGE,
-                "reply exceeds the message ceiling"
-            );
-            // Before the reply leaves: it may say what was written.
-            match self.guest.zfs().anchor_tenant(tenant).await {
-                Ok(()) => {
-                    if let Some(notify) = &self.notify {
-                        notify.deliver_staged(tenant);
-                    }
-                }
-                Err(e) => {
-                    if let Some(notify) = &self.notify {
-                        notify.drop_staged(tenant);
-                    }
-                    return Err(e);
-                }
-            }
-            Ok(bytes)
-        };
-        // The same wall clock that bounds an interaction. A guest parked in a
-        // host call executes no wasm, so the epoch alone would never reach it.
-        tokio::time::timeout(self.timeout, work)
-            .await
-            .context("the guest took too long to answer a message")?
-    }
-
-    /// One task run: a fresh instance, under the same tenant lock as requests.
-    pub(crate) async fn run_background(
+    /// One task attempt: a fresh instance, its `run-task`, and then whatever it wrote anchored.
+    async fn run_task(
         &self,
         queue: &Arc<crate::tasks::TaskQueue>,
-        task: &crate::tasks::Task,
-    ) -> Result<Option<Vec<u8>>> {
-        let tenancy = self
-            .tenancy
-            .as_ref()
-            .context("background tasks require tenants")?;
-        let checkout = tenancy.pool.checkout(&task.tenant);
-        let Ok(_guard) = checkout.slot().lock().clone().try_lock_owned() else {
-            return Ok(None);
-        };
-        if !queue.begin(task).await? {
-            return Ok(Some(Vec::new()));
-        }
+        job: &crate::tasks::Job,
+    ) -> Result<Vec<u8>> {
         let work = async {
-            let state = self.tenant_state(task.tenant).await?;
-            let mut store = Store::new(self.pre.engine(), state);
+            let state = self.tenant_state(job.tenant).await?;
+            let mut store = Store::new(self.background_pre.engine(), state);
             // Yield every tick, even in CPU-only loops, so the wall deadline
             // can cancel both guest code and async host calls.
             store.set_epoch_deadline(1);
@@ -473,7 +423,7 @@ impl ServeHandle {
             let instance = self.background_pre.instantiate_async(&mut store).await?;
             store.data_mut().tasks = Some(crate::tasks::TaskContext {
                 queue: queue.clone(),
-                tenant: task.tenant,
+                tenant: job.tenant,
                 interactive: false,
             });
             store.data_mut().notify =
@@ -481,41 +431,49 @@ impl ServeHandle {
                     .as_ref()
                     .map(|notifier| crate::notify::NotifyContext {
                         notifier: notifier.clone(),
-                        tenant: task.tenant,
+                        tenant: job.tenant,
                         interactive: false,
                     });
             store.data_mut().telemetry = Some(
                 self.telemetry
-                    .context(task.tenant, crate::telemetry::Invocation::Task),
+                    .context(job.tenant, crate::telemetry::Invocation::Task),
             );
             let run = instance
                 .get_typed_func::<(String, Vec<u8>), (std::result::Result<Vec<u8>, String>,)>(
                     &mut store, "run-task",
                 )?;
             let (result,) = run
-                .call_async(&mut store, (task.run_id(), task.payload.clone()))
+                .call_async(&mut store, (job.run_id(), job.payload.clone()))
                 .await?;
             let bytes = result.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(bytes.len() <= 64 * 1024, "task result exceeds 64 KiB");
-            // Anchored with the outcome, by the queue's `finish`.
-            Ok(Some(bytes))
+            Ok(bytes)
         };
-        tokio::time::timeout(queue.limits.timeout, work)
+        let outcome = tokio::time::timeout(queue.limits.timeout, work)
             .await
-            .context("background task deadline exceeded")?
+            .context("background task deadline exceeded")
+            .and_then(|outcome| outcome);
+        // Whatever the guest wrote reaches the anchor before its outcome is recorded or anyone
+        // is woken, failed attempts included: they may have written too.
+        self.guest
+            .zfs()
+            .anchor_tenant(job.tenant)
+            .await
+            .context("anchoring a task's writes")?;
+        outcome
     }
 
-    /// Deliver a tenant's staged wakes — for the task worker, once `finish` has
-    /// anchored the outcome the wake announces.
-    pub(crate) fn deliver_wakes(&self, tenant: [u8; 16]) {
+    /// Deliver a tenant's staged wakes — for the task worker, once the outcome the
+    /// wake announces is recorded.
+    fn deliver_wakes(&self, tenant: [u8; 16]) {
         if let Some(notify) = &self.notify {
             notify.deliver_staged(tenant);
         }
     }
 
     /// Drop a tenant's staged wakes unsent — if the outcome could not be
-    /// anchored.
-    pub(crate) fn drop_wakes(&self, tenant: [u8; 16]) {
+    /// recorded.
+    fn drop_wakes(&self, tenant: [u8; 16]) {
         if let Some(notify) = &self.notify {
             notify.drop_staged(tenant);
         }
@@ -572,8 +530,8 @@ impl ServeHandle {
     ///
     /// `tenant` is required rather than defaulted, so every caller has to
     /// answer the question. It is **not** a way around the gate: with one
-    /// configured, [`serve_connection`] verifies an assertion before it gets
-    /// here and there is no path that reaches a guest without one.
+    /// configured, [`serve_connection`] spends a token before it gets here and
+    /// there is no path that reaches a guest without one.
     pub async fn handle<B>(
         &self,
         scheme: Scheme,
@@ -638,26 +596,11 @@ impl ServeHandle {
         // Owned, so it can move into the task below and outlive this function.
         let guard = checkout.slot().lock().clone().lock_owned().await;
 
-        // Under the lock, so two simultaneous first requests from one client
-        // resolve to one directory, the second waiting here rather than racing
-        // the first into a second `zfs create`.
-        let (dir, arrival) = self.guest.zfs().tenant_dir(tenant_id).await?;
-        if arrival == crate::tenant::Arrival::New {
-            tracing::info!(tenant = %hex::encode(tenant_id), "tenant directory created");
-        }
+        // Attached when the token was granted, with the key its owner sent:
+        // a release reaches no tenant's data any other way.
+        let dir = self.guest.zfs().attached_dir(tenant_id)?;
 
-        let mut instance = self.instantiate(&dir).await?;
-        instance.store.data_mut().streams =
-            self.streams
-                .as_ref()
-                .map(|registry| crate::stream::StreamContext {
-                    registry: registry.clone(),
-                    tenant: tenant_id,
-                    // Its owner is here, so this invocation may open and close
-                    // connections — unlike one caused by a message arriving on
-                    // one, which may only reply.
-                    interactive: true,
-                });
+        let mut instance = self.store_for(&dir)?;
         instance.store.data_mut().tasks =
             self.tasks.as_ref().map(|queue| crate::tasks::TaskContext {
                 queue: queue.clone(),
@@ -676,21 +619,20 @@ impl ServeHandle {
             self.telemetry
                 .context(tenant_id, crate::telemetry::Invocation::Request),
         );
+        // Here and nowhere else: signing needs the wallet's half of each round,
+        // so its owner connected.
+        instance.store.data_mut().signer =
+            self.signer_keys
+                .as_ref()
+                .map(|keys| crate::signer::SignerContext {
+                    keys: keys.clone(),
+                    tenant: tenant_id,
+                });
         let progress = instance.progress.clone();
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        // Wrapped before it becomes a guest resource, which is the last point
-        // the runtime holds it.
+        // Wrapped before it becomes the guest's, which is the last point the
+        // runtime holds it.
         let req = req.map(|body| Counting::new(body, progress.clone()));
-        let req = instance
-            .store
-            .data_mut()
-            .http()
-            .new_incoming_request(scheme, req)?;
-        let out = instance
-            .store
-            .data_mut()
-            .http()
-            .new_response_outparam(sender)?;
+        let (call, receiver) = self.prepare(&mut instance.store, scheme, req).await?;
 
         let zfs = self.guest.zfs().clone();
         let notify = self.notify.clone();
@@ -705,11 +647,7 @@ impl ServeHandle {
             let _guard = guard;
             let _checkout = checkout;
             let mut instance = instance;
-            let result = instance
-                .proxy
-                .wasi_http_incoming_handler()
-                .call_handle(&mut instance.store, req, out)
-                .await;
+            let result = call.run(&mut instance.store).await;
             if result.is_err() {
                 tracing::warn!("guest trapped; its instance dies with the call");
             }
@@ -736,29 +674,57 @@ impl ServeHandle {
     /// A background or message run's state: the tenant's dataset as `/`. One
     /// that has gone is not brought back by work running in its name.
     async fn tenant_state(&self, tenant: [u8; 16]) -> Result<State> {
-        let dir = self.guest.zfs().existing_tenant_dir(tenant).await?;
+        let dir = self.guest.zfs().attached_dir(tenant)?;
         self.guest.new_state(Some(&dir))
     }
 
-    /// Build an instance whose guest sees `dir` as `/`.
+    /// A store whose guest sees `dir` as `/`, watched by the epoch.
     ///
     /// Every tenant request gets one, used for that call and dropped with it.
-    async fn instantiate(&self, dir: &std::path::Path) -> Result<GuestInstance> {
-        let mut store = Store::new(self.pre.engine(), self.guest.new_state(Some(dir))?);
+    fn store_for(&self, dir: &std::path::Path) -> Result<GuestInstance> {
+        let mut store = Store::new(
+            self.background_pre.engine(),
+            self.guest.new_state(Some(dir))?,
+        );
         let progress = Arc::new(StreamProgress::new());
         store.set_epoch_deadline(self.watchdog());
         self.arm_watchdog(&mut store, progress.clone());
-        let proxy = self
-            .pre
-            .instantiate_async(&mut store)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))
-            .context("instantiating the guest")?;
-        Ok(GuestInstance {
-            store,
-            proxy,
-            progress,
-        })
+        Ok(GuestInstance { store, progress })
+    }
+
+    /// Ready one call in `store`, and where its response head will arrive.
+    ///
+    /// An HTTP guest is instantiated here, so one that will not start fails
+    /// before anything is spawned; an rpc guest is instantiated inside the call.
+    async fn prepare<B>(
+        &self,
+        store: &mut Store<State>,
+        scheme: Scheme,
+        req: hyper::Request<Counting<B>>,
+    ) -> Result<(Call<B>, tokio::sync::oneshot::Receiver<Head>)>
+    where
+        B: hyper::body::Body<Data = bytes::Bytes> + Send + Unpin + 'static,
+        B::Error: Into<wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>,
+    {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let call = match &self.shape {
+            GuestShape::Http(pre) => {
+                let proxy = pre
+                    .instantiate_async(&mut *store)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+                    .context("instantiating the guest")?;
+                let req = store.data_mut().http().new_incoming_request(scheme, req)?;
+                let out = store.data_mut().http().new_response_outparam(sender)?;
+                Call::Http { proxy, req, out }
+            }
+            GuestShape::Rpc(pre) => Call::Rpc {
+                pre: pre.clone(),
+                req,
+                head: sender,
+            },
+        };
+        Ok((call, receiver))
     }
 
     /// Let a call that is moving bytes outlive the budget; keep one that is not
@@ -814,22 +780,20 @@ impl ServeHandle {
         let head = req.method() == hyper::Method::HEAD;
         let anonymous = self.anonymous.clone().lock_owned().await;
 
-        // One shared directory, never the pool's root: that would hand an
-        // unauthenticated guest `/runtime` and every tenant.
-        let (dir, _) = self.guest.zfs().tenant_dir(ANONYMOUS).await?;
-        let mut store = Store::new(self.pre.engine(), self.guest.new_state(Some(&dir))?);
+        // One shared pool, keyed by this release, and only its `data`
+        // dataset: never anything that would hand an unauthenticated guest a
+        // tenant's records.
+        let dir = self.guest.zfs().anonymous_dir().await?;
+        let GuestInstance {
+            mut store,
+            progress,
+        } = self.store_for(&dir)?;
         store.data_mut().telemetry = Some(
             self.telemetry
                 .context(ANONYMOUS, crate::telemetry::Invocation::Request),
         );
-        let progress = Arc::new(StreamProgress::new());
-        store.set_epoch_deadline(self.watchdog());
-        self.arm_watchdog(&mut store, progress.clone());
-        let (sender, receiver) = tokio::sync::oneshot::channel();
         let req = req.map(|body| Counting::new(body, progress.clone()));
-        let req = store.data_mut().http().new_incoming_request(scheme, req)?;
-        let out = store.data_mut().http().new_response_outparam(sender)?;
-        let pre = self.pre.clone();
+        let (call, receiver) = self.prepare(&mut store, scheme, req).await?;
         let zfs = self.guest.zfs().clone();
         let (anchored_tx, anchored_rx) = tokio::sync::oneshot::channel();
 
@@ -838,11 +802,8 @@ impl ServeHandle {
         // it is held for the whole call rather than released at the head.
         let task = tokio::task::spawn(async move {
             let _anonymous = anonymous;
-            let proxy = pre.instantiate_async(&mut store).await?;
-            let result = proxy
-                .wasi_http_incoming_handler()
-                .call_handle(store, req, out)
-                .await;
+            let mut store = store;
+            let result = call.run(&mut store).await;
             let _ = anchored_tx.send(zfs.anchor_tenant(ANONYMOUS).await);
             result
         });
@@ -865,13 +826,15 @@ impl ServeHandle {
     /// which is nothing new: [`ServeHandle::in_fresh_instance`] runs it on
     /// every request already.
     pub async fn verify_instantiates(&self) -> Result<()> {
-        let mut store = Store::new(self.pre.engine(), self.guest.new_state(None)?);
+        let mut store = Store::new(self.background_pre.engine(), self.guest.new_state(None)?);
         // A deadline of its own, or a guest that hangs in `start` would hang
         // the boot rather than failing it.
         store.set_epoch_deadline(self.watchdog());
-        self.pre
-            .instantiate_async(&mut store)
-            .await
+        let started = match &self.shape {
+            GuestShape::Http(pre) => pre.instantiate_async(&mut store).await.map(drop),
+            GuestShape::Rpc(pre) => pre.instantiate_async(&mut store).await.map(drop),
+        };
+        started
             .map_err(|e| anyhow::anyhow!(e.to_string()))
             .context("instantiating the guest")?;
         if self.tasks.is_some() {
@@ -887,6 +850,41 @@ impl ServeHandle {
         // The store and the instance drop here. Nothing is kept: an instance
         // that outlived this call would be an instance two requests could
         // share, which is the whole thing this design refuses.
+    }
+}
+
+/// A tenant's turn: its lock, and the checkout that keeps its slot from being reused while the
+/// lock is held. Dropped in that order.
+struct TenantTurn {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _checkout: crate::serve::pool::Checkout,
+}
+
+#[async_trait::async_trait]
+impl crate::tasks::Runner for ServeHandle {
+    fn turn(&self, tenant: [u8; 16]) -> Option<Box<dyn Send>> {
+        let checkout = self.tenancy.as_ref()?.pool.checkout(&tenant);
+        let guard = checkout.slot().lock().clone().try_lock_owned().ok()?;
+        Some(Box::new(TenantTurn {
+            _guard: guard,
+            _checkout: checkout,
+        }))
+    }
+
+    async fn run(
+        &self,
+        queue: &Arc<crate::tasks::TaskQueue>,
+        job: &crate::tasks::Job,
+    ) -> Result<Vec<u8>> {
+        self.run_task(queue, job).await
+    }
+
+    fn wakes(&self, tenant: [u8; 16], deliver: bool) {
+        if deliver {
+            self.deliver_wakes(tenant);
+        } else {
+            self.drop_wakes(tenant);
+        }
     }
 }
 
@@ -1013,9 +1011,9 @@ fn resumed<S>(stream: &tokio_rustls::server::TlsStream<S>, peer: SocketAddr) -> 
     false
 }
 
-/// The directory callers without a gate share. Tenant ids are drawn from the
-/// NSM, so none is ever all zeroes.
-const ANONYMOUS: [u8; 16] = [0; 16];
+/// The tenant callers without a gate share. A tenant id is a hash of a group
+/// key, so none is ever all zeroes.
+use crate::tenant::ANONYMOUS;
 
 /// Hold a response's end until what produced it is anchored, so no client can
 /// see it finish before the writes it may describe would survive the host.
@@ -1151,9 +1149,9 @@ fn refused(status: hyper::StatusCode, detail: &str) -> hyper::Response<HyperOutg
 
 /// Serve one connection, whatever it is wrapped in.
 ///
-/// Generic over the stream so the three arms above — fixed TLS, ACME TLS and
-/// plaintext — share one body instead of three copies of it. All three satisfy
-/// the bound, so this monomorphises and costs nothing at runtime.
+/// Generic over the stream so the two arms above — TLS and plaintext — share one
+/// body instead of two copies of it. Both satisfy the bound, so this
+/// monomorphises and costs nothing at runtime.
 ///
 /// The service closure is built here rather than by the caller because it must
 /// capture `client`, and `client` does not exist until the handshake has
@@ -1203,51 +1201,60 @@ where
         // every request on a kept-alive connection.
         let scheme = scheme.clone();
         async move {
-            // One place, before the router, so the rule covers the guest,
-            // `/auth/*`, `/enclave/*` and every refusal alike — and so a
-            // request without a nonce reaches none of them.
-            // Required whether or not this deployment attests. A client then
-            // behaves identically either way, and a deployment cannot silently
-            // stop attesting without its clients noticing — which is the
-            // failure a client can least afford to miss.
-            let nonce = match nonce_from_headers(req.headers()) {
-                Ok(nonce) => nonce,
-                Err(e) => {
-                    // No document on this one: there is no nonce to bind, and
-                    // one the runtime chose would prove nothing.
-                    tracing::debug!(reason = %e, "refused a request with no usable nonce");
-                    return Ok::<_, anyhow::Error>(refused(
-                        hyper::StatusCode::BAD_REQUEST,
-                        &e.to_string(),
-                    ));
+            // A nonce on the options calls, the only ones whose answers carry
+            // a document (`ATTESTED_CALLS`); no other call takes one. Checked
+            // before the route runs, so a call refused for it leaves no
+            // challenge or half-finished registration behind. Without sign-in
+            // there are no `/auth` routes, and those paths are the guest's like
+            // any other.
+            let attested_call =
+                auth.is_some() && crate::auth::ATTESTED_CALLS.contains(&req.uri().path());
+            let nonce = if attested_call {
+                match nonce_from_headers(req.headers()) {
+                    Ok(nonce) => Some(nonce),
+                    Err(e) => {
+                        // No document on this one: there is no nonce to bind, and
+                        // one the runtime chose would prove nothing.
+                        tracing::debug!(reason = %e, "refused an options call with no usable nonce");
+                        return Ok::<_, anyhow::Error>(refused(
+                            hyper::StatusCode::BAD_REQUEST,
+                            &e.to_string(),
+                        ));
+                    }
                 }
+            } else {
+                None
             };
 
-            // Only where a client still has to work out who it is talking to,
-            // which is the `/auth/` exchange and nothing after it.
+            // Only where a client still has to work out who it is talking to:
+            // the options calls, each the first of its operation. The auth
+            // route decides, and no refusal is attested.
             //
-            // A client identifies the enclave on the challenge request — that
-            // response's document binds the certificate it was served — and
-            // then pins that certificate for the operation. TLS proves the peer
+            // A client identifies the enclave on that answer — its document
+            // binds the certificate it was served — and then pins that
+            // certificate for the rest of the operation. TLS proves the peer
             // holds its private key, which the certificate itself, being
             // public, does not; so "the same certificate" and "the same
-            // enclave" are one statement, and the operation needs no second
-            // signature to establish what the first already did.
+            // enclave" are one statement, and the verify call and the
+            // interaction need no document of their own. Each would cost an
+            // NSM signature, and the device is the throughput ceiling —
+            // `CONCURRENT_DOCUMENTS` is 4.
             //
-            // Attesting it anyway cost an NSM signature per operation, and the
-            // device is the throughput ceiling — `CONCURRENT_DOCUMENTS` is 4.
-            // That halves the signatures a signed request costs.
-            let attest_this = req.uri().path().starts_with(crate::auth::AUTH_PREFIX);
+            // The SHA-256 of the certificate this connection was served: what a
+            // client's signature binds, so one made for anyone else's is refused.
+            let served = certificate
+                .as_ref()
+                .map(|c| nitro_attestation::sha256(c))
+                .unwrap_or(crate::auth::approval::NO_CERTIFICATE);
 
-            // Generated before the request is routed, not after the
-            // response exists: it binds the nonce and the connection's
-            // certificate, neither of which depends on what the guest says.
-            // Doing it here means a failure refuses before the guest runs,
-            // rather than stranding a half-produced response.
-            let document = match &attestor {
-                Some(attestor) if attest_this => {
+            // Made once the auth route has answered, never for a guest response:
+            // an `/auth` answer is small and whole, so nothing is stranded if
+            // attesting it fails.
+            let (mut response, attest) = route(req, guest, auth, gate, scheme, &served).await?;
+            let document = match (&attestor, &nonce) {
+                (Some(attestor), Some(nonce)) if attest => {
                     match attestor
-                        .document(certificate.as_ref().map(|c| c.as_slice()), &nonce)
+                        .document(certificate.as_ref().map(|c| c.as_slice()), nonce)
                         .await
                     {
                         Ok(document) => Some(document),
@@ -1270,12 +1277,10 @@ where
                         }
                     }
                 }
-                // Either the deployment does not attest, or this is a request
-                // whose caller has already identified the enclave.
+                // Either the deployment does not attest, or this is not one of
+                // the two answers that carry a document.
                 _ => None,
             };
-
-            let mut response = route(req, guest, auth, gate, scheme).await?;
             match document {
                 Some(document) => crate::serve::attest::attach(&mut response, document),
                 // Not "leave it as it is": a response the runtime did not
@@ -1312,15 +1317,16 @@ async fn route(
     auth: Option<Arc<AuthEndpoints>>,
     gate: Option<Arc<Gate>>,
     scheme: Scheme,
-) -> Result<hyper::Response<HyperOutgoingBody>> {
+    served: &[u8; 32],
+) -> Result<(hyper::Response<HyperOutgoingBody>, bool)> {
     {
         {
             let method = req.method().clone();
             let path = req.uri().path().to_string();
 
             // `/auth/` is checked first and is not forwardable: a guest able
-            // to answer there could hand out its own challenges and verify its
-            // own assertions, which is the same as having none.
+            // to answer there could hand out its own tokens, which is the same
+            // as having none.
             if let Some(auth) = &auth {
                 if path.starts_with(crate::auth::AUTH_PREFIX) {
                     // `/auth/*` bodies are small and bounded by the endpoints
@@ -1330,16 +1336,19 @@ async fn route(
                         Ok(collected) => collected.to_bytes(),
                         Err(e) => {
                             tracing::debug!(error = %e, "reading an auth request body");
-                            return Ok(refused(
-                                hyper::StatusCode::BAD_REQUEST,
-                                "malformed request",
+                            return Ok((
+                                refused(hyper::StatusCode::BAD_REQUEST, "malformed request"),
+                                false,
                             ));
                         }
                     };
-                    if let Some(response) = auth.handle(&method, &path, &body).await {
-                        return Ok(response);
+                    if let Some(answer) = auth.handle(&method, &path, &body, served).await {
+                        return Ok((answer.response, answer.attest));
                     }
-                    return Ok(refused(hyper::StatusCode::NOT_FOUND, "no such endpoint"));
+                    return Ok((
+                        refused(hyper::StatusCode::NOT_FOUND, "no such endpoint"),
+                        false,
+                    ));
                 }
             }
 
@@ -1371,21 +1380,24 @@ async fn route(
                             .map_err(wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::from)
                             .boxed_unsync();
                         let rebuilt = rebuilt.body(body).expect("request is well formed");
-                        return guest
-                            .handle(scheme, rebuilt, Some(&verified.tenant_id))
-                            .await;
+                        return Ok((
+                            guest
+                                .handle(scheme, rebuilt, Some(&verified.tenant_id))
+                                .await?,
+                            false,
+                        ));
                     }
                     Err(denied) => {
                         // Logged in full, answered in one sentence: which check
                         // failed is the runtime's business, and telling a
                         // caller would tell them which guess to refine.
                         tracing::info!(%path, reason = %denied, "refused an unauthorized interaction");
-                        return Ok(refused(denied.status(), denied.public_message()));
+                        return Ok((refused(denied.status(), denied.public_message()), false));
                     }
                 },
                 None => None,
             };
-            guest.handle(scheme, req, tenant.as_ref()).await
+            Ok((guest.handle(scheme, req, tenant.as_ref()).await?, false))
         }
     }
 }
@@ -1408,34 +1420,9 @@ pub struct Server {
     /// would refuse everything forever.
     auth: Option<Arc<AuthEndpoints>>,
     gate: Option<Arc<Gate>>,
-    tls: Option<Tls>,
-    /// Fired once the listener is accepting. ACME waits on it before placing
-    /// an order, because the challenge is a connection inbound to this socket.
-    listening: Option<Arc<tokio::sync::Notify>>,
+    /// The one certificate every connection is served, and told about.
+    tls: Option<Arc<TlsIdentity>>,
     addr: SocketAddr,
-}
-
-/// How TLS is terminated.
-///
-/// One shape, not one per certificate source. Every connection loads one
-/// identity from `slot` — a configuration and the leaf it presents — and keeps
-/// it for its life. That is what makes "the certificate this connection is
-/// using" answerable: rustls offers no way to ask a live connection, so the
-/// pairing is arranged at accept time instead of discovered later.
-///
-/// ACME differs only by having a second configuration to offer, so it is a
-/// field rather than a variant. As two variants this logic was written twice,
-/// which is two places to keep the load-once-and-refuse-resumption discipline
-/// and one place to eventually get it wrong.
-struct Tls {
-    /// Where a connection takes its serving identity. Replaced on an ACME
-    /// renewal — and by the renewal test, which is the point: a connection that
-    /// already loaded one keeps it.
-    slot: CertificateSlot,
-    /// ACME only. The ClientHello chooses: a TLS-ALPN-01 validation connection
-    /// is answered on this same port, which is the reason that challenge type
-    /// was chosen.
-    challenge: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Server {
@@ -1446,12 +1433,12 @@ impl Server {
             auth: None,
             gate: None,
             tls: None,
-            listening: None,
             addr,
         }
     }
 
-    /// Require a verified assertion for everything the guest could see.
+    /// Require a token, bought with a signed approval, for everything the guest
+    /// could see.
     pub fn with_authentication(mut self, auth: Arc<AuthEndpoints>, gate: Arc<Gate>) -> Self {
         self.auth = Some(auth);
         self.gate = Some(gate);
@@ -1463,51 +1450,23 @@ impl Server {
         self
     }
 
-    pub fn with_tls(mut self, certificate: CertificateSlot) -> Self {
-        self.tls = Some(Tls {
-            slot: certificate,
-            challenge: None,
-        });
-        self
-    }
-
-    pub fn with_acme(mut self, acme: &crate::serve::acme::Acme) -> Self {
-        self.tls = Some(Tls {
-            slot: acme.certificate.clone(),
-            challenge: Some(acme.challenge_config.clone()),
-        });
-        self.listening = Some(acme.listening.clone());
+    pub fn with_tls(mut self, certificate: Arc<TlsIdentity>) -> Self {
+        self.tls = Some(certificate);
         self
     }
 
     /// Accept connections until the process is stopped.
     pub async fn run(self) -> Result<()> {
-        // Dropping the server cancels the scheduler and its owned worker set.
-        // A scheduler storage error stops serving instead of losing wakeups.
+        // Dropping the server cancels the task consumer and its owned worker set. The
+        // consumer only ends if it cannot go on, and then serving stops with it.
         let mut scheduler = tokio::task::JoinSet::new();
         if let Some(queue) = &self.guest.tasks {
             anyhow::ensure!(
                 self.gate.is_some(),
                 "background tasks require authentication"
             );
-            scheduler.spawn(queue.clone().run(self.guest.clone()));
-        }
-        // The supervisors, started from what is already on disk. This is what
-        // re-establishes a connection after a restart — no guest is involved and
-        // nothing is scheduled; the records are the instruction and this reads
-        // them. See [`crate::stream`].
-        if let Some(streams) = &self.guest.streams {
-            anyhow::ensure!(
-                self.gate.is_some(),
-                "held connections require authentication"
-            );
-            // The attestor `/auth/*` uses, not a second one: one device, and one
-            // limit on it for both directions. Set before the supervisor starts,
-            // so not even the first dial after a restart goes out unsigned.
-            if let Some(attestor) = &self.attestor {
-                streams.set_attestor(attestor.clone()).await;
-            }
-            scheduler.spawn(streams.clone().run(self.guest.clone()));
+            let runner: Arc<dyn crate::tasks::Runner> = self.guest.clone();
+            scheduler.spawn(queue.clone().run(runner));
         }
         let listener = TcpListener::bind(self.addr)
             .await
@@ -1519,13 +1478,6 @@ impl Server {
             "serving"
         );
 
-        // Only now may ACME order. Until this point a validation connection
-        // would have found nothing listening, which the CA counts as a failed
-        // authorization rather than as "try again in a moment".
-        if let Some(listening) = &self.listening {
-            listening.notify_one();
-        }
-
         // What the *client* used. With TLS terminated here the guest is still
         // told `https`, or it would build wrong absolute URLs and set wrong
         // cookie flags.
@@ -1534,7 +1486,7 @@ impl Server {
         } else {
             Scheme::Http
         };
-        let tls = self.tls.map(Arc::new);
+        let tls = self.tls;
 
         loop {
             let (client, peer) = tokio::select! {
@@ -1560,55 +1512,12 @@ impl Server {
                 // the handshake, because that is the only point at which the
                 // peer's certificate exists. Built out here — as it was — the
                 // connection's identity could never reach a request.
-                let result = match tls.as_deref() {
-                    Some(Tls { slot, challenge }) => {
-                        // The ClientHello is read before any configuration is
-                        // chosen, because under ACME it decides which one: a
-                        // validation connection and the real service share this
-                        // port, which is the reason TLS-ALPN-01 was chosen.
-                        let handshake =
-                            match tokio_rustls::LazyConfigAcceptor::new(Default::default(), client)
-                                .await
-                            {
-                                Ok(handshake) => handshake,
-                                Err(e) => {
-                                    tracing::debug!(%peer, error = %e, "TLS handshake failed");
-                                    return;
-                                }
-                            };
-
-                        if let Some(challenge) = challenge {
-                            if rustls_acme::is_tls_alpn_challenge(&handshake.client_hello()) {
-                                // A validation connection carries no HTTP. The
-                                // handshake itself is the proof; completing it
-                                // and closing is the whole exchange.
-                                tracing::info!(%peer, "answering a TLS-ALPN-01 challenge");
-                                match handshake.into_stream(challenge.clone()).await {
-                                    Ok(mut tls) => {
-                                        use tokio::io::AsyncWriteExt;
-                                        let _ = tls.shutdown().await;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            %peer, error = %e,
-                                            "the ACME challenge handshake failed; \
-                                             issuance will not complete"
-                                        );
-                                    }
-                                }
-                                return;
-                            }
-                        }
-
-                        // Loaded once, and after the challenge check so a
-                        // validation connection is still answered before any
-                        // certificate exists. Everything this connection is
-                        // told about its certificate comes from this value.
-                        let Some(identity) = slot.get() else {
-                            tracing::debug!(%peer, "no certificate to serve with yet");
-                            return;
-                        };
-                        match handshake.into_stream(identity.config.clone()).await {
+                let result = match tls {
+                    Some(identity) => {
+                        // Every connection is served the one certificate this
+                        // boot made, and is told about exactly that one.
+                        let acceptor = tokio_rustls::TlsAcceptor::from(identity.config.clone());
+                        match acceptor.accept(client).await {
                             Ok(stream) => {
                                 if resumed(&stream, peer) {
                                     return;
@@ -1622,10 +1531,7 @@ impl Server {
                             }
                             Err(e) => {
                                 // Routine: scanners, health checks, and clients
-                                // that reject the certificate. Under ACME every
-                                // handshake lands here until the first order
-                                // completes, which is the expected state while
-                                // one is in flight.
+                                // that reject the certificate.
                                 tracing::debug!(%peer, error = %e, "TLS handshake failed");
                                 return;
                             }
@@ -1670,36 +1576,25 @@ pub async fn serve_component(
         .component()
         .get_export_index(None, "run-task")
         .is_some();
-    if let Some(limits) = config.background_tasks.take().filter(|_| runs_tasks) {
+    if let Some(tasks) = config.background_tasks.take().filter(|_| runs_tasks) {
         anyhow::ensure!(
             config.authentication.is_some(),
             "the guest exports run-task, and background tasks require authentication"
         );
-        let queue = crate::tasks::TaskQueue::open(
-            handle.environment().zfs().clone(),
-            handle.environment().clock().clone(),
-            limits,
-        )
-        .await?;
+        let queue = tasks
+            .open(
+                handle.environment().zfs().clone(),
+                handle.environment().clock().clone(),
+            )
+            .await?;
         handle = handle.with_tasks(queue)?;
-    }
-    // Held connections, whenever there is a tenant to attribute one to and a gate to authenticate
-    // that tenant. No flag of its own: the registry is a directory and a supervisor loop over
-    // whatever records exist, and a guest that never asks for a connection has neither. A held
-    // connection reaches only what the guest's own request could, checked on every dial and
-    // every send — so enabling this widens nothing.
-    if config.tenancy.is_some() && config.authentication.is_some() {
-        let registry =
-            crate::stream::StreamRegistry::open_registry(handle.environment().zfs().clone())
-                .await?;
-        handle = handle.with_streams(registry)?;
     }
     let mut notify_forwarder = None;
     if let Some(notify) = config.notify.take() {
         anyhow::ensure!(
             config.authentication.is_some(),
             "notifications require authentication: the tenant a wake belongs to comes \
-             from a verified assertion, and without a gate there is none"
+             from a verified sign-in, and without a gate there is none"
         );
         let registry =
             crate::notify::DeviceRegistry::open(handle.environment().zfs().clone()).await?;
@@ -1752,31 +1647,25 @@ pub async fn serve_component(
     // the enclave, not the first client unlucky enough to arrive.
     handle.verify_instantiates().await?;
 
+    if let Some((auth, _)) = &config.authentication {
+        handle = handle.with_signer_keys(auth.keys().clone());
+    }
+
     let mut server = Server::new(handle, config.addr);
     match config.authentication {
         Some((auth, gate)) => server = server.with_authentication(auth, gate),
         None => tracing::warn!(
             "serving with NO authentication: every request reaches the guest without a \
-             WebAuthn assertion. Set --webauthn-rp-id for anything that is not a \
+             signed approval. Set --operator-master-parameter for anything that is not a \
              development run."
         ),
     }
 
-    // Where a connection loads its serving identity at accept time. Fixed for a
-    // self-signed certificate; replaced by the ACME client on issue and on
-    // every renewal — but a connection that already loaded one keeps it, which
-    // is what makes "the certificate this connection was served" answerable.
-    let certificate = match (config.certificate.take(), &config.acme) {
-        (Some(slot), _) => Some(slot),
-        (None, Some(acme)) => Some(acme.certificate.clone()),
-        (None, None) => None,
-    };
-
-    match (&certificate, &config.attestation) {
-        (Some(slot), attestation) => {
+    match (config.certificate.take(), &config.attestation) {
+        (Some(identity), attestation) => {
             if let Some(nsm) = attestation {
-                // Every response carries a proof, so the device is on the path
-                // of every request.
+                // Both options calls carry a proof, so the device is on the
+                // path of every registration and sign-in.
                 let attestor = Arc::new(ResponseAttestor::new(nsm.clone(), component_bytes));
 
                 // Checked once, here, with the largest nonce a client may send.
@@ -1789,7 +1678,7 @@ pub async fn serve_component(
                     Ok(bytes) => {
                         tracing::info!(
                             document_header_bytes = bytes,
-                            "attesting every /auth response"
+                            "attesting registration and sign-in answers"
                         )
                     }
                     Err(e) => anyhow::bail!(
@@ -1800,13 +1689,7 @@ pub async fn serve_component(
                 server = server.with_attestor(attestor);
             }
 
-            // ACME owns its own slot and needs the challenge configuration
-            // alongside it; a fixed certificate is served straight from the
-            // slot built above.
-            server = match &config.acme {
-                Some(acme) => server.with_acme(acme),
-                None => server.with_tls(slot.clone()),
-            };
+            server = server.with_tls(identity);
         }
         (None, Some(_)) => {
             anyhow::bail!(

@@ -18,25 +18,23 @@ say "WIT drift"
 
 "$REPO/scripts/build-guest.sh" http
 "$REPO/scripts/build-guest.sh" grpc
+"$REPO/scripts/build-guest.sh" signer
 
 # Built before the suites rather than between them: one of serve_auth's tests
 # drives this real binary as a subprocess instead of a stand-in, and skips
 # silently when it is missing. A skipped test that reports green is the failure
 # mode worth spending a build on avoiding.
-say "building the passkey client"
-cargo build --release -p enclave-runtime --features testing --bin passkey-client
+say "building the wallet client"
+cargo build --release -p enclave-runtime --features testing --bin wallet-client
 
 # A binary's own unit tests are not part of `--lib`, so they need naming. These
 # are the measurements the client insists on before it approves anything.
 # `--release` so this shares the compile with the binary just built.
-say "passkey client"
-cargo test --release -p enclave-runtime --features testing --bin passkey-client
+say "wallet client"
+cargo test --release -p enclave-runtime --features testing --bin wallet-client
 
 say "background tasks"
 cargo test -p enclave-runtime --lib tasks::tests -- --include-ignored
-
-say "held connections"
-cargo test -p enclave-runtime --lib stream::tests -- --include-ignored
 
 say "serving a guest"
 cargo test -p enclave-runtime --test serve_guest -- --include-ignored
@@ -62,11 +60,15 @@ cargo test -p enclave-runtime --test serve_grpc -- --include-ignored
 say "gRPC on the wire, with a real client"
 cargo test -p enclave-runtime --test serve_grpc_wire -- --include-ignored
 
-# The whole authorization model — challenge, assertion, token, scope, tenant
+# The whole authorization model — challenge, signature, token, scope, tenant
 # isolation — and the only suite that checks an attestation document against the
 # connection it arrived on.
 say "interaction tokens, end to end"
 cargo test -p enclave-runtime --test serve_auth -- --include-ignored
+
+# `enclave:signer` is wired by hand, so a guest that imports it has to link.
+say "a guest that signs"
+cargo test -p enclave-runtime --test signer_guest -- --include-ignored
 
 say "guest logging"
 cargo test -p enclave-runtime --test guest_logs -- --include-ignored

@@ -14,7 +14,6 @@
 #           expose :8443 → 192.168.127.2:443 ──▶ rustls :443
 #   vhost-device-vsock --forward-cid 1
 #   heartbeat.py :9000  ───────────────────────▶ init's boot heartbeat
-#   Pebble :14000 ◀────────────────────────────  ACME order, TLS-ALPN-01
 #
 # ---------------------------------------------------------------------------
 # What a caller sets before sourcing, all optional:
@@ -24,8 +23,7 @@
 #                 apart; it does not let them run at the same time, because
 #                 MinIO's :9000, the push stub's :9180 and the enclave's vsock CID
 #                 are fixed — the last two by the image, which dials them.
-#   HTTPS_PORT    host port gvproxy forwards to the enclave's :443, and the
-#                 port Pebble validates against. Default 8443.
+#   HTTPS_PORT    host port gvproxy forwards to the enclave's :443. Default 8443.
 #   GUEST_WASM    a component to serve instead of the one Nix builds. This is
 #                 what makes the emulator useful to somebody else's guest.
 #   WITH_SUBSTITUTE  also stage a second, altered guest, for a caller that
@@ -33,9 +31,6 @@
 #   TIMEOUT       seconds for each wait. Default 240.
 #   QEMU_MEMORY   the enclave's memory, as QEMU's -m. Default 3G.
 #   STORE_BIND    the address MinIO is published on. Default all of them.
-#   TLS_DOMAIN    serve this name with a certificate from Let's Encrypt instead
-#                 of enclave.test from Pebble — for an emulator on a public host.
-#                 ACME_STAGING picks the staging CA, ACME_CONTACT its contact.
 #   PUSH_APP_ID   real notifications through that AWS End User Messaging Push
 #                 application, signed as this host's instance role, instead of
 #                 the stub.
@@ -47,9 +42,9 @@
 #
 #   EXPECTED_PCR0 / EXPECTED_PCR16   what the builds said the measurements are
 #   TRUST_ROOT                       DER the enclave's documents chain to
-#   ATTEST / PASSKEY                 client binaries, built here
-#   PASSKEY_ARGS                     the trust flags both clients need
-#   signed / signed2                 two identities, each with its own passkey
+#   ATTEST / WALLET                  client binaries, built here
+#   WALLET_ARGS                      the trust flags the wallet client needs
+#   signed / signed2                 two identities, each with its own wallet
 #   CONSOLE, RUNDIR, plain, fail, say, nonce, boot_enclave, upload_guest,
 #   wait_for_serving, wait_for_https
 # ---------------------------------------------------------------------------
@@ -59,9 +54,8 @@ WORK="${WORK:-$REPO/target/qemu-nitro}"
 PREFIX="${PREFIX:-e2e}"
 RUNDIR="${RUNDIR:-$WORK/$PREFIX}"
 
-# The store, when it is kept across runs: MinIO's data, and every Pebble root
-# and intermediate that has issued a certificate the store may still hold.
-# Beside RUNDIR rather than in it, because RUNDIR is cleared on every start.
+# The store, when it is kept across runs: MinIO's data. Beside RUNDIR rather
+# than in it, because RUNDIR is cleared on every start.
 STORE_DIR="$WORK/$PREFIX-store"
 KEEP_STORE="${KEEP_STORE:-}"
 FRESH_STORE="${FRESH_STORE:-}"
@@ -78,24 +72,13 @@ IMAGE="${QEMU_IMAGE:-enclave-qemu-nitro:latest}"
 TIMEOUT="${TIMEOUT:-240}"
 QEMU_MEMORY="${QEMU_MEMORY:-3G}"
 STORE_BIND="${STORE_BIND:-}"
-TLS_DOMAIN="${TLS_DOMAIN:-}"
-ACME_STAGING="${ACME_STAGING:-}"
-ACME_CONTACT="${ACME_CONTACT:-}"
 PUSH_APP_ID="${PUSH_APP_ID:-}"
 PACK_DIR="${PACK_DIR:-}"
 
-LETS_ENCRYPT_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory
-LETS_ENCRYPT_STAGING_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory
 CONSOLE="$RUNDIR/console.log"
 
-# Host-side port that gvproxy forwards into the enclave's :443. Pebble also
-# validates the TLS-ALPN-01 challenge against it, so it is both the service
-# port and the challenge port — as it is in production, where both are 443.
+# Host-side port that gvproxy forwards into the enclave's :443.
 HTTPS_PORT="${HTTPS_PORT:-8443}"
-
-# The ACME test CA. Pinned by digest: this image supplies the issuance path the
-# harness claims to exercise, and "latest" would let that change under us.
-PEBBLE_IMAGE="${PEBBLE_IMAGE:-ghcr.io/letsencrypt/pebble@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199}"
 
 # Every container this run creates carries it, so cleanup can find them without
 # a hard-coded list that the next container to be added would not appear in.
@@ -122,20 +105,7 @@ enclave_preflight() {
     command -v nix >/dev/null || {
         echo "nix is not on PATH; see deploy/nix/README.md" >&2; exit 1; }
 
-    # Flakes copy only what git tracks, so an untracked file is invisible to the
-    # build no matter that it is right there on disk. The failure lands deep
-    # inside the EIF derivation as a bare "cp: cannot stat", naming a store path
-    # that does not contain it — true, and useless. Checked here instead.
-    local f
-    for f in pebble/ca.pem pebble/cert.pem pebble/key.pem; do
-        git -C "$REPO" ls-files --error-unmatch "deploy/qemu-nitro/$f" >/dev/null 2>&1 || {
-            echo "deploy/qemu-nitro/$f is not tracked by git, so nix cannot see it." >&2
-            echo "  git add deploy/qemu-nitro/" >&2
-            exit 1
-        }
-    done
-
-    # And the general case, which cost twenty minutes to learn: a *source* file
+    # Flakes copy only what git tracks, which cost twenty minutes to learn: a *source* file
     # that git does not track is invisible to the build no matter that the
     # workspace compiles here. A new module declared in lib.rs and never added
     # fails as `file not found for module`, from a sandbox, after everything
@@ -298,29 +268,12 @@ enclave_build_image() {
         return
     fi
     say "building the enclave image"
-    if [[ -n "${WEBAUTHN_RP_ID:-}${TLS_DOMAIN}${PUSH_APP_ID}" ]]; then
+    if [[ -n "${PUSH_APP_ID}" ]]; then
         # The same image configured differently. Not a package — flake outputs take no arguments —
         # so the flake's `lib.eifQemu` is called directly, which reading the flake by path needs
-        # --impure for. dev-enclave.sh has already held every value to a shape that cannot break
+        # --impure for. dev-enclave.sh has already held the value to a shape that cannot break
         # out of the string.
-        nix_list() {
-            local out="" o
-            IFS=, read -ra items <<<"$1"
-            for o in "${items[@]}"; do out+=" \"$o\""; done
-            printf '[%s ]' "$out"
-        }
-        local args=""
-        [[ -n "${WEBAUTHN_RP_ID:-}" ]] && args+=" rpId = \"$WEBAUTHN_RP_ID\";"
-        [[ -n "${WEBAUTHN_ALLOWED_ORIGINS:-}" ]] \
-            && args+=" allowedOrigins = $(nix_list "$WEBAUTHN_ALLOWED_ORIGINS");"
-        if [[ -n "$TLS_DOMAIN" ]]; then
-            local directory="$LETS_ENCRYPT_DIRECTORY"
-            [[ -n "$ACME_STAGING" ]] && directory="$LETS_ENCRYPT_STAGING_DIRECTORY"
-            args+=" tlsDomains = [ \"$TLS_DOMAIN\" ]; acmeDirectory = \"$directory\"; acmeCa = null;"
-            # A bare address: the runtime adds the mailto: scheme itself.
-            [[ -n "$ACME_CONTACT" ]] && args+=" acmeContacts = [ \"$ACME_CONTACT\" ];"
-        fi
-        [[ -n "$PUSH_APP_ID" ]] && args+=" pushAppId = \"$PUSH_APP_ID\";"
+        local args=" pushAppId = \"$PUSH_APP_ID\";"
         nix_expr "eif-qemu (${args# })" "$RUNDIR/eif" \
             "((builtins.getFlake \"git+file://$REPO\").lib.\${builtins.currentSystem}.eifQemu {$args })"
     else
@@ -382,7 +335,7 @@ enclave_build_guest() {
 enclave_build_clients() {
     if [[ -n "$BUNDLE" ]]; then
         ATTEST="$BUNDLE/bin/nitro-attest"
-        PASSKEY="$BUNDLE/bin/passkey-client"
+        WALLET="$BUNDLE/bin/wallet-client"
         EXPECTED_PCR16="$("$ATTEST" --measure "$RUNDIR/guests/guest.wasm" | jq -r .PCR16)"
         echo "PCR16 $EXPECTED_PCR16"
         enclave_measure_substitute
@@ -408,13 +361,13 @@ enclave_build_clients() {
 
     enclave_measure_substitute
 
-    # The client half of the WebAuthn gate. Nothing reaches the guest without a
-    # fresh assertion bound to that exact request, and a shell script cannot
-    # sign one — so the harness drives the gate with a software passkey.
+    # The client half of the gate. Nothing reaches the guest without an approval
+    # signed with its tenant's wallet share, and a shell script cannot make one —
+    # so the harness drives the gate with a wallet in software.
     ( cd "$REPO" && cargo build --release -p enclave-runtime --features testing \
-        --bin passkey-client ) 2>&1 | tail -2
-    PASSKEY="$REPO/target/release/passkey-client"
-    [[ -x "$PASSKEY" ]] || { echo "passkey-client did not build" >&2; exit 1; }
+        --bin wallet-client ) 2>&1 | tail -2
+    WALLET="$REPO/target/release/wallet-client"
+    [[ -x "$WALLET" ]] || { echo "wallet-client did not build" >&2; exit 1; }
 }
 
 # The altered guest run-e2e.sh's leg 8 boots, measured with whichever verifier the run has — the
@@ -428,14 +381,14 @@ enclave_measure_substitute() {
     fi
 }
 
-# Two identities, each with its own passkey file, so a caller can show that one
+# Two identities, each with its own wallet file, so a caller can show that one
 # tenant cannot see another's data.
 #
-# `PASSKEY_ARGS` is empty until the enclave has booted and reported the root its
+# `WALLET_ARGS` is empty until the enclave has booted and reported the root its
 # documents chain to — see `enclave_trust_root`. Both functions read it at call
 # time for that reason, and because each reboot mints a new chain.
-signed()  { "$PASSKEY" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/alice.json" "${PASSKEY_ARGS[@]}" "$@"; }
-signed2() { "$PASSKEY" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/bob.json"   "${PASSKEY_ARGS[@]}" "$@"; }
+signed()  { "$WALLET" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/alice.json" "${WALLET_ARGS[@]}" "$@"; }
+signed2() { "$WALLET" --url "https://127.0.0.1:$HTTPS_PORT" --state "$RUNDIR/bob.json"   "${WALLET_ARGS[@]}" "$@"; }
 
 # ---------------------------------------------------------------------------
 # The store the enclave will mount, and the guest it will fetch.
@@ -579,60 +532,7 @@ EOF
     echo "gvproxy listening on host vsock port 1024"
 }
 
-# The CA. Pebble is a real RFC 8555 server, so the enclave runs the same
-# issuance path it runs against Let's Encrypt: directory, account, order,
-# TLS-ALPN-01 challenge, finalize, and a certificate sealed into the cache.
-#
-# `--network host` because two things must reach it: the enclave, which dials
-# gvproxy's host address 192.168.127.254:14000, and this script on loopback.
-# `--add-host` is what makes the challenge work — Pebble resolves the identifier
-# `enclave.test` to the loopback address where gvproxy forwards :443 into the
-# enclave, so validation arrives on the port the service uses.
-#
-# Two knobs are turned off because they exist to make clients prove they retry,
-# and a flaky CA here would read as a flaky runtime: PEBBLE_VA_NOSLEEP skips a
-# random pre-validation delay, PEBBLE_WFE_NONCEREJECT the deliberate 5% bad
-# nonce. rustls-acme handles both; this harness is not the place to find out.
-enclave_start_ca() {
-    say "starting Pebble, the ACME test CA"
-    docker rm -f "$PREFIX-pebble" >/dev/null 2>&1 || true
-    cat > "$RUNDIR/pebble-config.json" <<EOF
-{
-  "pebble": {
-    "listenAddress": "0.0.0.0:14000",
-    "managementListenAddress": "127.0.0.2:15000",
-    "certificate": "/pebble/cert.pem",
-    "privateKey": "/pebble/key.pem",
-    "httpPort": 80,
-    "tlsPort": $HTTPS_PORT,
-    "ocspResponderURL": "",
-    "externalAccountBindingRequired": false
-  }
-}
-EOF
-    docker run -d --rm --name "$PREFIX-pebble" --label "$LABEL" \
-        --network host \
-        --add-host "enclave.test:127.0.0.1" \
-        -e PEBBLE_VA_NOSLEEP=1 \
-        -e PEBBLE_WFE_NONCEREJECT=0 \
-        -v "$REPO/deploy/qemu-nitro/pebble:/pebble:ro" \
-        -v "$RUNDIR/pebble-config.json:/pebble-config.json:ro" \
-        "$PEBBLE_IMAGE" -config /pebble-config.json >/dev/null \
-        || { echo "Pebble did not start" >&2; exit 1; }
-
-    for _ in $(seq "$TIMEOUT"); do
-        curl -sk --max-time 2 "https://127.0.0.1:14000/dir" >/dev/null 2>&1 && break
-        sleep 1
-    done
-    curl -sk --max-time 5 "https://127.0.0.1:14000/dir" >/dev/null 2>&1 \
-        || { echo "Pebble never answered:" >&2; docker logs "$PREFIX-pebble" 2>&1 | tail -20 >&2; exit 1; }
-    echo "Pebble serving its directory on :14000, validating :$HTTPS_PORT"
-}
-
-# Before the enclave boots, not after. The enclave starts its ACME order as soon
-# as it has a network, and the challenge is a connection *inbound* to :443 — so
-# if this forward does not exist yet, the first order fails and the harness
-# waits out a retry backoff for no reason.
+# Before the enclave boots, so the first client to try finds the forward there.
 enclave_expose_https() {
     say "forwarding :$HTTPS_PORT into the enclave"
     curl -sf --unix-socket "$RUNDIR/network.sock" \
@@ -775,19 +675,13 @@ enclave_trust_root() {
     # "pinned" root pins nothing. Without it the presented root must equal this
     # one — the same comparison a client makes against AWS's — and passing
     # --pcr0 and --pcr16 becomes mandatory.
-    PASSKEY_ARGS=(--trust-root "$TRUST_ROOT" --pcr0 "$EXPECTED_PCR0" --pcr16 "$EXPECTED_PCR16"
-        --rp-id "${WEBAUTHN_RP_ID:-enclave.test}")
+    WALLET_ARGS=(--trust-root "$TRUST_ROOT" --pcr0 "$EXPECTED_PCR0" --pcr16 "$EXPECTED_PCR16")
 }
 
-# Nothing answers HTTPS until an ACME order completes — directory, account,
-# order, challenge, finalize — so this loop is the issuance path finishing, not
-# just a process starting. On a later boot the sealed cache has the certificate
-# already, and it answers at once.
+# The enclave serves the certificate it made at boot as soon as its listener is
+# up, so this waits for the listener and nothing else.
 wait_for_https() {
     local answered=""
-    # Bounded by TIMEOUT rather than a literal: a full ACME order on a slow
-    # machine is the longest wait here, and a fixed 90 was a CI-only failure
-    # waiting to be discovered on a busy runner.
     for _ in $(seq "$TIMEOUT"); do
         if curl -sk --max-time 2 "https://127.0.0.1:$HTTPS_PORT/" >/dev/null 2>&1; then
             answered=yes
@@ -798,81 +692,20 @@ wait_for_https() {
     [[ -n "$answered" ]]
 }
 
-# And it is genuinely the CA's, not something the enclave minted for itself.
-# Pebble publishes the issuing chain on its management port, so this verifies
-# the served chain against that root the way any PKI client would — which is the
-# part a self-signed image could never test.
+# What the enclave serves: a certificate it made for itself at boot. No CA
+# vouches for it, and nothing needs to — a client trusts it because an
+# attestation document binds its hash, which every client here checks.
 enclave_check_certificate() {
-    if [[ -n "$TLS_DOMAIN" ]]; then
-        enclave_check_public_certificate
-        return
-    fi
-    curl -sk --max-time 5 "https://127.0.0.2:15000/roots/0" > "$RUNDIR/pebble-root.pem" \
-        || { echo "could not fetch Pebble's root" >&2; exit 1; }
-    curl -sk --max-time 5 "https://127.0.0.2:15000/intermediates/0" > "$RUNDIR/pebble-int.pem" \
-        || { echo "could not fetch Pebble's intermediate" >&2; exit 1; }
-    if [[ -n "$KEEP_STORE" ]]; then
-        # Pebble mints a new CA every start, but a kept store holds the
-        # certificate an earlier Pebble issued and serves it until renewal. So
-        # every root and intermediate seen is kept, and clients are handed all
-        # of them: the served chain verifies whichever one issued it.
-        keep_pem "$RUNDIR/pebble-root.pem" "$STORE_DIR/pebble-roots.pem"
-        keep_pem "$RUNDIR/pebble-int.pem" "$STORE_DIR/pebble-ints.pem"
-        cp "$STORE_DIR/pebble-roots.pem" "$RUNDIR/pebble-root.pem"
-        cp "$STORE_DIR/pebble-ints.pem" "$RUNDIR/pebble-int.pem"
-    fi
-    echo | openssl s_client -connect "127.0.0.1:$HTTPS_PORT" -servername enclave.test -showcerts \
-        2>/dev/null | sed -n '/BEGIN CERT/,/END CERT/p' > "$RUNDIR/served-chain.pem"
-    [[ -s "$RUNDIR/served-chain.pem" ]] || { echo "the enclave presented no certificate" >&2; exit 1; }
-
-    openssl verify -CAfile "$RUNDIR/pebble-root.pem" -untrusted "$RUNDIR/pebble-int.pem" \
-        "$RUNDIR/served-chain.pem" \
-        || { echo "the served certificate does not chain to the CA that issued it" >&2; exit 1; }
-
-    # The name, from the SAN rather than the subject: an ACME certificate
-    # carries no CN at all — identity lives in subjectAltName — so printing the
-    # subject would print an empty string and look like a bug.
-    local names issuer
-    names="$(openssl x509 -in "$RUNDIR/served-chain.pem" -noout -ext subjectAltName \
-        | tail -n +2 | tr -d ' ')"
-    issuer="$(openssl x509 -in "$RUNDIR/served-chain.pem" -noout -issuer)"
-    echo "served for $names"
-    echo "issued by $issuer"
-    [[ "$names" == *enclave.test* ]] \
-        || { echo "the certificate is not for enclave.test: $names" >&2; exit 1; }
-    [[ "$issuer" == *Pebble* ]] \
-        || { echo "the certificate was not issued by Pebble: $issuer" >&2; exit 1; }
-}
-
-# A public name, from a public CA. Checked as any client on the internet checks it — the system's
-# roots and the name — except against staging, whose roots nothing trusts by design; there the
-# issuer is what says the order went where it should.
-enclave_check_public_certificate() {
-    local out names issuer
-    out="$(echo | openssl s_client -connect "127.0.0.1:$HTTPS_PORT" -servername "$TLS_DOMAIN" \
-        -verify_hostname "$TLS_DOMAIN" -showcerts 2>&1 || true)"
-    sed -n '/BEGIN CERT/,/END CERT/p' <<<"$out" > "$RUNDIR/served-chain.pem"
-    [[ -s "$RUNDIR/served-chain.pem" ]] || { echo "the enclave presented no certificate" >&2; exit 1; }
-    names="$(openssl x509 -in "$RUNDIR/served-chain.pem" -noout -ext subjectAltName | tail -n +2 | tr -d ' ')"
-    issuer="$(openssl x509 -in "$RUNDIR/served-chain.pem" -noout -issuer)"
-    echo "served for $names"
-    echo "issued by $issuer"
-    [[ "$names" == *"DNS:$TLS_DOMAIN"* ]] \
-        || { echo "the certificate is not for $TLS_DOMAIN: $names" >&2; exit 1; }
-    if [[ -n "$ACME_STAGING" ]]; then
-        [[ "$issuer" == *STAGING* ]] \
-            || { echo "expected a Let's Encrypt staging certificate: $issuer" >&2; exit 1; }
-    else
-        grep -q "Verify return code: 0 (ok)" <<<"$out" \
-            || { echo "the served certificate does not verify against the system roots:" >&2
-                 grep "Verify return code" <<<"$out" >&2; exit 1; }
-    fi
-}
-
-# Append the certificate in $1 to the bundle $2 unless it is already there.
-keep_pem() {
-    touch "$2"
-    grep -qF "$(sed -n 2p "$1")" "$2" || cat "$1" >> "$2"
+    echo | openssl s_client -connect "127.0.0.1:$HTTPS_PORT" -servername enclave.test \
+        2>/dev/null | sed -n '/BEGIN CERT/,/END CERT/p' > "$RUNDIR/served.pem"
+    [[ -s "$RUNDIR/served.pem" ]] || { echo "the enclave presented no certificate" >&2; exit 1; }
+    local subject issuer
+    subject="$(openssl x509 -in "$RUNDIR/served.pem" -noout -subject | sed 's/^subject=//')"
+    issuer="$(openssl x509 -in "$RUNDIR/served.pem" -noout -issuer | sed 's/^issuer=//')"
+    [[ "$subject" == "$issuer" ]] \
+        || { echo "expected the self-signed certificate the enclave made, not one issued by $issuer" >&2; exit 1; }
+    echo "serving the certificate it made at boot, sha256 $(openssl x509 -in "$RUNDIR/served.pem" \
+        -outform der | sha256sum | cut -d' ' -f1)"
 }
 
 # Everything above, in the one order that works. The ordering constraints are
@@ -887,8 +720,6 @@ enclave_bring_up() {
 
     enclave_start_store
     enclave_start_parent
-    # A public name is validated by the public CA, over the internet, on this host's :443.
-    [[ -n "$TLS_DOMAIN" ]] || enclave_start_ca
     enclave_expose_https
 
     say "booting the enclave"
@@ -905,22 +736,18 @@ enclave_bring_up() {
 
     enclave_trust_root
 
-    local ca=Pebble
-    [[ -z "$TLS_DOMAIN" ]] || ca="Let's Encrypt"
-    say "waiting for $ca to issue the serving certificate"
+    say "waiting for HTTPS"
     wait_for_https || {
-        echo "no certificate was ever issued; the ACME path did not complete" >&2
-        echo "--- pebble ---" >&2;  docker logs "$PREFIX-pebble" 2>&1 | tail -30 >&2
-        echo "--- console ---" >&2; plain | grep -i acme | tail -30 >&2
+        echo "the enclave never answered HTTPS" >&2
+        echo "--- console ---" >&2; plain | tail -30 >&2
         exit 1
     }
-    echo "the enclave is serving a certificate it obtained over ACME"
     enclave_check_certificate
 }
 
 # Everything a run builds, in one directory, for a machine that should not build.
 #
-# The image is a file and its measurement is beside it; gvproxy is static; the verifier, the passkey
+# The image is a file and its measurement is beside it; gvproxy is static; the verifier, the wallet
 # client and vhost-device-vsock link only against the C library. So a host with Docker, KVM and
 # vsock runs the whole stack from this with `--prebuilt` — no Nix store, no toolchain, no checkout
 # that has to match — which is what makes a small VM enough. The image configuration is recorded
@@ -941,7 +768,7 @@ enclave_pack() {
     say "packing into $PACK_DIR"
     rm -rf "$PACK_DIR"; mkdir -p "$PACK_DIR/eif" "$PACK_DIR/bin" "$PACK_DIR/images"
     cp -L "$EIF_DIR/enclave-qemu.eif" "$EIF_DIR/pcr.json" "$PACK_DIR/eif/"
-    cp -L "$GV_DIR/bin/gvproxy" "$ATTEST" "$PASSKEY" "$VSOCK_BIN" "$PACK_DIR/bin/"
+    cp -L "$GV_DIR/bin/gvproxy" "$ATTEST" "$WALLET" "$VSOCK_BIN" "$PACK_DIR/bin/"
     chmod -R u+w "$PACK_DIR"
 
     # The harness itself, the MinIO scripts it calls, the wasi-sdk pin a guest build needs, and
@@ -966,11 +793,6 @@ enclave_pack() {
     docker save "$minio_image" | gzip -1 > "$PACK_DIR/images/minio.tar.gz"
 
     {
-        printf 'WEBAUTHN_RP_ID=%q\n' "${WEBAUTHN_RP_ID:-}"
-        printf 'WEBAUTHN_ALLOWED_ORIGINS=%q\n' "${WEBAUTHN_ALLOWED_ORIGINS:-}"
-        printf 'TLS_DOMAIN=%q\n' "$TLS_DOMAIN"
-        printf 'ACME_STAGING=%q\n' "$ACME_STAGING"
-        printf 'ACME_CONTACT=%q\n' "$ACME_CONTACT"
         printf 'PUSH_APP_ID=%q\n' "$PUSH_APP_ID"
         printf 'ENCLAVE_RUNTIME_REV=%q\n' "$(git -C "$REPO" describe --always --dirty)"
         # The images this bundle runs on, unless the caller names others: read before lib.sh

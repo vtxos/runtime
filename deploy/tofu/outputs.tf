@@ -30,6 +30,24 @@ output "guest_log_group" {
   value = aws_cloudwatch_log_group.guest.name
 }
 
+# The image's background-task settings: `taskTable`, `taskQueueUrl`,
+# `taskScheduleGroup` and `taskSchedulerRoleArn` in deploy/nix/deployment.nix.
+output "task_table" {
+  value = aws_dynamodb_table.tasks.name
+}
+
+output "task_queue_url" {
+  value = aws_sqs_queue.tasks.url
+}
+
+output "task_schedule_group" {
+  value = aws_scheduler_schedule_group.tasks.name
+}
+
+output "task_scheduler_role_arn" {
+  value = aws_iam_role.scheduler.arn
+}
+
 # What to run once it is up. The last command is the one that matters: it
 # checks that the certificate the connection was served is the one the enclave
 # attested, and that the runtime and guest behind it are the approved ones.

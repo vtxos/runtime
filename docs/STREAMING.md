@@ -11,12 +11,27 @@ settled before a key depends on either.
 
 ## What works
 
-A guest holds the request body and the response body at the same time and
-answers each message as it arrives. This is specified behaviour rather than a
-trick: `wasi:http`'s `response-outparam.set` is documented to *"allow execution
-to continue after the response has been sent"*, and `incoming-request.consume`
-borrows the request rather than consuming it, so the two resource trees are
-independent.
+There are two ways to serve one, by what the guest exports.
+
+**`enclave:rpc/service`: the runtime ends gRPC** ([`wit/rpc`](../wit/rpc/rpc.wit)).
+The guest's `call` gets the method and a stream of the client's messages,
+already deframed, and returns a stream of replies and a future for its status.
+The runtime frames the replies, sends the status as `grpc-status` and
+`grpc-message` trailers, and refuses a compressed, oversized or truncated frame
+itself. The guest has no HTTP or gRPC code at all.
+[`examples/guest-grpc`](../examples/guest-grpc/) and
+[`examples/guest-signer`](../examples/guest-signer/) are built this way. It is the component model's async ABI (WASI 0.3's streams and
+futures), which the runtime's engine enables for every guest.
+
+**`wasi:http/incoming-handler`: the guest serves HTTP itself.** It holds the
+request body and the response body at the same time and answers each message as
+it arrives. This is specified behaviour rather than a trick: `wasi:http`'s
+`response-outparam.set` is documented to *"allow execution to continue after
+the response has been sent"*, and `incoming-request.consume` borrows the request
+rather than consuming it, so the two resource trees are independent.
+
+Either way, the response head goes out before the first message, and the end of
+the response (the trailers) waits until the tenant's writes are anchored.
 
 The runtime negotiates HTTP/2 by ALPN, per connection. There is no
 configuration for it, and HTTP/1.1 clients are unaffected.
@@ -29,11 +44,10 @@ never be bound by a body hash, and rather than keep a second weaker path for it,
 the approval now names something both shapes have — the interaction.
 
 ```console
-POST /auth/request/options   { credential_id, method, path, query }
-        ↓                     response is attested: check it, pin the certificate
-   Face ID / Touch ID
-        ↓
-POST /auth/request/verify    { challenge_id, assertion }  →  { token, expires_in_secs }
+POST /auth/request/options   { group_key, method, path, query }  →  { challenge_id }
+        ↓                     response is attested: check it, pin the certificate,
+        ↓                     sign the challenge and the interaction with the wallet share
+POST /auth/request/verify    { challenge_id, signature, ecdh }   →  { token, expires_in_secs, ecdh }
         ↓
 <the interaction>            Authorization: Bearer <token>
 ```
@@ -55,7 +69,7 @@ tenant. Redeeming removes it before anything about it is checked, so two callers
 racing one token have exactly one winner and a token offered for the wrong route
 is spent by the attempt.
 
-### Per-message approval: not built, and not buildable today
+### Per-message approval: not built
 
 If a guest wants "the person approved *these bytes*", it must obtain that
 itself, per message, inside the interaction. **The runtime cannot do it**: it
@@ -63,11 +77,12 @@ hands the body through without reading it, and teaching it to parse a guest's
 message format would make it care about a protocol it deliberately knows
 nothing about.
 
-**But the guest cannot do it either, yet.** Verifying a passkey assertion needs
-the stored credential, the challenge that was issued, the relying-party
-configuration, and the ability to mark that challenge used. All four live in the
-runtime, and a guest is given standard WASI and nothing else — there is no host
-function it can call to ask.
+**No guest does it yet.** An approval is a BIP-340 signature by the owner's
+share of the wallet key. `enclave:signer`'s `wallet-key` gives a guest the
+public key package, with the owner's verifying share. So a guest could check
+such a signature itself. What it would have to add is freshness: a challenge of
+its own for each message, used once, because the runtime's challenges are not
+visible to it.
 
 `examples/guest-grpc` deliberately carries **no** approval fields on
 `ClientMsg`. An earlier draft carried `challenge_id` and `assertion` and refused
@@ -75,10 +90,9 @@ messages without them, which promised a check nothing performed; fields that
 look like a credential and are never verified read as a guarantee, and are worse
 than their absence.
 
-Closing this needs a new host import — a way for a guest to hand the runtime an
-assertion and get back yes or no. **It should be designed before a real key
-depends on it**, because until then "someone opened an interaction" is the only
-thing between a compromised client and whatever the guest will do.
+**It should be designed before a real key depends on it**, because until then
+"someone opened an interaction" is the only thing between a compromised client
+and whatever the guest will do.
 
 ### What a stolen token buys
 
@@ -100,21 +114,22 @@ life**, and that tenant's next request waits behind it. Different tenants are
 unaffected and run concurrently.
 
 Anonymous callers share a single lock, so a stream with no gate configured
-would starve every other anonymous caller. **Streams are refused outright when
-no gate is configured.**
+holds every other anonymous caller behind it until it ends. Nothing refuses
+it: a deployment without a gate is a development arrangement, and says so at
+startup.
 
 ## Lifetime and failure
 
 | event | what happens |
 |---|---|
-| **half-close** (client sends END_STREAM) | the orderly end: the guest finishes and emits `grpc-status` trailers |
+| **half-close** (client sends END_STREAM) | the orderly end: the guest's request stream ends, it finishes, and its status goes out as `grpc-status` trailers |
 | **client cancels or disconnects** | the guest's next write fails, the call ends, the instance is dropped and never reused, the tenant lock frees |
 | **head timeout** (`request_timeout`) | bounds only the *response head*. It does not apply once the head is out, so it never ends a healthy stream |
 | **no traffic either way** | the epoch watchdog asks whether bytes moved, not how long the call ran. Sustained silence while executing wasm ends the call |
 | **interaction deadline** (300s) | a wall clock, checked whether or not wasm is executing — so it reaches a guest blocked in a host call, which the epoch never can. Ends the interaction and frees the tenant |
 | **guest spins** | trapped by the epoch, on the same schedule as before streams existed |
 | **guest traps** | the instance is discarded, never reused — a partially-executed call leaves a store that cannot be re-entered |
-| **`grpc-timeout` header** | **not enforced by the runtime.** Forwarded to the guest, which owns it. The runtime's deadlines are its own, so a client cannot lengthen them |
+| **`grpc-timeout` header** | **not enforced by the runtime.** A `wasi:http` guest gets the header and owns it; an `enclave:rpc` guest never sees headers. The runtime's deadlines are its own, so a client cannot lengthen them |
 | **`wasi:http` 600s between-bytes** | hardcoded in `wasmtime-wasi-http` and not configurable. A ceiling above ours |
 
 ## Sessions, retries, duplicates
@@ -126,108 +141,33 @@ every other request.
 
 The runtime does not retry, resume, or deduplicate anything. **There is no
 exactly-once guarantee and no automatic replay of signing rounds.** A client
-that reconnects opens a *new* stream with a *new* stream-open assertion, and
+that reconnects opens a *new* stream with a *new* approval, and
 any message it re-sends is simply a new message.
 Duplicates are the guest's to detect by sequence number, and its round handling
 must be idempotent because the transport promises nothing.
 
 ## Attestation
 
-The `x-enclave-attestation` document is on the response head, which for gRPC is
-the initial metadata. A client should verify it — against the nonce it chose
-and the leaf from its own handshake — **before sending anything
-signing-sensitive**.
+A stream carries no document of its own. The client verified one on the
+challenge for the sign-in that bought its token, against the nonce it chose and
+the leaf from its own handshake, and pinned that certificate. It opens the stream on a connection
+serving the same certificate, and TLS proves the peer still holds its key. That
+is all done **before it sends anything signing-sensitive**.
 
-One document per stream, at open. **It attests the connection**: that this
-enclave terminates it and is alive now. It says nothing about individual
-messages and nothing about signing results, because it is generated before the
-guest runs.
-
-## What proves the enclave to the service
-
-Everything above is a client calling in. The held connections of
-[`enclave:streams/connection`](../wit/stream/stream.wit) run the other way: the
-runtime dials the service and holds `GET <origin>/escrow/stream?id=<wire id>`
-open for server-sent events, and sends each message as
-`POST <origin>/escrow/send?id=<wire id>`. There the enclave is the client, and
-the service has to tell this image from anyone who has learned a wire id — a
-customer running a cosigner of their own, say.
-
-So the runtime signs both. Each carries `x-enclave-attestation`: an NSM
-attestation document (COSE_Sign1), standard base64 with padding — the header
-and encoding of an `/auth/*` response. Its `user_data` is 32 bytes:
-
-```text
-SHA-256( "enclave-runtime/stream/v1" 0x00  kind 0x00  wire_id 0x00  SHA-256(body) )
-```
-
-| request | `kind` | `wire_id` | `body` |
-|---|---|---|---|
-| `GET /escrow/stream` | `open` | the `id` query parameter | empty |
-| `POST /escrow/send` | `send` | the `id` query parameter | the request body, byte for byte |
-
-The wire id is `<tenant hex>-<stream id>`, URL-safe as sent. Its tenant half
-comes from the authenticated invocation, never from the guest, so a document
-also says whose connection a message belongs to. There is no nonce — the
-service first hears of a request when it arrives, and asking it for one would
-cost a round trip per message — and no public key. A pinned vector, from
-`stream_user_data` in `runtime/src/stream.rs`: with wire id
-`01010101010101010101010101010101-esc`, `open` over no bytes is
-`f9a46679b41ae322117cb08515fefa42b1c53a7d24aa472eedde9650a6d7fb82` and `send`
-over `hello` is
-`c828be10c689f688431ce5ecb5ca9870a03f8ac375956733fa755150bdd6fa7c`.
-
-### What a service checks, before acting on the body
-
-1. **Signature and chain** to the root it pins: AWS's Nitro root in
-   production. In development, the root the dev enclave mints and prints at
-   each boot ([DEV_ENCLAVE.md](DEV_ENCLAVE.md)) — which proves only that the
-   image produced the document, not who ran it.
-2. **PCR0 and PCR16, both pinned.** PCR0 is the runtime image, PCR16 the guest
-   it measured. Neither alone is an identity: any runtime can write a
-   convincing PCR16, and PCR0 does not contain the guest.
-3. **Freshness**: the document's `timestamp` within five minutes of the
-   service's clock. With no nonce, this is the only bound on replay.
-4. **`user_data`**, recomputed from the `id` it was sent and the exact body it
-   received, compared byte for byte.
-5. **For `open`, only a newer document replaces a held stream.** A `GET` whose
-   document is no newer than the one the live stream for that wire id was
-   opened with is refused, or a `GET` replayed inside the window could take a
-   live connection over.
-6. **A missing header is a refusal**, never a downgrade. A runtime with no
-   attestor configured sends none, and is meant to be refused.
-
-### What it costs
-
-**One NSM signature per message, and one per dial**, under the same
-four-at-a-time limit as `/auth/*` responses: the device is one device.
-
-**The header is a few KB**: about 3.3 KB of base64 from the dev enclave, and
-6–8 KB expected on hardware, whose certificate bundle is larger. The runtime
-refuses to start if a document would exceed 16 KiB. Anything in front of the
-service must accept a request header of **~16 KB** — nginx's default
-`large_client_header_buffers 4 8k` leaves no room for a document from hardware.
-
-### What it does not prove
-
-- **Which service it was for.** Nothing names the origin: a document one
-  service received is good, for five minutes, at any other that accepts the
-  same wire id.
-- **That a `send` is new.** One replayed inside the window is a duplicate, not
-  a forgery, and delivery is at least once anyway — handlers deduplicate as
-  they already must.
-- **Anything about the service.** What arrives down the held stream is
-  authenticated by TLS, not by this.
+**The document attests the connection**: that this enclave terminates it and is
+alive now. It says nothing about individual messages and nothing about signing
+results.
 
 ## Known limits
 
-- **One task, alternating.** The guest reads and writes in turn rather than
-  truly simultaneously. Sufficient for a request/response signing protocol; a
-  guest needing to emit unsolicited frames while blocked on a read would need
-  more.
-- **Per-message authorization is designed, not built.** See above.
-- **`grpc-timeout` is forwarded, never enforced.** The runtime's deadlines are
-  its own so a client cannot lengthen them by asking; interpreting a client's
-  deadline is the guest's, because only the guest knows what its work is worth.
+- **A signing guest alternates.** A signing round reads and writes in turn,
+  which a request/response signing protocol is. An `enclave:rpc` guest has two
+  independent streams and may write while a read is pending; a `wasi:http`
+  guest written as one body polling the other cannot.
+- **Per-message authorization is not built.** See above.
+- **`grpc-timeout` is never enforced.** The runtime's deadlines are its own so a
+  client cannot lengthen them by asking. A `wasi:http` guest may interpret a
+  client's deadline; an `enclave:rpc` guest is not told it.
 - **HTTP/1.1 trailers need a `Trailer:` header** or hyper drops them silently.
-  The guest sets one. HTTP/2 needs no such thing.
+  The runtime sends one for an `enclave:rpc` guest; a `wasi:http` guest must
+  set its own. HTTP/2 needs no such thing.

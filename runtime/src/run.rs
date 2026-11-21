@@ -7,9 +7,9 @@ use anyhow::{Context, Result};
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::clock::{TrustedClock, WallClockAdapter};
-use crate::guest_io::GuestLogs;
 use crate::random::GuestRandom;
 use crate::state::State;
+use crate::telemetry::logs::GuestLogs;
 use nitro_nsm::Nsm;
 
 /// Exit code for a failure before the guest ever started — the filesystem
@@ -63,7 +63,7 @@ pub fn read_component(path: &Path) -> Result<Vec<u8>> {
 /// The pool is shared, deliberately: one disk, one anchor chain. What differs
 /// between two clients is only which of its directories each one is handed.
 pub struct GuestEnvironment {
-    zfs: Arc<crate::zfs::Zfs>,
+    zfs: Arc<crate::store::zfs::Zfs>,
     clock: Arc<WallClockAdapter>,
     entropy: Arc<dyn Nsm>,
     env: Vec<(String, String)>,
@@ -81,7 +81,7 @@ impl GuestEnvironment {
     /// and it put untrusted guest text straight onto the enclave console with
     /// nothing marking it as untrusted.
     pub fn new(
-        zfs: Arc<crate::zfs::Zfs>,
+        zfs: Arc<crate::store::zfs::Zfs>,
         clock: std::sync::Arc<dyn TrustedClock>,
         entropy: Arc<dyn Nsm>,
         env: &[(String, String)],
@@ -100,7 +100,7 @@ impl GuestEnvironment {
         })
     }
 
-    pub fn zfs(&self) -> &Arc<crate::zfs::Zfs> {
+    pub fn zfs(&self) -> &Arc<crate::store::zfs::Zfs> {
         &self.zfs
     }
 
@@ -118,6 +118,9 @@ impl GuestEnvironment {
         let mut wasi = WasiCtxBuilder::new();
         if let Some(dir) = dir {
             use wasmtime_wasi::{DirPerms, FilePerms};
+            // The tenant's only preopen, and the separation between tenants: cap-std resolves
+            // every path through it, so `..` stops here, an absolute path starts here, and a
+            // symlink cannot point out of it.
             wasi.preopened_dir(dir, "/", DirPerms::all(), FilePerms::all())?;
         }
         // Closed, not inherited. An enclave has no console to read from, so an
@@ -142,7 +145,7 @@ impl GuestEnvironment {
             .socket_addr_check(|_, _| Box::pin(async { false }));
         // Never `inherit_stdio`. Guest output is untrusted, attacker-chosen
         // text; on the enclave's own stdout it would be indistinguishable from
-        // the runtime's log lines. These carry it into `crate::guest_io`
+        // the runtime's log lines. These carry it into `crate::telemetry::logs`
         // instead, tagged by stream and marked as guest-produced.
         wasi.stdout(self.logs.stdout());
         wasi.stderr(self.logs.stderr());

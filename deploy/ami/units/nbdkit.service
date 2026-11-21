@@ -2,7 +2,7 @@
 #
 # An enclave has no devices. The pool lives on an EBS volume attached to this
 # instance, and this hands its blocks to the enclave as NBD on vsock port
-# 10809, where the runtime attaches it as /dev/nbd0 (runtime/src/zfs.rs).
+# 10809, where the runtime attaches it as /dev/nbd0 (runtime/src/store/zfs.rs).
 #
 # Everything it serves is dm-crypt ciphertext under a key this machine never
 # sees, and the enclave checks every block it reads against ZFS's checksums

@@ -23,16 +23,6 @@ fn component_path() -> PathBuf {
         .join("../examples/guest-http/target/wasm32-wasip2/release/guest-http.wasm")
 }
 
-/// Every request carries one, whether or not the deployment attests.
-fn nonce_header() -> String {
-    use base64::Engine as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let mut nonce = vec![0xc3u8; 20];
-    nonce[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce)
-}
-
 #[derive(Debug)]
 struct AcceptAny;
 
@@ -87,7 +77,7 @@ async fn start() -> std::net::SocketAddr {
     });
 
     let (logs, _collector) =
-        enclave_runtime::guest_io::start(Arc::new(enclave_runtime::TracingLogSink));
+        enclave_runtime::telemetry::logs::start(Arc::new(enclave_runtime::TracingLogSink));
     let guest = GuestEnvironment::new(
         fs,
         Arc::new(HostClock),
@@ -115,8 +105,7 @@ async fn start() -> std::net::SocketAddr {
                 notify: None,
                 telemetry: Default::default(),
                 addr,
-                certificate: Some(enclave_runtime::CertificateSlot::fixed(identity)),
-                acme: None,
+                certificate: Some(identity),
                 attestation: None,
                 request_timeout: std::time::Duration::from_secs(30),
                 max_interaction: std::time::Duration::from_secs(300),
@@ -202,11 +191,7 @@ async fn a_client_that_never_heard_of_alpn_is_unaffected() {
     let (mut stream, chosen) = connect(addr, &[]).await;
     assert_eq!(chosen, None, "no ALPN offered, so none should be selected");
 
-    let request = format!(
-        "GET /counter HTTP/1.1\r\nHost: enclave.test\r\nx-enclave-nonce: {}\r\n\
-         Connection: close\r\n\r\n",
-        nonce_header()
-    );
+    let request = "GET /counter HTTP/1.1\r\nHost: enclave.test\r\nConnection: close\r\n\r\n";
     stream.write_all(request.as_bytes()).await.expect("write");
     let mut response = Vec::new();
     let _ = stream.read_to_end(&mut response).await;
@@ -238,7 +223,6 @@ async fn a_request_completes_over_h2() {
     let req = hyper::Request::builder()
         .method("GET")
         .uri("https://enclave.test/counter")
-        .header("x-enclave-nonce", nonce_header())
         .body(Full::new(bytes::Bytes::new()))
         .expect("well-formed request");
 

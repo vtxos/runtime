@@ -24,3 +24,6 @@ deploy/tofu/.terraform/
 # those scripts write and not a log someone keeps deliberately elsewhere.
 /bench.txt
 /runtime.log
+
+# `nix build` leaves its output link here.
+/result

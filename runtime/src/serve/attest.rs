@@ -1,5 +1,5 @@
-//! A proof, on every `/auth/*` response, that this connection is terminated by
-//! this enclave.
+//! A proof, on the `/auth/*` answers a client identifies the enclave by, that
+//! this connection is terminated by this enclave.
 //!
 //! ```text
 //!   client nonce ──┐
@@ -18,47 +18,40 @@
 //!
 //! # Which responses carry one
 //!
-//! Every response to a path under `/auth/`, whatever its method or status — the
-//! challenge, the token, a refusal, and a 405 for `GET /auth/`, which is how a
-//! client attests the enclave without asking it for anything (`nitro-attest`
-//! does exactly that). The document is made before routing, so it cannot
-//! depend on what the route answers.
+//! Two: the options calls, `register/options` and `request/options`, the first
+//! call of a registration and of a sign-in. A client checks the document before
+//! it sends anything secret on the verify call that follows. The document is
+//! made once the route has answered, and no refusal carries one. There is no
+//! attestation endpoint.
 //!
-//! Nothing else carries one. A guest response is served on a connection whose
-//! certificate the client already verified on the auth exchange and pinned, and
-//! TLS proves the peer still holds that certificate's key — so a second
-//! document would only spend an NSM signature to repeat the first. The header
-//! is stripped from those responses, so a guest cannot supply one of its own.
+//! Nothing else carries one. The verify call and the guest response are served
+//! on a connection whose certificate the client already checked on the options
+//! answer and pinned, and TLS proves the peer still holds that certificate's
+//! key — so a second document would only spend an NSM signature to repeat the
+//! first. The header is stripped from every other response, so a guest cannot
+//! supply one of its own.
 //!
-//! A request without a valid `x-enclave-nonce` is refused with a 400 before
-//! routing, and carries no document either: there is no client nonce to bind.
+//! An options call without a valid `x-enclave-nonce` is refused with a 400
+//! before it is routed, and carries no document either: there is no client
+//! nonce to bind. No other call sends one, since nothing else is attested.
 //!
 //! # What it does not prove
 //!
-//! **Nothing about the response body.** The document is generated before the
-//! guest runs and binds only the nonce and the certificate. It is not a receipt
-//! for what the guest said, and adding one would mean a new `user_data` layout
-//! and a verifier that understands it.
+//! **Nothing about the response body.** The document binds only the nonce and
+//! the certificate. It is not a receipt for what the answer said, and adding
+//! one would mean a new `user_data` layout and a verifier that understands it.
 //!
 //! **Nothing before the request was sent.** By the time a client sees the
-//! proof, its request is already inside the enclave. A client that must know
-//! first sends a nonced request, verifies, and reuses **the same
-//! connection** — which proves more than a separate round trip could, since the
-//! binding is per-connection.
+//! proof, its request is already inside the enclave. So what a client sends
+//! first is nothing secret — a DKG commitment, or the interaction it wants a
+//! challenge for; it verifies, and sends what is secret — its signature and
+//! its ECDH partial — only on **the same certificate**.
 //!
 //! The client also has to do its part, and the runtime cannot make it: generate
 //! the nonce from a CSPRNG per request, compare the document's nonce to the one
 //! sent, and treat a *missing* header as a failure. Without the last of those,
 //! an attacker who strips the header downgrades every client that does not
 //! check.
-//!
-//! # And the other way
-//!
-//! The same device also signs every request of a connection the runtime holds
-//! for a guest ([`crate::stream`]), under the same header and the same limit —
-//! bound to that request's bytes rather than to a connection, because there the
-//! enclave is the client. [`ResponseAttestor::stream_document`] makes those;
-//! `docs/STREAMING.md` says what a service checks.
 
 use std::sync::Arc;
 
@@ -117,7 +110,7 @@ impl std::fmt::Display for NonceError {
         match self {
             NonceError::Missing => write!(
                 f,
-                "every request must carry {NONCE_HEADER}: \
+                "this call must carry {NONCE_HEADER}: \
                  {MIN_NONCE_BYTES}..={MAX_NONCE_BYTES} random bytes, base64url, unpadded"
             ),
             NonceError::NotAscii => write!(f, "{NONCE_HEADER} is not printable ASCII"),
@@ -245,21 +238,7 @@ impl ResponseAttestor {
             .await
     }
 
-    /// A document for one outbound stream request, binding `user_data` alone —
-    /// [`crate::stream::stream_user_data`] says what that is.
-    ///
-    /// No nonce, because nobody is there to choose one: the service first hears
-    /// of the request when it arrives, and asking it for a nonce would be a
-    /// round trip per message. Its freshness is the document's own timestamp,
-    /// which the service bounds. No certificate either — the enclave is the
-    /// client here, and the guest is PCR16's to name. Smaller than what
-    /// [`Self::verify_fits`] sized at boot, so that check covers this too.
-    pub async fn stream_document(&self, user_data: [u8; 32]) -> Result<HeaderValue, AttestError> {
-        self.sign(AttestationRequest::with_user_data(user_data.to_vec()))
-            .await
-    }
-
-    /// One signature from the device, under the limit both callers share.
+    /// One signature from the device, under the limit every caller shares.
     ///
     /// The permit is taken **before** the blocking call, not inside it: tokio's
     /// blocking pool queues without bound, so acquiring inside would convert a
@@ -307,12 +286,9 @@ impl ResponseAttestor {
     /// call to the device, so an NSM that will not answer at all is found here
     /// rather than on a client's first request.
     ///
-    /// Deliberately does **not** take the serving certificate. On the ACME path
-    /// there is none yet — issuance needs a round trip to the CA and an inbound
-    /// challenge, both of which happen after this — and refusing to start then
-    /// would mean no ACME deployment could ever boot. A placeholder is sound
-    /// because only the leaf's 32-byte SHA-256 reaches `user_data`, so the
-    /// document is the same size whatever certificate is eventually served.
+    /// It does not need the serving certificate: only the leaf's 32-byte
+    /// SHA-256 reaches `user_data`, so a placeholder makes a document the same
+    /// size as any certificate would.
     pub async fn verify_fits(&self) -> Result<usize, AttestError> {
         let probe = ClientNonce(vec![0u8; MAX_NONCE_BYTES]);
         let header = self.document(Some(b"boot-time size probe"), &probe).await?;
@@ -489,7 +465,7 @@ mod tests {
         assert_eq!(parsed.as_bytes(), &nonce);
     }
 
-    /// A request with no nonce reaches nothing: there is no value to bind, and
+    /// An options call with no nonce reaches nothing: there is no value to bind, and
     /// one the runtime chose would prove nothing to the client.
     #[test]
     fn a_missing_nonce_is_refused() {
@@ -637,15 +613,5 @@ mod tests {
             attestor.verify_fits().await,
             Err(AttestError::TooLarge(_))
         ));
-    }
-
-    /// The check must not need the serving certificate. An ACME deployment has
-    /// none at boot — issuance happens later — so a check that asked for one
-    /// would refuse to start exactly the deployments this runtime is for.
-    #[tokio::test]
-    async fn the_boot_check_does_not_need_a_certificate_yet() {
-        let nsm = Arc::new(nitro_nsm::fake::FakeNsm::new());
-        let attestor = ResponseAttestor::new(nsm, b"g");
-        assert!(attestor.verify_fits().await.is_ok());
     }
 }

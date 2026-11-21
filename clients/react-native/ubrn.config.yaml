@@ -1,0 +1,19 @@
+# uniffi-bindgen-react-native: builds rust/vtxos-uniffi for each platform and generates
+# the TypeScript, the C++ between Hermes and Rust, and the Turbo Module around them.
+rust:
+  directory: rust
+  manifestPath: vtxos-uniffi/Cargo.toml
+android:
+  # 64-bit only: phones (arm64-v8a), and emulators and Chromebooks (x86_64). An app using the
+  # package must build the same two (`reactNativeArchitectures`): the C++ links this per ABI.
+  targets:
+    - arm64-v8a
+    - x86_64
+  # React Native 0.86's own floor.
+  apiLevel: 24
+  # Ship the cdylib (about 9 MB per ABI), not the staticlib (50-60 MB).
+  useSharedLibrary: true
+ios:
+  targets:
+    - aarch64-apple-ios
+    - aarch64-apple-ios-sim

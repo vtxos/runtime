@@ -159,7 +159,7 @@ async fn start() -> Harness {
     });
 
     let (logs, _collector) =
-        enclave_runtime::guest_io::start(Arc::new(enclave_runtime::TracingLogSink));
+        enclave_runtime::telemetry::logs::start(Arc::new(enclave_runtime::TracingLogSink));
     let guest = GuestEnvironment::new(fs, Arc::new(HostClock), nsm.clone(), &[], &[], logs)
         .expect("guest environment");
 
@@ -181,8 +181,7 @@ async fn start() -> Harness {
                 notify: None,
                 telemetry: Default::default(),
                 addr,
-                certificate: Some(enclave_runtime::CertificateSlot::fixed(identity)),
-                acme: None,
+                certificate: Some(identity),
                 attestation: Some(nsm_for_server),
                 request_timeout: std::time::Duration::from_secs(30),
                 max_interaction: std::time::Duration::from_secs(300),
@@ -234,19 +233,6 @@ impl tower::Service<http::Request<tonic::body::Body>> for H2Service {
     }
 }
 
-fn nonce() -> Vec<u8> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let mut n = vec![0x2bu8; 20];
-    n[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes());
-    n
-}
-
-fn nonce_header(nonce: &[u8]) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce)
-}
-
 /// **A real gRPC client driving a real bidirectional stream.**
 ///
 /// tonic, over TLS and ALPN-negotiated HTTP/2, decoding with prost — so the
@@ -256,7 +242,6 @@ fn nonce_header(nonce: &[u8]) -> String {
 #[ignore = "needs examples/guest-grpc built for wasm32-wasip2"]
 async fn tonic_drives_a_bidirectional_stream_over_the_wire() {
     let harness = start().await;
-    let chosen_nonce = nonce();
 
     // One TLS connection, whose certificate this test keeps.
     let mut config = rustls::ClientConfig::builder_with_provider(
@@ -307,11 +292,7 @@ async fn tonic_drives_a_bidirectional_stream_over_the_wire() {
     // The client controls its own send stream, so it can hold back until the
     // attestation checks out.
     let (tx, rx) = tokio::sync::mpsc::channel::<ClientMsg>(4);
-    let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
-    request.metadata_mut().insert(
-        "x-enclave-nonce",
-        nonce_header(&chosen_nonce).parse().expect("nonce header"),
-    );
+    let request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
 
     let response = client
         .streaming(
@@ -419,11 +400,7 @@ async fn a_refusal_reaches_tonic_as_permission_denied() {
     let mut client = grpc_client(harness.addr).await;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<ClientMsg>(4);
-    let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
-    request.metadata_mut().insert(
-        "x-enclave-nonce",
-        nonce_header(&nonce()).parse().expect("nonce header"),
-    );
+    let request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
 
     let response = client
         .streaming(
@@ -486,10 +463,6 @@ async fn a_grpc_timeout_does_not_shorten_or_lengthen_the_runtime_deadlines() {
 
     let (tx, rx) = tokio::sync::mpsc::channel::<ClientMsg>(4);
     let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
-    request.metadata_mut().insert(
-        "x-enclave-nonce",
-        nonce_header(&nonce()).parse().expect("nonce header"),
-    );
     // A deadline far longer than anything this test takes. If the runtime were
     // acting on it the call would still work; what would break is the
     // assumption that it is the guest's to interpret.

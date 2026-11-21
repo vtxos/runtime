@@ -2,7 +2,7 @@
 //!
 //! This trait abstracts over S3, S3-compatible (MinIO, R2), and an in-memory
 //! test fake. Methods correspond closely to S3 wire operations. What the
-//! runtime builds on them is the anchor chain ([`crate::zfs`]) and the boot
+//! runtime builds on them is the anchor chain ([`crate::store::zfs`]) and the boot
 //! records ([`crate::boot`]): conditional creates under Object Lock, and reads
 //! of the retained version beneath any delete marker.
 //!
@@ -27,12 +27,13 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::store::error::StoreResult;
+use crate::store::error::{StoreError, StoreResult};
 
 pub mod memory;
 
@@ -299,4 +300,113 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
     ) -> StoreResult<BlobMeta>;
 
     async fn multipart_abort(&self, key: &str, upload_id: &MultipartId) -> StoreResult<()>;
+}
+
+/// What a write-once PUT came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Once {
+    /// These bytes are the ones Object Lock kept.
+    Won,
+    /// Somebody else's bytes are.
+    Lost,
+}
+
+/// Write `body` at `key` once, COMPLIANCE-locked until `retain_until`, and say
+/// whose bytes the lock kept.
+///
+/// `If-None-Match` alone does not decide that: a delete marker over an earlier
+/// write lets a second conditional PUT through. The retained version does, so
+/// it is read back. Everything that must exist once — an anchor, a generation,
+/// a tenant record, a region claim, a version's sealed key — is written here.
+pub async fn put_once(
+    roots: &Arc<dyn Backend>,
+    key: &str,
+    body: Bytes,
+    retain_until: SystemTime,
+) -> StoreResult<Once> {
+    let input = PutBlobInput::new(key, body.clone()).with_object_lock(ObjectLock {
+        mode: ObjectLockMode::Compliance,
+        retain_until,
+    });
+    match roots.put_blob_if_not_exists(input).await {
+        Ok(_) => {}
+        Err(StoreError::AlreadyExists) => return Ok(Once::Lost),
+        Err(e) => return Err(e),
+    }
+    Ok(if roots.get_retained_blob(key).await?.body == body {
+        Once::Won
+    } else {
+        Once::Lost
+    })
+}
+
+/// The retained bytes at `key`, or `None` if nothing was ever kept there. A
+/// delete marker over a retained version still reads as that version.
+pub async fn get_once(roots: &Arc<dyn Backend>, key: &str) -> StoreResult<Option<Bytes>> {
+    match roots.get_retained_blob(key).await {
+        Ok(out) => Ok(Some(out.body)),
+        Err(StoreError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod once_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn roots() -> Arc<dyn Backend> {
+        Arc::new(memory::MemoryBackend::new())
+    }
+
+    fn later() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(3600)
+    }
+
+    #[tokio::test]
+    async fn the_first_writer_wins_and_the_second_loses() {
+        let r = roots();
+        let first = put_once(&r, "k", Bytes::from_static(b"a"), later()).await;
+        assert_eq!(first.unwrap(), Once::Won);
+        let second = put_once(&r, "k", Bytes::from_static(b"b"), later()).await;
+        assert_eq!(second.unwrap(), Once::Lost);
+        assert_eq!(get_once(&r, "k").await.unwrap().unwrap(), &b"a"[..]);
+    }
+
+    /// A delete marker lets the conditional PUT through; the read-back is what
+    /// says the hidden writer still holds the key.
+    #[tokio::test]
+    async fn hiding_the_winner_does_not_hand_the_key_to_a_second_writer() {
+        let r = roots();
+        put_once(&r, "k", Bytes::from_static(b"a"), later())
+            .await
+            .unwrap();
+        r.delete_blob("k").await.unwrap();
+        assert_eq!(
+            put_once(&r, "k", Bytes::from_static(b"b"), later())
+                .await
+                .unwrap(),
+            Once::Lost
+        );
+        assert_eq!(get_once(&r, "k").await.unwrap().unwrap(), &b"a"[..]);
+    }
+
+    /// A plain PUT over the winner is a newer version; the retained read still
+    /// answers with the original.
+    #[tokio::test]
+    async fn a_forged_newer_version_is_not_what_is_read() {
+        let r = roots();
+        put_once(&r, "k", Bytes::from_static(b"a"), later())
+            .await
+            .unwrap();
+        r.put_blob(PutBlobInput::new("k", Bytes::from_static(b"forged")))
+            .await
+            .unwrap();
+        assert_eq!(get_once(&r, "k").await.unwrap().unwrap(), &b"a"[..]);
+    }
+
+    #[tokio::test]
+    async fn an_absent_key_is_none() {
+        assert!(get_once(&roots(), "nothing").await.unwrap().is_none());
+    }
 }

@@ -25,9 +25,9 @@ The enclave boots as an EIF under QEMU's `nitro-enclave` machine — the same
 image format and the same boot path as production, measured into PCR0 by the
 hypervisor. It takes its address by DHCP over emulated vsock, brings up its ZFS
 pool on a disk image served over vsock, fetches your component from the store and
-measures it into PCR16 before it can obtain a key, orders a certificate from a
-CA over RFC 8555 TLS-ALPN-01, and gates every request on a WebAuthn assertion
-bound to that exact request.
+measures it into PCR16 before it can obtain a key, makes its own TLS
+certificate, and gates every request on a signature by the tenant's wallet
+share, bound to that exact request.
 
 Your client verifies the attestation document by signature, certificate chain,
 validity window, pinned root and both measurements — the same code path, with
@@ -58,13 +58,6 @@ pinning PCR0 and PCR16 is what stops a substituted guest from reading anything;
 locally, a substituted guest boots and serves. The e2e's leg 8 shows the half
 that *is* testable: the enclave measures whatever it fetched, and a client
 pinning the approved guest refuses it.
-
-**The CA.** Certificates come from [Pebble](https://github.com/letsencrypt/pebble),
-Let's Encrypt's test server. The protocol is real RFC 8555 — directory, account,
-order, TLS-ALPN-01 challenge, finalize, and a certificate sealed into the store —
-but no public root signs it, so a client needs Pebble's root as well, printed as
-`--ca` on startup. A real client should pin the certificate out of the
-attestation document instead, which is what the document binds it for.
 
 ## Must PCR0 always be zero?
 
@@ -108,25 +101,28 @@ comparison a client makes against AWS's.
 
 ## Trying it
 
-The repo's own client signs a WebAuthn assertion per request, which is the only
-way anything reaches the guest:
+The repo's own client signs an approval with its wallet share for each request,
+which is the only way anything reaches the guest:
 
 ```bash
-target/release/passkey-client \
+target/release/wallet-client \
     --url https://127.0.0.1:8443 --state target/qemu-nitro/dev/alice.json \
     --trust-root target/qemu-nitro/dev/trust-root.der \
     --pcr0 <printed> --pcr16 <printed> \
     get --path /counter
 ```
 
-Registration is open: any passkey may enrol and gets its own tenant. A second
-`--state` file is a second tenant, which is how to check that one cannot see the
-other's data.
+The script registered the wallet in `alice.json` when it started. Registration
+is open: any wallet may register and gets its own tenant. `enrol` with a second
+`--state` file makes a second tenant, which is how to check that one cannot see
+the other's data.
 
-To verify the attestation without touching the guest, `nitro-attest --url
-https://127.0.0.1:8443/auth/` with the same three flags. The document rides on
-the `/auth/` exchange, which needs no credential — that is where a client
-identifies the enclave before it approves anything.
+To verify the attestation without touching the guest, check the document the
+script's registration was answered with, kept under
+`target/qemu-nitro/dev/proof/`: `nitro-attest --document … --peer-certificate …
+--nonce …` with the same three flags. The script prints the whole command. A
+client gets a document from `register/options` or `request/options`. That is
+where it identifies the enclave, before it sends anything secret.
 
 ## Options
 
@@ -135,8 +131,6 @@ identifies the enclave before it approves anything.
 | `--guest COMPONENT.wasm` | the component to serve. Without one, the example in `examples/guest-http` is built |
 | `--port PORT` | host port forwarded to the enclave's `:443`. Default 8443 |
 | `--name NAME` | names this run's containers and its directory under `target/qemu-nitro`. It keeps runs apart on disk; only one can be up at a time, because MinIO's port and the enclave's vsock CID are fixed |
-| `--rp-id DOMAIN` | the WebAuthn relying party the image is built with. Default `enclave.test`; a phone app needs a domain whose `assetlinks.json` names it |
-| `--allowed-origin ORIGIN` | an origin assertions may claim besides `https://<rp id>`, repeatable — `android:apk-key-hash:<hash>` for an Android app |
 | `--keep-store` | keep the store in `target/qemu-nitro/<name>-store` and resume it on the next start with that name — see [Restarting](#restarting) |
 | `--fresh` | with `--keep-store`, discard the kept store first |
 | `--guest-env NAME=VALUE` | a setting for the guest, repeatable — e.g. the address of a service it talks to. Written into the guest file before it is uploaded, so it is measured into PCR16 with the guest and can be given with `--prebuilt` |
@@ -144,10 +138,11 @@ identifies the enclave before it approves anything.
 A guest reaches the public internet and nothing else, by address; there is no
 option for it. In the emulator it also reaches the machine running the script,
 `192.168.127.254` from inside the enclave, on every port but the runtime's own
-there (its store, its CA, its push stub).
+there (its store, its push stub).
 
 Everything the run produced lives under `target/qemu-nitro/<name>/`: the console
-log, the trust root, the passkey state files, and `push-messages.jsonl` — every
+log, the trust root, the wallet's state file and its attestation proof, and
+`push-messages.jsonl` — every
 notification the guest raised, since the push service is stubbed locally.
 
 ## On a public host
@@ -159,13 +154,13 @@ holds and matters more once the host is not yours alone: whoever controls the ho
 tenant's data (the master key is static and public in `flake.nix`) and sign any attestation document
 (the chain is minted inside the image). Put test money behind it, never real money.
 
+The certificate is self-signed there too. A client pins it through the attestation, so the host
+needs no domain name.
+
 What changes:
 
 | flag | |
 |---|---|
-| `--domain NAME` | serve `NAME` with a certificate from Let's Encrypt, validated over TLS-ALPN-01. `NAME` must resolve to the host and `--port` must be 443, reachable from the internet. Pebble is not started |
-| `--acme-staging` | Let's Encrypt's staging CA. Prove issuance with it first: production allows five duplicate certificates a week, and nothing trusts a staging one |
-| `--acme-contact EMAIL` | the contact registered with the CA |
 | `--push-app-id ID` | real notifications through that AWS End User Messaging Push application instead of the stub, signed as the host's instance role — so the host must be on EC2, with a role allowed to send through it. Not a secret: the application's FCM channel holds the Firebase credential |
 | `--memory SIZE` | the enclave's memory (QEMU `-m`). Default `3G`; the runtime with a small guest runs in `1536M` |
 | `--store-bind ADDR` | publish MinIO on one address, e.g. `127.0.0.1`. Its credentials are the defaults; the enclave still reaches it through gvproxy |
@@ -185,7 +180,7 @@ image with the image options given and puts into `DIR` everything a run needs:
 DIR/
 ├── image.env          every image option, the runtime revision, and the image tags below
 ├── eif/               enclave-qemu.eif, pcr.json
-├── bin/               gvproxy (static); nitro-attest, passkey-client, vhost-device-vsock (libc only)
+├── bin/               gvproxy (static); nitro-attest, wallet-client, vhost-device-vsock (libc only)
 ├── images/            qemu.tar.gz, minio.tar.gz — the container images, loaded on first run
 ├── deploy/qemu-nitro/ this harness, as it was when the image was built
 ├── scripts/           lib.sh, minio-up.sh, minio-image.sh, wasi-sdk.sh
@@ -226,19 +221,17 @@ measurement will refuse the new enclave, which is the behaviour you want to see.
 
 With `--keep-store` the store survives. MinIO's data lives in
 `target/qemu-nitro/<name>-store/minio` instead of inside its container, so the
-next start with the same name finds the receipt and the store together and
-**resumes**: every tenant, passkey and file a guest wrote is still there. A new
-component is an **upgrade** of that store — the boot machine records the new
-pair — not a new one. Two things still change every boot, and clients have to
+next start with the same name **resumes**: every tenant, and every file a
+guest wrote, is still there. A new component is a new **release** on the same
+store: it mints its own key, and opens each tenant's data as that tenant's
+owner next signs in — so a client signs in once before it sees its files, and
+background work for a tenant waits for that. Two things still change every boot, and clients have to
 re-read them: the trust root, minted fresh by design, and PCR16 whenever the
 component did.
 
-Pebble also starts a new CA every time, while a kept store holds the certificate
-an earlier Pebble issued and serves it until renewal. So with `--keep-store`
-every root and intermediate seen is kept in the store directory, and
-`pebble-root.pem` holds all of them — trust that whole file. The store directory
-also carries an `id`, stable across restarts, for clients that keep state per
-store. `--fresh` (with `--keep-store`) deletes the directory and starts over;
+The TLS certificate is new every boot as well, so a client attests again on its
+first sign-in after a restart. The store directory carries an `id`, stable
+across restarts, for clients that keep state per store. `--fresh` (with `--keep-store`) deletes the directory and starts over;
 so does deleting it by hand while the enclave is down.
 
 ## If it does not start

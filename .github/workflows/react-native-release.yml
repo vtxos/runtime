@@ -1,0 +1,130 @@
+# A `react-native-wallet-v*` tag is a release of the React Native package
+# (clients/react-native, `@vtxos/react-native-wallet`) to npm. A tag with a
+# hyphen (react-native-wallet-v0.1.0-rc.1) is a prerelease, published under the
+# `next` dist-tag so `npm install @vtxos/react-native-wallet` never picks it up;
+# any other goes out as `latest`. The tag names the version: package.json is not
+# bumped by hand.
+#
+# Android builds on Linux and iOS on macOS, each with its build script
+# (scripts/ci-mobile-*.sh: the library, its bindings and Turbo Module, the
+# TypeScript, and the example app built against them), and each hands its
+# generated files to one publish job, which assembles the package and publishes
+# it with npm provenance, so anyone can see which commit and workflow built it.
+#
+# Needs the repository secret NPM_TOKEN: an npm token that can publish to the
+# `@vtxos` scope.
+name: React Native release
+
+on:
+  push:
+    tags: ["react-native-wallet-v*"]
+
+permissions:
+  contents: read
+
+# One release at a time: two tags pushed together must not race to npm.
+concurrency:
+  group: react-native-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  android:
+    name: Android
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # vtxos-client's build script generates protobuf code.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: ./.github/actions/rust
+        with:
+          shared-key: mobile-android
+          workspaces: clients/react-native/rust -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: clients/react-native/.nvmrc
+      - run: scripts/ci-mobile-android.sh
+      # The generated module (android/, without what the example's build left in
+      # it), with the bindings and the C++ both platforms share.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          if-no-files-found: error
+          path: |
+            clients/react-native/android
+            !clients/react-native/android/build
+            !clients/react-native/android/.cxx
+            !clients/react-native/android/.gradle
+            clients/react-native/cpp
+            clients/react-native/src
+
+  ios:
+    name: iOS
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install protobuf
+      - uses: ./.github/actions/rust
+        with:
+          shared-key: mobile-ios
+          workspaces: clients/react-native/rust -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: clients/react-native/.nvmrc
+      - run: scripts/ci-mobile-ios.sh
+      # The iOS half only: cpp/ and src/ come from the Android job.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios
+          if-no-files-found: error
+          path: |
+            clients/react-native/ios
+            !clients/react-native/ios/build
+            clients/react-native/*.xcframework
+            clients/react-native/*.podspec
+
+  publish:
+    name: Publish to npm
+    needs: [android, ios]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # npm provenance: the signed statement of which commit and workflow built it.
+      id-token: write
+    defaults:
+      run:
+        working-directory: clients/react-native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: clients/react-native/.nvmrc
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          name: android
+          path: clients/react-native
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios
+          path: clients/react-native
+      - run: corepack enable && yarn install --immutable
+      - name: The version, from the tag
+        run: |
+          version="${GITHUB_REF_NAME#react-native-wallet-v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::$GITHUB_REF_NAME does not name a version (react-native-wallet-v1.2.3[-rc.1])"
+            exit 1
+          fi
+          node -e 'const fs = require("fs"); const p = JSON.parse(fs.readFileSync("package.json", "utf8")); p.version = process.argv[1]; fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");' "$version"
+          case "$version" in *-*) echo "DIST_TAG=next" ;; *) echo "DIST_TAG=latest" ;; esac >> "$GITHUB_ENV"
+      # What goes out, in the log: both platforms' files must be in it.
+      - run: npm pack --dry-run
+      - run: npm publish --provenance --access public --tag "$DIST_TAG"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -24,20 +24,18 @@ path = "src/lib.rs"
 name = "enclave-runtime"
 path = "src/main.rs"
 
-# The client half of the gate, for the QEMU harness. A shell script cannot sign
-# a WebAuthn assertion, and the harness's self-signed certificate means no real
-# platform authenticator would ever attest against it — so the e2e drives the
-# gate with this. Behind `testing`, because it can mint assertions.
+# The client half of the gate, for the QEMU harness: a wallet in software, which
+# registers, signs approvals with its share and derives the tenant key with the
+# runtime. A shell script can do none of that. Behind `testing`, because it can
+# sign approvals.
 [[bin]]
-name = "passkey-client"
-path = "src/bin/passkey-client.rs"
+name = "wallet-client"
+path = "src/bin/wallet-client.rs"
 required-features = ["testing"]
 
-# One feature, and it is not about size. `testing` compiles
-# `auth::SoftwareAuthenticator`, which mints WebAuthn assertions — a forgery
-# tool. It is off by default so it cannot reach a production image, and on for
-# the QEMU harness, whose self-signed certificate means no real platform
-# authenticator will ever attest against it.
+# One feature, and it is not about size. `testing` compiles `auth::client`, a
+# wallet in software that signs approvals for a tenant. It is off by default so
+# it cannot reach a production image, and on for the QEMU harness.
 #
 # There used to be `aws` and `serve` features too, so a host embedding only the
 # `wasi:filesystem` bindings could skip the AWS SDK and hyper. With one consumer
@@ -46,12 +44,12 @@ required-features = ["testing"]
 [features]
 default = []
 # `nitro-attestation/testing` costs nothing new: it is `dep:rcgen` plus
-# `dep:time`, and rcgen is already enabled here by this very feature. It is
-# what lets `testing::Enclave` mint documents a client can actually verify.
-testing = ["dep:rcgen", "dep:tempfile", "nitro-attestation/testing"]
+# `dep:time`, and rcgen is already here. It is what lets `testing::Enclave`
+# mint documents a client can actually verify.
+testing = ["dep:tempfile", "nitro-attestation/testing"]
 
 [dependencies]
-# The roots bucket: anchors, boot records, the guest, the ACME cache.
+# The roots bucket: anchors, boot records, the registry, the guest.
 aws-sdk-s3             = { workspace = true, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types       = { workspace = true }
@@ -87,12 +85,6 @@ http-body-util = "0.1"
 # aws-lc-rs, not ring: it is already the crypto stack for the block store's
 # AEAD, signatures and key derivation, and a second one would mean two
 # implementations of the same primitives inside one attested image.
-#
-# That argument has one accepted exception, below: `webauthn-rs` brings
-# `openssl` and `openssl-sys`, which is a second stack *with C bindings*, inside
-# the boundary PCR0 measures. It was taken knowingly, in exchange for not
-# writing assertion verification by hand on the authentication path. Left
-# unqualified this comment would contradict the manifest it is in.
 rustls         = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs", "tls12"] }
 # Already in the image via rustls, which parses every certificate it verifies.
 # Naming it here adds no code to the build — only the ability to ask for the
@@ -106,27 +98,14 @@ tokio-rustls   = { version = "0.26", default-features = false, features = ["aws-
 # than behind a feature name nobody looked at.
 hyper-rustls   = { version = "0.27", default-features = false, features = ["http1", "http2"] }
 # The roots that client validates against, compiled into the measured image
-# rather than read from a file. Already in the tree via rustls-acme.
+# rather than read from a file.
 webpki-roots   = "1"
-# Self-signed certificates, for the test harnesses and the QEMU emulator only.
-# Optional, and off in a production build: the runtime serves ACME-issued
-# certificates, so a certificate generator has no business inside the boundary
-# PCR0 measures.
-rcgen          = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"], optional = true }
-# TLS-ALPN-01, so the challenge arrives on the port the parent already
-# forwards. `webpki-roots` is not optional in practice: reaching the ACME
-# directory means validating the CA's own TLS certificate, and the enclave
-# cannot borrow the parent's trust store — the parent is the party being
-# excluded.
-# PEM, not a hand-rolled split: the certificate half of rustls-acme's blob is
-# the ACME directory's HTTP response verbatim, so its line endings are the CA's
-# choice and CRLF is as valid as LF. Already in the tree via rcgen/rustls-acme.
-pem            = "3"
-rustls-acme    = { version = "0.15", default-features = false, features = ["tokio", "aws-lc-rs", "tls12", "webpki-roots"] }
-# Sealing the ACME cache uses the same AES-256-GCM as the block store.
+# The serving certificate: self-signed inside the enclave at every boot, its
+# key in this boot's memory only. Clients trust it through the attestation that
+# binds its hash, not a CA (see src/serve/tls.rs).
+rcgen          = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 aws-lc-rs      = { workspace = true }
 blake3         = { workspace = true }
-# rustls-acme drives issuance through a Stream.
 futures        = { workspace = true }
 # The state_root pre-image and the receipt payloads. CBOR because the
 # receipt travels in an attestation document, which is CBOR already.
@@ -135,6 +114,17 @@ base64         = "0.22"
 # Scrubs key material on drop. Already in the tree via aws-credential-types.
 zeroize        = { workspace = true }
 hex            = "0.4"
+# The cosigner's half of each wallet key (src/signer): its DKG, its FROST rounds, its record.
+# `ecdh`: the tenant key, by threshold ECDH between the client's share and the
+# runtime's (src/signer, src/auth).
+threshold      = { path = "../crates/threshold", features = ["std", "ecdh"] }
+# The sign-in protocol, shared with every client: the approval, /auth/*'s messages, the tenant id.
+enclave-auth   = { path = "../crates/enclave-auth" }
+k256           = { version = "0.13", default-features = false, features = ["arithmetic"] }
+hkdf           = "0.12"
+sha2           = "0.10"
+# The generator trait `threshold` takes, served from the NSM (src/random.rs).
+rand_core      = "0.6"
 
 # The PTP clock is read through the POSIX dynamic-clock mechanism. rustix is
 # already compiled into the tree via wasmtime, so this adds no build cost and
@@ -179,6 +169,11 @@ aws-sdk-cloudwatchlogs = { version = "1.131.0", default-features = false, featur
 # Telemetry: guest spans to X-Ray and guest metrics to CloudWatch (see src/telemetry).
 aws-sdk-xray       = { version = "1.109.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
 aws-sdk-cloudwatch = { version = "1.127.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+# Background tasks (see src/tasks): EventBridge Scheduler fires them, SQS delivers them, and
+# DynamoDB records them where an operator can see them.
+aws-sdk-scheduler = { version = "1.119.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-sdk-sqs       = { version = "1.119.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-sdk-dynamodb  = { version = "1.136.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
 # The default credential chain, which resolves through gvproxy to the parent
 # instance's IMDS. Named explicitly rather than relied on as a fallback, so it
 # is obvious *which* identity guest logs are written with.
@@ -188,15 +183,13 @@ aws-config = { workspace = true, features = ["behavior-version-latest", "rt-toki
 # sign one request without a generated client.
 aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
 aws-credential-types = "1"
-# The feature adds no code beyond one registration constructor — see
-# `auth::routes`. Without it, options ask for a non-discoverable credential,
-# which Android below 14 creates outside Password Manager where nothing finds it.
-webauthn-rs = { version = "0.5.5", features = ["workaround-google-passkey-specific-issues"] }
 serde_json = "1.0.151"
 serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Checking the wallet key's signatures as BIP-340 (src/signer/signing.rs).
+k256 = { version = "0.13", default-features = false, features = ["arithmetic", "schnorr"] }
 # `tests/minio_integration.rs`: the S3 backend against a real MinIO.
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["minio"] }
@@ -234,7 +227,7 @@ tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 tonic-prost = "0.14"
 prost = "0.14"
 tower = { version = "0.5", features = ["util"] }
-# The integration suites drive the gate with a software passkey, which only
+# The integration suites drive the gate with a software wallet, which only
 # exists under `testing`. A dev-dependency on the crate itself is how a crate
 # turns a feature on for its own tests without turning it on for consumers.
 enclave-runtime = { path = ".", features = ["testing"] }

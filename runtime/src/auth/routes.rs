@@ -1,22 +1,45 @@
-//! `/auth/*` — the only routes that answer without an assertion.
+//! `/auth/*` — the only routes that answer without a token.
 //!
 //! They are runtime-owned in the same sense `/enclave/*` is: refused before
 //! dispatch, never forwarded, and unreachable by any guest. That is not a
 //! convenience. A guest able to answer under `/auth/` could hand out its own
-//! challenges and verify its own assertions, which is the same as having none.
+//! tokens, which is the same as having none.
 //!
-//! Nothing here performs a cosigner action or touches an *existing* tenant's
-//! directory. The most any of it does is create a new tenant, which anyone may
-//! do: registration is open, and what it grants is an empty tenant and nothing
-//! else.
+//! ## Registration: two calls, the whole DKG
 //!
-//! ## Why registration is two calls
+//! Registration is open: what it grants is a new, empty tenant and nothing else.
+//! It makes the tenant's wallet key, a 2-of-2 between the client and the runtime
+//! ([`crate::signer::dkg`]), and the wallet commits first:
 //!
-//! WebAuthn registration is a challenge and a response, and the runtime has to
-//! remember which challenge it issued while the user holds their thumb to a
-//! phone. The state is kept here, keyed by an id the client quotes back, for
-//! the same reasons the assertion challenges are: single use, short lived, and
-//! bounded, because issuing one is necessarily unauthenticated.
+//! 1. `register/options` takes the wallet's round one (a commitment and a proof
+//!    of knowledge: nothing secret) and answers with the runtime's round one and
+//!    the share it deals the wallet. The answer carries this enclave's
+//!    attestation, which the client checks, pinning the certificate, before it
+//!    sends anything secret.
+//! 2. `register/verify` takes the share the wallet deals the runtime, a
+//!    signature with the wallet's finished share, and its ECDH partial. Only when
+//!    all three verify is anything kept: the runtime's share sealed into the
+//!    tenant's record, a region claimed, and the pool created under `k`. A
+//!    registration that is abandoned or refused leaves nothing behind.
+//!
+//! ## Sign-in: a challenge, then a signature
+//!
+//! `request/options` names the tenant by its group key and the interaction it
+//! wants, and gets a single-use challenge ([`super::challenge`]). It is issued
+//! whatever key it names, so it cannot be used to learn which keys are tenants.
+//! The answer carries this enclave's attestation, which the client checks,
+//! pinning the certificate, before it signs anything. `request/verify` carries
+//! a signature by the wallet's share over that challenge and the interaction
+//! ([`super::approval`]), and the wallet's ECDH partial, from which the runtime
+//! derives `k` and opens the pool if it is not open already. A client cannot
+//! know whether it is, and is not told, so every sign-in carries the partial.
+//!
+//! So both operations have the same shape: an options call whose answer is
+//! attested ([`ATTESTED_CALLS`]), then a verify call that does the work, on the
+//! certificate that answer named.
+//!
+//! Every refusal of who is asking is the same `401`, carries no attestation,
+//! and costs the runtime no unsealing.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -24,15 +47,33 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
-use webauthn_rs::prelude::*;
+use serde::Serialize;
+use threshold::dkg::{Round1Package, Round2Package};
+use threshold::point;
 
-use super::credential::{tenant_of, FilesystemCredentials, StoredCredential, RECORD_VERSION};
-use super::gate::Gate;
+use enclave_auth::wire::{
+    RegisterOptionsRequest, RegisterOptionsResponse, RegisterVerifyRequest, RegisterVerifyResponse,
+    RequestOptionsRequest, RequestOptionsResponse, RequestVerifyRequest, RuntimeDeal,
+    TokenResponse, WirePartial,
+};
+
+use super::approval;
+use super::challenge::ChallengeStore;
+use super::gate::{Denied, Gate};
 use super::token::InteractionScope;
+use crate::signer::{seal_share, Keys};
+use crate::store::registry::Place;
+use crate::store::zfs::{Arrival, AttachError, Zfs};
+use crate::tenant::{tenant_of, TenantKey};
 
 /// The prefix the guest can never see.
 pub const AUTH_PREFIX: &str = "/auth/";
+
+/// The calls whose answers carry this enclave's attestation, and so the only ones that take
+/// `x-enclave-nonce`: the first call of a registration and of a sign-in. A client checks the
+/// document, and pins the certificate, before it sends anything secret on the verify call that
+/// follows.
+pub const ATTESTED_CALLS: [&str; 2] = ["/auth/register/options", "/auth/request/options"];
 
 /// How long a half-finished registration is held.
 const REGISTRATION_TTL: Duration = Duration::from_secs(300);
@@ -41,84 +82,22 @@ const MAX_REGISTRATIONS: usize = 64;
 /// Ceiling on an `/auth/*` request body.
 const MAX_BODY: usize = 16 * 1024;
 
-/// Registration is open, so nothing here is required. The only thing a caller
-/// may supply is what to call the credential.
+type Body = wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+
+/// An `/auth/*` answer, and whether this enclave attests it.
 ///
-/// `deny_unknown_fields` for the same reason `RequestOptionsRequest` has it: an
-/// older client still sending `enrollment_token` is told that it means nothing
-/// now, rather than having it quietly ignored and believing it was admitted on
-/// the strength of one.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RegisterOptionsRequest {
-    #[serde(default)]
-    display_name: Option<String>,
-}
-
-#[derive(Serialize)]
-struct RegisterOptionsResponse {
-    registration_id: String,
-    options: CreationChallengeResponse,
-}
-
-#[derive(Deserialize)]
-struct RegisterVerifyRequest {
-    registration_id: String,
-    credential: RegisterPublicKeyCredential,
-}
-
-#[derive(Serialize)]
-struct RegisterVerifyResponse {
-    tenant_id: String,
-    credential_id: String,
-}
-
-/// What an interaction challenge is issued for.
-///
-/// `deny_unknown_fields` is load-bearing: this route used to take a
-/// `body_sha256`, and a client still sending one must be told that it means
-/// nothing now rather than have it quietly ignored. An approval that names a
-/// body it does not bind would be worse than one that never claimed to.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RequestOptionsRequest {
-    /// Which passkey the client intends to use. The runtime allows exactly
-    /// that one, so an assertion from any other credential fails even before
-    /// the credential lookup.
-    credential_id: String,
-    method: String,
-    path: String,
-    #[serde(default)]
-    query: Option<String>,
-}
-
-/// The assertion, coming back to be turned into a token.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RequestVerifyRequest {
-    challenge_id: String,
-    /// Base64url of the `PublicKeyCredential` JSON `navigator.credentials.get()`
-    /// produced.
-    assertion: String,
-}
-
-/// The token, and how long it has to be spent.
-#[derive(Serialize)]
-struct TokenResponse {
-    token: String,
-    /// Seconds. This bounds the time to *start* an interaction, and is not how
-    /// long one may run once started.
-    expires_in_secs: u64,
-}
-
-#[derive(Serialize)]
-struct RequestOptionsResponse {
-    challenge_id: String,
-    options: RequestChallengeResponse,
+/// Only the options calls' answers are attested ([`ATTESTED_CALLS`]), and only when they succeed:
+/// no refusal carries a document.
+pub struct AuthResponse {
+    pub response: hyper::Response<Body>,
+    pub attest: bool,
 }
 
 struct PendingRegistration {
-    state: PasskeyRegistration,
+    /// What the runtime's polynomial for this registration is derived from.
+    handle: [u8; 16],
+    /// The wallet's round one, which `register/verify` finishes against.
+    wallet: Round1Package,
     expires: Instant,
 }
 
@@ -135,26 +114,36 @@ impl std::fmt::Debug for AuthEndpoints {
 
 pub struct AuthEndpoints {
     gate: Arc<Gate>,
-    credentials: Arc<FilesystemCredentials>,
+    /// Each tenant's wallet key, and the operator master the runtime's half is
+    /// derived from and sealed under.
+    keys: Arc<Keys>,
+    zfs: Arc<Zfs>,
     entropy: Arc<dyn nitro_nsm::Nsm>,
-    zfs: Arc<crate::zfs::Zfs>,
+    challenges: ChallengeStore,
     registrations: Mutex<HashMap<[u8; 16], PendingRegistration>>,
 }
 
 impl AuthEndpoints {
     pub fn new(
         gate: Arc<Gate>,
-        credentials: Arc<FilesystemCredentials>,
-        zfs: Arc<crate::zfs::Zfs>,
+        keys: Arc<Keys>,
+        zfs: Arc<Zfs>,
         entropy: Arc<dyn nitro_nsm::Nsm>,
+        challenges: ChallengeStore,
     ) -> Self {
         AuthEndpoints {
             gate,
-            credentials,
-            entropy,
+            keys,
             zfs,
+            entropy,
+            challenges,
             registrations: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Each tenant's wallet key, for the guest's signing to read.
+    pub fn keys(&self) -> &Arc<Keys> {
+        &self.keys
     }
 
     fn random_id(&self) -> anyhow::Result<[u8; 16]> {
@@ -163,24 +152,27 @@ impl AuthEndpoints {
         Ok(id)
     }
 
-    /// Answer an `/auth/*` request, or `None` if this is not one.
+    /// Answer an `/auth/*` request, or `None` if this is not one. `certificate`
+    /// is the SHA-256 of the certificate this connection was served, or
+    /// [`approval::NO_CERTIFICATE`] over plain HTTP.
     pub async fn handle(
         &self,
         method: &hyper::Method,
         path: &str,
         body: &[u8],
-    ) -> Option<hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody>> {
+        certificate: &[u8; 32],
+    ) -> Option<AuthResponse> {
         if !path.starts_with(AUTH_PREFIX) {
             return None;
         }
         if method != hyper::Method::POST {
-            return Some(problem(
+            return Some(refuse(
                 hyper::StatusCode::METHOD_NOT_ALLOWED,
                 "auth routes are POST",
             ));
         }
         if body.len() > MAX_BODY {
-            return Some(problem(
+            return Some(refuse(
                 hyper::StatusCode::PAYLOAD_TOO_LARGE,
                 "request body too large",
             ));
@@ -188,285 +180,392 @@ impl AuthEndpoints {
 
         Some(match &path[AUTH_PREFIX.len()..] {
             "register/options" => self.register_options(body).await,
-            "register/verify" => self.register_verify(body).await,
+            "register/verify" => self.register_verify(body, certificate).await,
             "request/options" => self.request_options(body).await,
-            "request/verify" => self.request_verify(body).await,
-            other => problem(
+            "request/verify" => self.request_verify(body, certificate).await,
+            other => refuse(
                 hyper::StatusCode::NOT_FOUND,
                 &format!("no auth endpoint {other:?}"),
             ),
         })
     }
 
-    async fn register_options(
-        &self,
-        body: &[u8],
-    ) -> hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody> {
+    async fn register_options(&self, body: &[u8]) -> AuthResponse {
         let Ok(request) = serde_json::from_slice::<RegisterOptionsRequest>(body) else {
-            return problem(hyper::StatusCode::BAD_REQUEST, "malformed request");
+            return refuse(hyper::StatusCode::BAD_REQUEST, "malformed request");
         };
-
-        // Registration is open: anyone who can reach this route may create a
-        // tenant. What that grants is deliberately narrow — a *new*, empty
-        // tenant and nothing else. It cannot reach an existing tenant's data,
-        // approve anything, or add a passkey to somebody else's account, all of
-        // which still need an assertion from a credential already registered
-        // there. Admission control over resource creation is what was given up
-        // here; access control was not.
-        let name = request.display_name.as_deref().unwrap_or("cosigner");
-        // A discoverable platform passkey (`residentKey: required`,
-        // `authenticatorAttachment: platform`), not webauthn-rs's default of
-        // `residentKey: discouraged` with no attachment. Android below 14 takes
-        // the default literally and makes a non-discoverable security-key
-        // credential outside Password Manager, which sign-in then cannot find.
-        // Clients are native apps, never a browser, so nothing is given up by
-        // ruling out roaming security keys and cross-device registration. It
-        // also drops credProtect, which Android does not support and a platform
-        // passkey does not need.
-        let (options, state) = match self
-            .gate
-            .webauthn()
-            .start_google_passkey_in_google_password_manager_only_registration(
-                Uuid::new_v4(),
-                name,
-                name,
-                None,
-            ) {
-            Ok(pair) => pair,
+        let Ok(wallet) = Round1Package::from_json(&request.dkg.round1_package) else {
+            return refuse(hyper::StatusCode::BAD_REQUEST, "malformed DKG package");
+        };
+        let master = match self.master().await {
+            Ok(master) => master,
+            Err((status, message)) => return refuse(status, message),
+        };
+        let Ok(handle) = self.random_id() else {
+            return refuse(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+        };
+        // The wallet has committed; the runtime answers with its commitment and the share it
+        // deals, and keeps nothing secret: `register/verify` derives the same polynomial again.
+        let deal = match crate::signer::dkg::deal(master, &handle, &wallet) {
+            Ok(deal) => deal,
             Err(e) => {
-                tracing::error!(error = %e, "starting registration");
-                return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+                tracing::info!(reason = %e, "refused a DKG package");
+                return refuse(
+                    hyper::StatusCode::BAD_REQUEST,
+                    "the DKG package did not verify",
+                );
             }
         };
 
         let Ok(id) = self.random_id() else {
-            return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+            return refuse(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
         };
         {
             let now = Instant::now();
             let mut pending = self.registrations.lock().expect("registrations poisoned");
             pending.retain(|_, p| p.expires > now);
             if pending.len() >= MAX_REGISTRATIONS {
-                return problem(hyper::StatusCode::SERVICE_UNAVAILABLE, "try again");
+                return refuse(hyper::StatusCode::SERVICE_UNAVAILABLE, "try again");
             }
             pending.insert(
                 id,
                 PendingRegistration {
-                    state,
+                    handle,
+                    wallet,
                     expires: now + REGISTRATION_TTL,
                 },
             );
         }
 
-        json(
-            hyper::StatusCode::OK,
-            &RegisterOptionsResponse {
-                registration_id: b64(&id),
-                options,
-            },
-        )
+        AuthResponse {
+            response: json(
+                hyper::StatusCode::OK,
+                &RegisterOptionsResponse {
+                    registration_id: b64(&id),
+                    dkg: RuntimeDeal {
+                        round1_package: deal.package.to_json(),
+                        round2_package: deal.dealt.to_json(),
+                    },
+                },
+            ),
+            attest: true,
+        }
     }
 
-    async fn register_verify(
-        &self,
-        body: &[u8],
-    ) -> hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody> {
+    async fn register_verify(&self, body: &[u8], certificate: &[u8; 32]) -> AuthResponse {
         let Ok(request) = serde_json::from_slice::<RegisterVerifyRequest>(body) else {
-            return problem(hyper::StatusCode::BAD_REQUEST, "malformed request");
+            return refuse(hyper::StatusCode::BAD_REQUEST, "malformed request");
         };
         let Some(id) = decode_id(&request.registration_id) else {
-            return problem(hyper::StatusCode::BAD_REQUEST, "malformed registration id");
+            return refuse(hyper::StatusCode::BAD_REQUEST, "malformed registration id");
+        };
+        let Ok(from_wallet) = Round2Package::from_json(&request.dkg.round2_package) else {
+            return refuse(hyper::StatusCode::BAD_REQUEST, "malformed DKG package");
+        };
+        let Some(signature) = hex_array::<64>(&request.signature) else {
+            return refuse(hyper::StatusCode::BAD_REQUEST, "malformed signature");
+        };
+        let Some(partial) = request.ecdh.decode() else {
+            return refuse(hyper::StatusCode::BAD_REQUEST, "malformed ECDH partial");
         };
 
-        // Taken, not borrowed: an attempt that fails must not leave the
-        // registration open for another try at the same challenge.
+        // Taken, not borrowed: an attempt that fails must not leave the registration open for
+        // another try.
         let pending = {
             let mut registrations = self.registrations.lock().expect("registrations poisoned");
             registrations.remove(&id)
         };
         let Some(pending) = pending.filter(|p| p.expires > Instant::now()) else {
-            return problem(hyper::StatusCode::FORBIDDEN, "registration expired");
+            return refuse(hyper::StatusCode::FORBIDDEN, "registration expired");
+        };
+        let master = match self.master().await {
+            Ok(master) => master,
+            Err((status, message)) => return refuse(status, message),
         };
 
-        let passkey = match self
-            .gate
-            .webauthn()
-            .finish_passkey_registration(&request.credential, &pending.state)
-        {
-            Ok(passkey) => passkey,
+        // The key, in memory: nothing is kept until the wallet has shown it holds its half.
+        let key = match crate::signer::dkg::register(
+            master,
+            &pending.handle,
+            &pending.wallet,
+            &from_wallet,
+        ) {
+            Ok(registered) => registered.key,
             Err(e) => {
-                tracing::warn!(error = %e, "registration did not verify");
-                return problem(hyper::StatusCode::FORBIDDEN, "registration did not verify");
+                tracing::info!(reason = %e, "refused a DKG package");
+                return refuse(
+                    hyper::StatusCode::BAD_REQUEST,
+                    "the DKG package did not verify",
+                );
             }
         };
+        let group_key = key.group_key();
+        let tenant = tenant_of(&group_key);
+        let message = approval::register(&id, &group_key, &key.wallet().serialize(), certificate);
 
-        // Derived, so a credential id already registered lands on its own
-        // existing directory and is then refused below, rather than leaving an
-        // empty one behind.
-        let credential_id = request.credential.raw_id.as_ref().to_vec();
-        let tenant_id = tenant_of(&credential_id);
-
-        // The directory first, so the tenant's first request finds one rather
-        // than paying for it while a user waits — and so the credential's
-        // anchor below covers both.
-        if let Err(e) = self.zfs.tenant_dir(tenant_id).await {
-            tracing::error!(error = format!("{e:#}"), "creating a tenant directory");
-            return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+        // The wallet finished its share: it signs with it, and makes its partial with it.
+        if !threshold::auth::verify_schnorr_signature(
+            &point::serialize_compressed(key.wallet_share()),
+            &message,
+            &signature,
+        ) {
+            return self.denied(Denied::Signature);
         }
-
-        let record = StoredCredential {
-            version: RECORD_VERSION,
-            passkey,
-            active: true,
-            created_ms: 0,
-            counter: 0,
+        let (tenant_key, mine) = match crate::signer::tenant_key(&key, &partial, &message) {
+            Ok(pair) => pair,
+            Err(_) => return self.denied(Denied::Proof),
         };
-        if let Err(e) = self.credentials.register(&credential_id, record).await {
-            tracing::error!(error = format!("{e:#}"), "storing a credential");
-            return problem(hyper::StatusCode::CONFLICT, "could not register");
-        }
 
-        tracing::info!(
-            tenant = %hex::encode(tenant_id),
-            credential = %hex::encode(&credential_id[..8.min(credential_id.len())]),
-            "registered a passkey"
-        );
-        json(
-            hyper::StatusCode::OK,
-            &RegisterVerifyResponse {
-                tenant_id: hex::encode(tenant_id),
-                credential_id: b64(&credential_id),
-            },
-        )
+        // Everything verified. Kept now, in this order: the record with the sealed share and its
+        // region, then the pool under `k`.
+        let sealed = match seal_share(master, &tenant, key.secret_share()) {
+            Ok(sealed) => sealed,
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "sealing a wallet key");
+                return refuse(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+            }
+        };
+        let record = match self
+            .zfs
+            .registry()
+            .register(tenant, key.record(sealed))
+            .await
+        {
+            Ok(record) => record,
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "registering a tenant");
+                return refuse(hyper::StatusCode::CONFLICT, "could not register");
+            }
+        };
+        if let Err((status, message)) = self.attach(tenant, record.place, &tenant_key).await {
+            return refuse(status, message);
+        }
+        self.keys.insert(tenant, key);
+
+        tracing::info!(tenant = %hex::encode(tenant), "registered a tenant");
+        AuthResponse {
+            response: json(
+                hyper::StatusCode::OK,
+                &RegisterVerifyResponse {
+                    tenant_id: hex::encode(tenant),
+                    group_key: hex::encode(group_key),
+                    ecdh: WirePartial::encode(&mine),
+                },
+            ),
+            attest: false,
+        }
     }
 
-    /// Turn a verified assertion into a token for one interaction.
-    ///
-    /// The second of the three trips a signed interaction takes, and it has to
-    /// be its own exchange: a passkey is a challenge-response, so the assertion
-    /// cannot exist until `request/options` has already answered. Named to
-    /// match `register/options` → `register/verify`, which is the same shape.
+    /// A challenge for one interaction of one tenant, with this enclave's attestation.
+    /// Unauthenticated by necessity: a client cannot sign until it has one, and checks the
+    /// attestation before it does. Issued whatever key it names, so an answer here says nothing
+    /// about which keys are tenants; a key that is not one fails at `request/verify`, like any
+    /// other refusal.
+    async fn request_options(&self, body: &[u8]) -> AuthResponse {
+        let Ok(request) = serde_json::from_slice::<RequestOptionsRequest>(body) else {
+            return refuse(hyper::StatusCode::BAD_REQUEST, "malformed request");
+        };
+        let Some(group_key) = hex_array::<33>(&request.group_key).filter(|k| k[0] == 0x02) else {
+            return refuse(hyper::StatusCode::BAD_REQUEST, "malformed group key");
+        };
+        let Ok(id) = self.random_id() else {
+            return refuse(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+        };
+        let scope = InteractionScope::new(&request.method, &request.path, request.query.as_deref());
+        match self.challenges.issue(id, tenant_of(&group_key), scope) {
+            Ok(()) => AuthResponse {
+                response: json(
+                    hyper::StatusCode::OK,
+                    &RequestOptionsResponse {
+                        challenge_id: b64(&id),
+                    },
+                ),
+                attest: true,
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "issuing a challenge");
+                refuse(hyper::StatusCode::SERVICE_UNAVAILABLE, "try again")
+            }
+        }
+    }
+
+    /// Turn a signed approval into a token for one interaction.
     ///
     /// **What the token authorizes: one interaction at the method, path and
-    /// query the challenge was issued for.** It commits to no bytes. A person
-    /// approved *doing this thing*, not *sending these bytes*, and nothing here
-    /// should be described as approval of a payload.
-    async fn request_verify(
-        &self,
-        body: &[u8],
-    ) -> hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody> {
+    /// query the client signed.** It commits to no bytes. The client approved
+    /// *doing this thing*, not *sending these bytes*, and nothing here should
+    /// be described as approval of a payload.
+    async fn request_verify(&self, body: &[u8], certificate: &[u8; 32]) -> AuthResponse {
         let Ok(request) = serde_json::from_slice::<RequestVerifyRequest>(body) else {
-            return problem(hyper::StatusCode::BAD_REQUEST, "malformed request");
+            return refuse(hyper::StatusCode::BAD_REQUEST, "malformed request");
         };
         let Some(challenge_id) = decode_id(&request.challenge_id) else {
-            return problem(hyper::StatusCode::BAD_REQUEST, "malformed challenge id");
+            return refuse(hyper::StatusCode::BAD_REQUEST, "malformed challenge id");
         };
-        let Some(assertion_json) = decode(&request.assertion) else {
-            return problem(hyper::StatusCode::BAD_REQUEST, "malformed assertion");
+        let Some(signature) = hex_array::<64>(&request.signature) else {
+            return refuse(hyper::StatusCode::BAD_REQUEST, "malformed signature");
         };
-        let Ok(assertion) = serde_json::from_slice::<PublicKeyCredential>(&assertion_json) else {
-            return problem(hyper::StatusCode::BAD_REQUEST, "malformed assertion");
+        let Some(partial) = request.ecdh.decode() else {
+            return refuse(hyper::StatusCode::BAD_REQUEST, "malformed ECDH partial");
         };
 
-        let who = match self.gate.authenticate(&challenge_id, &assertion).await {
-            Ok(who) => who,
-            Err(denied) => {
-                // Logged in full, answered in one sentence — the same rule the
-                // gate has always followed.
-                tracing::info!(reason = %denied, "refused an assertion");
-                return problem(denied.status(), denied.public_message());
+        // Consumed whatever happens next: a challenge answered badly has been seen by whoever
+        // answered it, and a second attempt at the same one buys them only attempts.
+        let (tenant, scope) = match self.challenges.consume(&challenge_id) {
+            Ok(issued) => issued,
+            Err(e) => return self.denied(Denied::Challenge(e)),
+        };
+
+        // Who is asking: a tenant on record, not revoked, whose wallet signed exactly this.
+        let record = match self.zfs.registry().tenant(tenant).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return self.denied(Denied::UnknownTenant),
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "reading a tenant record");
+                return refuse(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
             }
         };
+        match self.zfs.registry().revoked(tenant).await {
+            Ok(false) => {}
+            Ok(true) => return self.denied(Denied::UnknownTenant),
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "reading a revocation");
+                return refuse(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+            }
+        }
+        let group_key = record.key.group_key;
+        let message = approval::request(&approval::Request {
+            challenge_id: &challenge_id,
+            group_key: &group_key,
+            wallet: &record.key.wallet.identifier,
+            certificate,
+            method: &scope.method,
+            path: &scope.path,
+            query: scope.query.as_deref(),
+        });
+        if !threshold::auth::verify_schnorr_signature(
+            &record.key.wallet.verifying_share,
+            &message,
+            &signature,
+        ) {
+            return self.denied(Denied::Signature);
+        }
 
-        // Minted here, from the enclave's entropy, and held in exactly two
-        // places: this response, and a hash in the store.
+        // The pool: opened with `k`, which the wallet's partial and the runtime's share make. The
+        // proof first, so a bad partial costs no unsealing.
+        let (Ok(x), Ok(wallet)) = (
+            point::deserialize_compressed(&group_key),
+            point::deserialize_compressed(&record.key.wallet.verifying_share),
+        ) else {
+            return refuse(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+        };
+        if partial.verify(&x, &wallet, &message).is_err() {
+            return self.denied(Denied::Proof);
+        }
+        let key = match self.keys.get(tenant).await {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "reading a wallet key");
+                return refuse(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+            }
+        };
+        let (tenant_key, mine) = match crate::signer::tenant_key(&key, &partial, &message) {
+            Ok(pair) => pair,
+            Err(_) => return self.denied(Denied::Proof),
+        };
+        if let Err((status, message)) = self.attach(tenant, record.place, &tenant_key).await {
+            return refuse(status, message);
+        }
+
+        // Minted here, from the enclave's entropy, and held in exactly two places: this
+        // response, and a hash in the store.
         let mut token = [0u8; 32];
         if self.entropy.get_random(&mut token).is_err() {
-            return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+            return refuse(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
         }
         let token = b64(&token);
-
-        let ttl = match self.gate.grant(token.as_bytes(), &who) {
+        let (method, path) = (scope.method.clone(), scope.path.clone());
+        let ttl = match self.gate.grant(token.as_bytes(), tenant, scope) {
             Ok(ttl) => ttl,
             Err(denied) => {
                 tracing::warn!(reason = %denied, "could not record an approval");
-                return problem(denied.status(), denied.public_message());
+                return refuse(hyper::StatusCode::SERVICE_UNAVAILABLE, "try again");
             }
         };
 
-        // The token itself is never logged. What identifies this event is the
-        // tenant it belongs to and the interaction it is good for.
+        // The token itself is never logged. What identifies this event is the tenant it belongs
+        // to and the interaction it is good for.
         tracing::info!(
-            tenant = %hex::encode(who.tenant_id),
-            method = %who.scope.method,
-            path = %who.scope.path,
+            tenant = %hex::encode(tenant),
+            %method,
+            %path,
             "issued an interaction token"
         );
-
-        json(
-            hyper::StatusCode::OK,
-            &TokenResponse {
-                token,
-                expires_in_secs: ttl.as_secs(),
-            },
-        )
-    }
-
-    async fn request_options(
-        &self,
-        body: &[u8],
-    ) -> hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody> {
-        let Ok(request) = serde_json::from_slice::<RequestOptionsRequest>(body) else {
-            return problem(hyper::StatusCode::BAD_REQUEST, "malformed request");
-        };
-        let Some(credential_id) = decode(&request.credential_id) else {
-            return problem(hyper::StatusCode::BAD_REQUEST, "malformed credential id");
-        };
-
-        let record = match self.credentials_lookup(&credential_id).await {
-            Ok(Some(record)) if record.active => record,
-            Ok(_) => {
-                // Deliberately the same answer as a credential that exists but
-                // is revoked, and the same as one that never did.
-                return problem(
-                    hyper::StatusCode::FORBIDDEN,
-                    "no challenge for that credential",
-                );
-            }
-            Err(e) => {
-                tracing::error!(error = format!("{e:#}"), "looking up a credential");
-                return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
-            }
-        };
-
-        let Ok(id) = self.random_id() else {
-            return problem(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
-        };
-        let scope = InteractionScope::new(&request.method, &request.path, request.query.as_deref());
-        match self
-            .gate
-            .issue(id, scope, std::slice::from_ref(&record.passkey))
-        {
-            Ok(options) => json(
+        AuthResponse {
+            response: json(
                 hyper::StatusCode::OK,
-                &RequestOptionsResponse {
-                    challenge_id: b64(&id),
-                    options,
+                &TokenResponse {
+                    token,
+                    expires_in_secs: ttl.as_secs(),
+                    ecdh: WirePartial::encode(&mine),
                 },
             ),
+            attest: false,
+        }
+    }
+
+    /// Logged in full, answered in one sentence: which check failed is the runtime's business,
+    /// and telling a caller would tell them which guess to refine.
+    fn denied(&self, denied: Denied) -> AuthResponse {
+        tracing::info!(reason = %denied, "refused a sign-in");
+        refuse(denied.status(), denied.public_message())
+    }
+
+    /// Attach a verified tenant's pool with `k`, creating it the first time.
+    async fn attach(
+        &self,
+        tenant: [u8; 16],
+        place: Place,
+        key: &TenantKey,
+    ) -> Result<(), (hyper::StatusCode, &'static str)> {
+        match self.zfs.attach(tenant, place, key).await {
+            Ok(Arrival::New) => {
+                tracing::info!(tenant = %hex::encode(tenant), "created a tenant's pool");
+                Ok(())
+            }
+            Ok(Arrival::Returning) => Ok(()),
+            Err(AttachError::WrongKey) => {
+                // `k` came from proofs that verified, so the pool, not the client, is wrong:
+                // its anchors were written under some other key.
+                tracing::error!(
+                    tenant = %hex::encode(tenant),
+                    "a tenant's pool does not open with the key its shares derive"
+                );
+                Err((hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable"))
+            }
+            Err(e @ AttachError::Superseded(_)) => {
+                tracing::error!(tenant = %hex::encode(tenant), error = %e, "refusing a tenant");
+                Err((
+                    hyper::StatusCode::CONFLICT,
+                    "this tenant was last served by a newer release",
+                ))
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "issuing a challenge");
-                problem(hyper::StatusCode::SERVICE_UNAVAILABLE, "try again")
+                tracing::error!(tenant = %hex::encode(tenant), error = %e, "attaching a tenant");
+                Err((hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable"))
             }
         }
     }
 
-    async fn credentials_lookup(
-        &self,
-        credential_id: &[u8],
-    ) -> anyhow::Result<Option<super::gate::CredentialRecord>> {
-        use super::gate::CredentialStore;
-        self.credentials.lookup(credential_id).await
+    /// The operator master, or why it cannot be read yet.
+    async fn master(&self) -> Result<&[u8; 32], (hyper::StatusCode, &'static str)> {
+        self.keys.master().get().await.map_err(|e| {
+            tracing::warn!(error = format!("{e:#}"), "reading the operator master");
+            (
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+                "the operator master is not provisioned yet",
+            )
+        })
     }
 }
 
@@ -484,309 +583,38 @@ fn decode_id(text: &str) -> Option<[u8; 16]> {
     decode(text).and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok())
 }
 
-fn body_of(bytes: Vec<u8>) -> wasmtime_wasi_http::p2::body::HyperOutgoingBody {
+fn hex_array<const N: usize>(text: &str) -> Option<[u8; N]> {
+    hex::decode(text.trim())
+        .ok()
+        .and_then(|b| <[u8; N]>::try_from(b).ok())
+}
+
+fn body_of(bytes: Vec<u8>) -> Body {
     use http_body_util::BodyExt;
     http_body_util::Full::new(Bytes::from(bytes))
         .map_err(|e: std::convert::Infallible| match e {})
         .boxed_unsync()
 }
 
-fn json<T: Serialize>(
-    status: hyper::StatusCode,
-    value: &T,
-) -> hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody> {
+fn json<T: Serialize>(status: hyper::StatusCode, value: &T) -> hyper::Response<Body> {
     let bytes = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
     hyper::Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        // Challenges and options are single-use and short-lived; a cache that
-        // replayed one would be handing out a used challenge.
+        // Tokens and registrations are single-use and short-lived; a cache that replayed one
+        // would be handing out a used one.
         .header("cache-control", "no-store")
         .body(body_of(bytes))
         .expect("response is well formed")
 }
 
-fn problem(
-    status: hyper::StatusCode,
-    detail: &str,
-) -> hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody> {
-    json(status, &serde_json::json!({ "error": detail }))
+/// An unattested refusal.
+fn refuse(status: hyper::StatusCode, detail: &str) -> AuthResponse {
+    AuthResponse {
+        response: json(status, &serde_json::json!({ "error": detail })),
+        attest: false,
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::auth::challenge::{ChallengeStore, DEFAULT_CAPACITY, DEFAULT_TTL};
-    use crate::auth::testing::{Relying, ORIGIN, RP_ID};
-    use crate::auth::SoftwareAuthenticator;
-    use crate::zfs::Zfs;
-    use http_body_util::BodyExt;
-
-    struct Fixture {
-        endpoints: AuthEndpoints,
-        fs: Arc<Zfs>,
-        credentials: Arc<FilesystemCredentials>,
-    }
-
-    async fn fixture() -> Fixture {
-        let fs = Zfs::scratch().await;
-        let credentials = Arc::new(FilesystemCredentials::new(fs.clone()));
-        let gate = Arc::new(Gate::new(
-            Relying::new().webauthn,
-            ChallengeStore::new(DEFAULT_TTL, DEFAULT_CAPACITY),
-            credentials.clone(),
-            super::super::TokenStore::new(
-                std::time::Duration::from_secs(60),
-                super::super::token::DEFAULT_CAPACITY,
-            ),
-        ));
-        let entropy: Arc<dyn nitro_nsm::Nsm> = Arc::new(nitro_nsm::fake::FakeNsm::new());
-        let endpoints = AuthEndpoints::new(gate, credentials.clone(), fs.clone(), entropy);
-        Fixture {
-            endpoints,
-            fs,
-            credentials,
-        }
-    }
-
-    async fn post(f: &Fixture, path: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
-        let response = f
-            .endpoints
-            .handle(&hyper::Method::POST, path, body.to_string().as_bytes())
-            .await
-            .expect("an auth route");
-        let status = response.status().as_u16();
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        (
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
-        )
-    }
-
-    /// Register a passkey the way a client does, and get its tenant back.
-    async fn register(f: &Fixture, auth: &SoftwareAuthenticator) -> (u16, serde_json::Value) {
-        let (status, options) = post(f, "/auth/register/options", serde_json::json!({})).await;
-        if status != 200 {
-            return (status, options);
-        }
-        let challenge = options["options"]["publicKey"]["challenge"]
-            .as_str()
-            .expect("a challenge")
-            .to_string();
-        post(
-            f,
-            "/auth/register/verify",
-            serde_json::json!({
-                "registration_id": options["registration_id"],
-                "credential": auth.register(&challenge, ORIGIN),
-            }),
-        )
-        .await
-    }
-
-    /// Options ask for a passkey sign-in can find. With webauthn-rs's defaults,
-    /// Android below 14 made a credential One Tap reports as "Cannot find a
-    /// matching credential".
-    #[tokio::test]
-    async fn registration_asks_for_a_discoverable_platform_passkey() {
-        let f = fixture().await;
-        let (status, body) = post(&f, "/auth/register/options", serde_json::json!({})).await;
-        assert_eq!(status, 200, "{body}");
-        let selection = &body["options"]["publicKey"]["authenticatorSelection"];
-        assert_eq!(selection["residentKey"], "required", "{selection}");
-        assert_eq!(selection["requireResidentKey"], true, "{selection}");
-        assert_eq!(
-            selection["authenticatorAttachment"], "platform",
-            "{selection}"
-        );
-        assert_eq!(selection["userVerification"], "required", "{selection}");
-    }
-
-    /// The whole registration path: options, response, tenant.
-    #[tokio::test]
-    async fn registration_creates_a_tenant() {
-        let f = fixture().await;
-        let auth = SoftwareAuthenticator::new(RP_ID);
-        let (status, body) = register(&f, &auth).await;
-        assert_eq!(status, 200, "{body}");
-
-        let tenant_hex = body["tenant_id"].as_str().expect("a tenant id");
-        assert_eq!(
-            tenant_hex,
-            hex::encode(tenant_of(auth.credential_id())),
-            "the tenant is the one the credential derives"
-        );
-
-        // The credential is stored and points at that tenant.
-        use crate::auth::gate::CredentialStore;
-        let record = f
-            .credentials
-            .lookup(auth.credential_id())
-            .await
-            .unwrap()
-            .expect("the credential was stored");
-        assert_eq!(hex::encode(record.tenant_id), tenant_hex);
-
-        // And the tenant's directory exists, so their first request is cheap.
-        let mut tenant = [0u8; 16];
-        hex::decode_to_slice(tenant_hex, &mut tenant).unwrap();
-        assert!(f.fs.tenant_path(tenant).is_dir());
-    }
-
-    /// Registration is open, and each one stands alone: a second, unrelated
-    /// passkey registers too and lands in a tenant of its own rather than
-    /// joining the first.
-    #[tokio::test]
-    async fn registration_is_open_and_each_one_is_a_new_tenant() {
-        let f = fixture().await;
-        let (first_status, first) = register(&f, &SoftwareAuthenticator::new(RP_ID)).await;
-        assert_eq!(first_status, 200, "{first}");
-        let (second_status, second) = register(&f, &SoftwareAuthenticator::new(RP_ID)).await;
-        assert_eq!(second_status, 200, "{second}");
-        assert_ne!(
-            first["tenant_id"], second["tenant_id"],
-            "a second registration joined the first one's tenant"
-        );
-    }
-
-    /// An older client still sending an enrollment token is told the field
-    /// means nothing now, rather than being quietly admitted as though one had
-    /// been checked.
-    #[tokio::test]
-    async fn a_registration_still_carrying_an_enrollment_token_is_refused() {
-        let f = fixture().await;
-        let (status, _) = post(
-            &f,
-            "/auth/register/options",
-            serde_json::json!({ "enrollment_token": "not-a-real-token-but-long" }),
-        )
-        .await;
-        assert_eq!(status, 400);
-    }
-
-    /// A registration response for a challenge that was never issued.
-    #[tokio::test]
-    async fn an_unknown_registration_id_is_refused() {
-        let f = fixture().await;
-        let auth = SoftwareAuthenticator::new(RP_ID);
-        let (status, _) = post(
-            &f,
-            "/auth/register/verify",
-            serde_json::json!({
-                "registration_id": "AAAAAAAAAAAAAAAAAAAAAA",
-                "credential": auth.register("Y2hhbGxlbmdl", ORIGIN),
-            }),
-        )
-        .await;
-        assert_eq!(status, 403);
-    }
-
-    /// A failed attempt must not leave the registration open for another try.
-    #[tokio::test]
-    async fn a_registration_id_cannot_be_retried() {
-        let f = fixture().await;
-        let (_, options) = post(&f, "/auth/register/options", serde_json::json!({})).await;
-        let auth = SoftwareAuthenticator::new(RP_ID);
-
-        // Wrong challenge: fails.
-        let (first, _) = post(
-            &f,
-            "/auth/register/verify",
-            serde_json::json!({
-                "registration_id": options["registration_id"],
-                "credential": auth.register("d3JvbmctY2hhbGxlbmdl", ORIGIN),
-            }),
-        )
-        .await;
-        assert_eq!(first, 403);
-
-        // The right one now also fails: the id was consumed by the attempt.
-        let challenge = options["options"]["publicKey"]["challenge"]
-            .as_str()
-            .unwrap();
-        let (second, _) = post(
-            &f,
-            "/auth/register/verify",
-            serde_json::json!({
-                "registration_id": options["registration_id"],
-                "credential": auth.register(challenge, ORIGIN),
-            }),
-        )
-        .await;
-        assert_eq!(second, 403, "a failed registration could be retried");
-    }
-
-    /// A challenge is issued only for a credential this runtime knows.
-    #[tokio::test]
-    async fn a_challenge_is_issued_for_a_registered_credential() {
-        let f = fixture().await;
-        let auth = SoftwareAuthenticator::new(RP_ID);
-        assert_eq!(register(&f, &auth).await.0, 200);
-
-        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let (status, body) = post(
-            &f,
-            "/auth/request/options",
-            serde_json::json!({
-                "credential_id": b64.encode(auth.credential_id()),
-                "method": "POST",
-                "path": "/sign",
-            }),
-        )
-        .await;
-        assert_eq!(status, 200, "{body}");
-        assert!(body["challenge_id"].is_string());
-        assert!(body["options"]["publicKey"]["challenge"].is_string());
-    }
-
-    /// Unknown and revoked credentials are refused identically, so the route
-    /// cannot be used to learn which passkeys exist.
-    #[tokio::test]
-    async fn unknown_and_revoked_credentials_are_indistinguishable() {
-        let f = fixture().await;
-        let auth = SoftwareAuthenticator::new(RP_ID);
-        assert_eq!(register(&f, &auth).await.0, 200);
-        f.credentials.revoke(auth.credential_id()).await.unwrap();
-
-        async fn ask(f: &Fixture, id: &[u8]) -> (u16, serde_json::Value) {
-            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-            post(
-                f,
-                "/auth/request/options",
-                serde_json::json!({
-                    "credential_id": b64.encode(id),
-                    "method": "POST",
-                    "path": "/sign",
-                }),
-            )
-            .await
-        }
-        let revoked = ask(&f, auth.credential_id()).await;
-        let unknown = ask(&f, &[0xff; 32]).await;
-        assert_eq!(revoked.0, 403);
-        assert_eq!(revoked, unknown, "the refusals differ and leak existence");
-    }
-
-    /// Everything outside `/auth/` is somebody else's business.
-    #[tokio::test]
-    async fn other_paths_are_not_claimed() {
-        let f = fixture().await;
-        assert!(f
-            .endpoints
-            .handle(&hyper::Method::POST, "/sign", b"{}")
-            .await
-            .is_none());
-        assert!(f
-            .endpoints
-            .handle(&hyper::Method::GET, "/counter", b"")
-            .await
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn an_unknown_auth_route_is_a_404() {
-        let f = fixture().await;
-        let (status, _) = post(&f, "/auth/nonsense", serde_json::json!({})).await;
-        assert_eq!(status, 404);
-    }
-}
+mod tests;

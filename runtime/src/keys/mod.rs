@@ -24,7 +24,8 @@
 //! [`KmsAttestedKey`] is the real one: KMS releases the secret only to an
 //! enclave whose runtime (PCR0) and guest (PCR16) match the key policy,
 //! encrypted to a key that exists only inside that enclave for that boot. The
-//! host proxies the call and never sees plaintext.
+//! host proxies the call and never sees plaintext. Each release has its own
+//! key and secret; see [`crate::boot`] for why nothing more is needed.
 //!
 //! [`StaticKey`] seals by *not* sealing. It exists because the QEMU harness
 //! cannot use the real one — an emulated NSM does not sign its attestations,
@@ -32,14 +33,15 @@
 //! every boot mode without hardware. It is not protection, and the image
 //! environment that selects it is measured, so PCR0 says which an enclave runs.
 
-mod ber;
 mod kms;
+mod operator;
 mod policy;
 mod recipient;
 #[cfg(any(test, feature = "testing"))]
 mod static_key;
 
 pub use kms::{KeyPointer, KmsAttestedKey, KmsKeyConfig};
+pub use operator::OperatorMaster;
 #[cfg(any(test, feature = "testing"))]
 pub use static_key::StaticKey;
 
@@ -58,8 +60,8 @@ use crate::notify::pinpoint::instance_role;
 /// A master secret in the form that is safe to store.
 ///
 /// Opaque bytes: what is inside depends on which [`MasterKeySource`] produced
-/// it, and no caller should look. A state-origin receipt commits to
-/// `sha256(bytes)` — never the plaintext, because the receipt is readable by
+/// it, and no caller should look. Logs name it by `sha256(bytes)` — never the
+/// plaintext, because the stored form is readable by
 /// anyone who can read the bucket it sits in.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SealedKey(Vec<u8>);
@@ -73,7 +75,7 @@ impl SealedKey {
         &self.0
     }
 
-    /// What a receipt commits to.
+    /// How logs name it.
     pub fn sha256(&self) -> [u8; 32] {
         nitro_attestation::sha256(&self.0)
     }
@@ -162,7 +164,9 @@ pub struct MasterKeyConfig {
     pub kind: MasterKeySourceKind,
     /// Hex secret. `static` only, and **refused** under `kms`.
     pub master_key: Option<String>,
-    pub kms_key_id: Option<String>,
+    /// The alias prefix each release's KMS key is found under.
+    pub kms_key_alias: Option<String>,
+    /// The base of each release's SSM parameter.
     pub parameter: Option<String>,
     /// Part of the encryption context, so a staging enclave cannot open a
     /// production filesystem even if it is pointed at the same parameter.
@@ -174,6 +178,11 @@ pub struct MasterKeyConfig {
     /// a credentials problem.
     pub kms_endpoint: Option<String>,
     pub ssm_endpoint: Option<String>,
+    /// The SSM `SecureString` parameter the operator writes its master to.
+    pub operator_master_parameter: Option<String>,
+    /// The operator master as hex: testing builds only, and refused beside
+    /// the parameter.
+    pub operator_master: Option<String>,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
     pub session_token: Option<String>,
@@ -194,7 +203,7 @@ pub fn open_key_source(
     match config.kind {
         #[cfg(any(test, feature = "testing"))]
         MasterKeySourceKind::Static => {
-            if config.kms_key_id.is_some() || config.parameter.is_some() {
+            if config.kms_key_alias.is_some() || config.parameter.is_some() {
                 bail!(
                     "--master-key-source=static was given alongside KMS settings. One of the \
                      two is not what was meant, and guessing which would mean an enclave \
@@ -215,10 +224,10 @@ pub fn open_key_source(
                      KMS release exists to prevent — so this is refused, not ignored."
                 );
             }
-            let key_id = config
-                .kms_key_id
+            let key_alias = config
+                .kms_key_alias
                 .as_deref()
-                .context("KMS release needs --kms-key-id (ENCLAVE_KMS_KEY_ID)")?;
+                .context("KMS release needs --kms-key-alias (ENCLAVE_KMS_KEY_ALIAS)")?;
             let parameter = config.parameter.as_deref().context(
                 "KMS release needs --master-key-parameter (ENCLAVE_MASTER_KEY_PARAMETER)",
             )?;
@@ -228,13 +237,35 @@ pub fn open_key_source(
                 kms_client(config),
                 ssm_client(config),
                 KmsKeyConfig {
-                    key_id: key_id.to_string(),
+                    key_alias: key_alias.to_string(),
                     parameter: parameter.to_string(),
                     environment: config.environment.clone(),
                     fs_id: config.fs_id,
                 },
             )))
         }
+    }
+}
+
+/// The operator master, when this deployment has one: read from SSM, or fixed
+/// by configuration in a testing build. Both at once is refused, as for the
+/// master key, and neither leaves the DKG unavailable.
+pub fn open_operator_master(config: &MasterKeyConfig) -> Result<Option<OperatorMaster>> {
+    match (&config.operator_master_parameter, &config.operator_master) {
+        (Some(_), Some(_)) => bail!(
+            "--operator-master was given alongside --operator-master-parameter. One of the \
+             two is not what was meant, and guessing which would mean deriving every wallet \
+             key from the wrong master."
+        ),
+        (Some(parameter), None) => Ok(Some(OperatorMaster::ssm(
+            ssm_client(config),
+            parameter.clone(),
+        ))),
+        #[cfg(any(test, feature = "testing"))]
+        (None, Some(hex)) => Ok(Some(OperatorMaster::fixed(*operator::parse(hex)?))),
+        #[cfg(not(any(test, feature = "testing")))]
+        (None, Some(_)) => bail!("--operator-master is a testing setting"),
+        (None, None) => Ok(None),
     }
 }
 
@@ -301,13 +332,15 @@ mod tests {
         MasterKeyConfig {
             kind: MasterKeySourceKind::Kms,
             master_key: None,
-            kms_key_id: Some("key".into()),
+            kms_key_alias: Some("alias/key".into()),
             parameter: Some("/parameter".into()),
             environment: "test".into(),
             fs_id: [0; 16],
             region: "us-east-1".into(),
             kms_endpoint: None,
             ssm_endpoint: None,
+            operator_master_parameter: None,
+            operator_master: None,
             access_key_id: access_key_id.map(str::to_string),
             secret_access_key: access_key_id.map(str::to_string),
             session_token: None,

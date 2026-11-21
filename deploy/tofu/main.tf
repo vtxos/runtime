@@ -87,7 +87,7 @@ resource "aws_route_table_association" "public" {
 
 resource "aws_security_group" "enclave" {
   name        = "${local.name}-enclave"
-  description = "Inbound HTTPS to the enclave; egress for S3, KMS and ACME"
+  description = "Inbound HTTPS to the enclave; egress for the AWS services it calls"
   vpc_id      = aws_vpc.this.id
   tags        = local.tags
 
@@ -120,7 +120,7 @@ resource "aws_security_group" "enclave" {
   # machine that proxies every byte in and out of the enclave. Use SSM if a
   # session is genuinely needed.
   egress {
-    description = "Outbound for S3, KMS and the ACME provider"
+    description = "Outbound for S3, KMS and the other AWS services the enclave calls"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -320,6 +320,220 @@ resource "aws_iam_role_policy" "telemetry" {
   name   = "${local.name}-telemetry"
   role   = aws_iam_role.parent.id
   policy = data.aws_iam_policy_document.telemetry[0].json
+}
+
+# ---------------------------------------------------------------------------
+# Background tasks
+# ---------------------------------------------------------------------------
+
+# Where a guest's background tasks are recorded, scheduled and delivered
+# (runtime/src/tasks). EventBridge Scheduler fires each task into the queue;
+# the enclave receives it, checks it against its record here, and runs it. An
+# operator sees every task — its state, its next run, how its last run went —
+# in the table.
+#
+# The parent's role reaches all of it, so none of it is trusted on its own:
+# every task is signed with a key derived from its tenant's key, its payload is
+# sealed to the same key, and a delivery before its time is dropped. What the
+# parent can still do here is delete or delay, which it can always do.
+
+resource "aws_dynamodb_table" "tasks" {
+  name         = "${local.name}-tasks"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+  range_key    = "sk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+  attribute {
+    name = "state_key"
+    type = "S"
+  }
+  attribute {
+    name = "updated_at"
+    type = "N"
+  }
+
+  # "Which tasks are scheduling, cancelling, scheduled": for the runtime's
+  # reconciler, and for an operator.
+  global_secondary_index {
+    name            = "by-state"
+    hash_key        = "state_key"
+    range_key       = "updated_at"
+    projection_type = "ALL"
+  }
+
+  # Each run's record expires thirty days after its last write.
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  tags = local.tags
+}
+
+# Where a message goes that the enclave keeps receiving and never finishes —
+# one whose run brings the enclave down. Kept for the longest SQS allows.
+resource "aws_sqs_queue" "tasks_dead" {
+  name                      = "${local.name}-tasks-dead"
+  message_retention_seconds = 1209600
+  sqs_managed_sse_enabled   = true
+  tags                      = local.tags
+}
+
+resource "aws_sqs_queue" "tasks" {
+  name = "${local.name}-tasks"
+  # Past an attempt's ten minutes and the record after it. The runtime sets it
+  # on every receive as well.
+  visibility_timeout_seconds = 900
+  # A due task waits this long for an enclave that is down: four days.
+  message_retention_seconds = 345600
+  receive_wait_time_seconds = 20
+  sqs_managed_sse_enabled   = true
+  # High enough that a tenant busy for a while, or a few retries, never trips
+  # it: an attempt the enclave died in is counted by the runtime itself.
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.tasks_dead.arn
+    maxReceiveCount     = 50
+  })
+  tags = local.tags
+}
+
+resource "aws_scheduler_schedule_group" "tasks" {
+  name = "${local.name}-tasks"
+  tags = local.tags
+}
+
+# The role EventBridge Scheduler takes to put a firing on the queue: that, and
+# nothing else, for schedules in this account.
+resource "aws_iam_role" "scheduler" {
+  name = "${local.name}-scheduler"
+  tags = local.tags
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = { Service = "scheduler.amazonaws.com" }
+      Condition = {
+        StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "scheduler" {
+  name = "${local.name}-scheduler"
+  role = aws_iam_role.scheduler.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "sqs:SendMessage"
+      Resource = aws_sqs_queue.tasks.arn
+    }]
+  })
+}
+
+# What the runtime calls, on these resources only. SendMessage too: a task due
+# within fifteen minutes goes straight on the queue, delayed, and one that came
+# due while its owner was away is sent again when they sign in.
+data "aws_iam_policy_document" "tasks" {
+  statement {
+    sid    = "RecordTasks"
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:DeleteItem",
+      "dynamodb:Query",
+    ]
+    resources = [
+      aws_dynamodb_table.tasks.arn,
+      "${aws_dynamodb_table.tasks.arn}/index/by-state",
+    ]
+  }
+
+  statement {
+    sid    = "ScheduleTasks"
+    effect = "Allow"
+    actions = [
+      "scheduler:CreateSchedule",
+      "scheduler:DeleteSchedule",
+      "scheduler:GetSchedule",
+    ]
+    resources = [
+      "arn:aws:scheduler:${var.region}:${data.aws_caller_identity.current.account_id}:schedule/${aws_scheduler_schedule_group.tasks.name}/*",
+    ]
+  }
+
+  statement {
+    sid       = "HandSchedulesTheirRole"
+    effect    = "Allow"
+    actions   = ["iam:PassRole"]
+    resources = [aws_iam_role.scheduler.arn]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["scheduler.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid    = "ReceiveTasks"
+    effect = "Allow"
+    actions = [
+      "sqs:ReceiveMessage",
+      "sqs:DeleteMessage",
+      "sqs:ChangeMessageVisibility",
+      "sqs:SendMessage",
+    ]
+    resources = [aws_sqs_queue.tasks.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "tasks" {
+  name   = "${local.name}-tasks"
+  role   = aws_iam_role.parent.id
+  policy = data.aws_iam_policy_document.tasks.json
+}
+
+# Seen in the console; attach actions to page someone.
+resource "aws_cloudwatch_metric_alarm" "tasks_dead" {
+  alarm_name          = "${local.name}-tasks-dead"
+  alarm_description   = "A task message the enclave kept receiving and never finished was set aside."
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  dimensions          = { QueueName = aws_sqs_queue.tasks_dead.name }
+  statistic           = "Maximum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+  tags                = local.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "tasks_waiting" {
+  alarm_name          = "${local.name}-tasks-waiting"
+  alarm_description   = "Due tasks have waited over half an hour: the enclave is down, or cannot keep up."
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateAgeOfOldestMessage"
+  dimensions          = { QueueName = aws_sqs_queue.tasks.name }
+  statistic           = "Maximum"
+  period              = 300
+  evaluation_periods  = 3
+  threshold           = 1800
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+  tags                = local.tags
 }
 
 # For a shell without opening port 22.

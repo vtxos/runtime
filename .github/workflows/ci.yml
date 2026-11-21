@@ -16,7 +16,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# Four stages, each a checkout, a toolchain, and one script. The scripts are the
+# Three stages, each a checkout, a toolchain, and one script. The scripts are the
 # recipes: they live in scripts/ so a job can be run locally with the same
 # command CI uses, and so deploy/qemu-nitro/run-e2e.sh can share them instead of
 # keeping a second copy that has to agree.
@@ -77,7 +77,10 @@ jobs:
   # runs in the emulator instead: docs/STORAGE.md, "Running SQLite".
   e2e:
     name: the whole stack, in an emulated enclave
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: on Ubuntu 26.04 the enclave's first vsock connection to this
+    # host times out and its init dies at boot (2026-11-21). 24.04 is what this job last passed
+    # on, with the same image. Moving it means making the host's vsock work there first.
+    runs-on: ubuntu-24.04
     # The integration suites, then a cold Nix build of the image, then the
     # emulated boot. This is the only integration signal, so it carries the
     # suites that used to have their own job.
@@ -88,8 +91,8 @@ jobs:
       # No Magic Nix Cache. It relays every store lookup through the Actions
       # cache API, which rate-limits it, and Nix treats the refusals as fatal:
       # the image build failed on "rate limit exceeded" with nothing wrong in
-      # it. nixpkgs comes from cache.nixos.org regardless; what is lost is only
-      # this repository's own derivations, rebuilt each run.
+      # it. nixpkgs comes from cache.nixos.org regardless, and this
+      # repository's own derivations from the directory restored below.
       - uses: ./.github/actions/rust
         with:
           shared-key: guests
@@ -97,17 +100,95 @@ jobs:
             . -> target
             examples/guest-http -> target
             examples/guest-grpc -> target
-      - uses: actions/cache@v4
+            examples/guest-signer -> target
+      # What this job builds that does not change with the runtime's code, kept
+      # from an earlier run. Each is restored here and saved at the end of the
+      # job whatever its outcome: a run that fails at the last step has still
+      # built all of it.
+      - name: The vsock tool, from an earlier run
+        id: vsock
+        uses: actions/cache/restore@v4
         with:
           path: target/qemu-nitro/tools
-          # The pinned version lives in the script, so the key follows the
-          # script rather than being a second place to update.
-          key: vhost-device-vsock-${{ hashFiles('scripts/ci-e2e.sh') }}
+          # The pinned version lives in the scripts, so the key follows them
+          # rather than being a second place to update.
+          key: vhost-device-vsock-${{ hashFiles('scripts/ci-e2e.sh', 'scripts/lib.sh') }}
+      # QEMU and MinIO are built from source and LocalEmu is pulled by digest:
+      # the key is everything that decides what they are, and only an exact
+      # match is used, since a loaded image is not rebuilt.
+      - name: The container images, from an earlier run
+        id: images
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/ci-cache/images
+          key: e2e-images-${{ hashFiles('deploy/qemu-nitro/Dockerfile', 'scripts/minio-image.sh', 'scripts/localemu-image.sh') }}
+      # The enclave image's expensive parts: the kernel with ZFS, and the
+      # runtime's dependencies as Nix builds them. A plain directory used as a
+      # binary cache, so nothing is asked of the Actions cache API per store
+      # path, which is what failed with Magic Nix Cache. Nix only takes from it
+      # what matches a derivation it was going to build, so an older entry is
+      # safe to restore.
+      - name: Nix outputs, from an earlier run
+        id: nix
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/ci-cache/nix
+          key: e2e-nix-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**', 'Cargo.lock') }}
+          restore-keys: e2e-nix-
+      - name: Load them
+        run: |
+          # The cache's own folders are made here, as this user: left to Nix, its daemon
+          # makes them as root when it first reads the cache, and the save below is refused.
+          mkdir -p ~/ci-cache/images ~/ci-cache/nix/nar ~/ci-cache/nix/realisations ~/ci-cache/nix/log
+          for tar in ~/ci-cache/images/*.tar; do
+            if [ -e "$tar" ]; then docker load -i "$tar"; fi
+          done
+          # An empty directory is a valid, empty cache.
+          [ -f ~/ci-cache/nix/nix-cache-info ] || printf 'StoreDir: /nix/store\n' > ~/ci-cache/nix/nix-cache-info
+          echo "NIX_CONFIG=extra-substituters = file://$HOME/ci-cache/nix?trusted=1" >> "$GITHUB_ENV"
       - run: scripts/ci-e2e.sh
         env:
           # A runner boots the emulated enclave more slowly than a workstation,
           # and the default is tuned for the latter.
           TIMEOUT: 480
+      - name: Keep what was built, whatever the outcome
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ "${{ steps.images.outputs.cache-hit }}" != "true" ]; then
+            for image in $(docker images --format '{{.Repository}}:{{.Tag}}' \
+                | grep -E '^(enclave-qemu-nitro:latest|enclave-runtime/(minio|localemu):)'); do
+              docker save "$image" -o ~/ci-cache/images/"$(echo "$image" | tr '/:' '__')".tar
+            done
+          fi
+          if [ "${{ steps.nix.outputs.cache-hit }}" != "true" ]; then
+            sudo chown -R "$(id -u):$(id -g)" ~/ci-cache/nix
+            # What this runner built itself: no signature of the public cache. Not the
+            # toolchains, which come from their own mirrors quickly, nor the final images,
+            # which change with every commit.
+            nix path-info --all --sigs | grep -v 'cache.nixos.org-1' | awk '{print $1}' \
+              | grep -v -E '\.drv$|-source$|-dev$|x86_64-unknown-linux|wasm32-|-eif-[0-9]+$|initramfs|rust-default' \
+              | xargs -r nix copy --to "file://$HOME/ci-cache/nix?compression=zstd"
+          fi
+          du -sh ~/ci-cache/* || true
+      - if: always() && steps.vsock.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: target/qemu-nitro/tools
+          key: ${{ steps.vsock.outputs.cache-primary-key }}
+      - if: always() && steps.images.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/ci-cache/images
+          key: ${{ steps.images.outputs.cache-primary-key }}
+      - if: always() && steps.nix.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/ci-cache/nix
+          key: ${{ steps.nix.outputs.cache-primary-key }}
       # Nested virtualisation on hosted runners works but is not something
       # GitHub supports, so this is the job most likely to fail for reasons
       # outside this repository. Its logs are the only way to tell that apart

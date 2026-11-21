@@ -14,22 +14,10 @@ name = "guest-grpc"
 path = "src/main.rs"
 
 [dependencies]
-wstd = "0.6"
-# Protobuf encoding without a code generator. `prost` is pure Rust and builds
-# for wasm32-wasip2; `prost-derive` is a proc macro and runs on the host. There
-# is no `protoc` in this build and no build script: the messages are four
-# fields each, and the `.proto` beside them is the specification a client
-# generates from, not an input to this crate.
-#
-# `tonic` is absent because tonic does not build for wasm32-wasip2 at all. What
-# it would have provided is the gRPC framing, which is five bytes.
 prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
-bytes = "1"
-http-body = "1"
-# `UnsyncBoxBody` (the request body, held while the response streams) and the
-# combinators for the empty-with-trailers refusal. Same versions wstd resolves,
-# so the `http_body::Body` impls are the same trait.
-http-body-util = "0.1"
+# `enclave:rpc/service`, read from the runtime's own WIT: the runtime ends gRPC, this guest sees
+# messages.
+wit-bindgen = { version = "0.51", features = ["async-spawn"] }
 
 [profile.release]
 opt-level = "s"

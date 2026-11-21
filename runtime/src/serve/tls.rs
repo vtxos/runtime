@@ -10,6 +10,19 @@
 //! Terminating TLS on the parent instance and forwarding plaintext would be
 //! far simpler and would give away the entire point.
 //!
+//! ## Why self-signed
+//!
+//! No CA would add anything. A client trusts this certificate because an
+//! attestation document — signed by the NSM, naming this runtime and guest —
+//! binds its hash, and that is checked on every exchange a client identifies
+//! the enclave by. A CA's signature says only that someone controlled a domain,
+//! which the operator does as surely as the enclave; and no client here has a
+//! domain to check — it signs in with its share of the wallet key, which
+//! belongs to no domain. So the enclave makes its certificate itself, at every
+//! boot:
+//! nothing to issue, renew, store or rate-limit, and a key that exists only in
+//! this boot's memory.
+//!
 //! ## Where the key's randomness comes from
 //!
 //! `rcgen` generates through `aws-lc-rs`, which draws from the kernel. That
@@ -54,9 +67,8 @@ impl std::fmt::Debug for TlsIdentity {
 }
 
 impl TlsIdentity {
-    /// Build from a certificate chain and key already in hand — the ACME path.
-    ///
-    /// `chain` is leaf first, as rustls and every ACME server present it.
+    /// Build from a certificate chain, leaf first, and its key: the one constructor, which
+    /// [`TlsIdentity::self_signed`] goes through.
     pub fn from_chain(chain: Vec<Vec<u8>>, key: PrivateKeyDer<'static>) -> Result<Self> {
         let leaf = chain.first().context("certificate chain is empty")?.clone();
 
@@ -74,10 +86,10 @@ impl TlsIdentity {
         )
         .with_safe_default_protocol_versions()
         .context("selecting TLS protocol versions")?
-        // No client certificates. Authentication is a WebAuthn assertion bound
-        // to one request — see `crate::auth` — and a certificate would be a
-        // second, weaker way to become a tenant that could not bind an
-        // approval to a transaction.
+        // No client certificates. Authentication is an approval signed with the
+        // tenant's wallet share and bound to one request — see `crate::auth` —
+        // and a certificate would be a second, weaker way to become a tenant
+        // that could not bind an approval to a transaction.
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("building the TLS configuration")?;
@@ -85,20 +97,17 @@ impl TlsIdentity {
         // No session resumption. This is what makes "the certificate this
         // connection is using" a well-defined thing to attest.
         //
-        // rustls calls the certificate resolver while processing every
-        // ClientHello, but sends a Certificate message **only on a full
-        // handshake** (`server/tls13.rs`, gated on `full_handshake`). A resumed
-        // session is authenticated by whatever the client cached from its
-        // original handshake — so after an ACME renewal a resumed connection is
-        // running on the old certificate while the server has the new one in
-        // hand. Attesting the current certificate there would name one the
-        // client's session was never authenticated under: a false binding, in
-        // exactly the case per-response attestation exists to get right.
+        // rustls sends a Certificate message **only on a full handshake**
+        // (`server/tls13.rs`, gated on `full_handshake`). A resumed session is
+        // authenticated by whatever the client cached from its original
+        // handshake, so it presents no certificate at all: a client pinning
+        // the certificate an attestation named would be checking its own
+        // memory, and a signature binding "the certificate this connection
+        // was served" would bind one this connection never showed.
         //
         // rustls exposes no way to ask which certificate an earlier session
         // used, so the only correct answer is to have no earlier session. The
-        // cost is one handshake signature per connection, which is nothing
-        // beside the per-response attestation this enables.
+        // cost is one handshake signature per connection.
         let mut config = config;
         config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         config.send_tls13_tickets = 0;
@@ -109,11 +118,6 @@ impl TlsIdentity {
         // entirely for the latter. The one client this turns away is one that
         // offers ALPN with no overlap, which is correct: there is no protocol
         // in common to speak.
-        //
-        // Unrelated to the TLS-ALPN-01 challenge, which never reaches this
-        // configuration — `rustls_acme` builds its own advertising
-        // `acme-tls/1`, chosen by inspecting the ClientHello before any
-        // serving identity is consulted.
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         Ok(TlsIdentity {
@@ -122,20 +126,9 @@ impl TlsIdentity {
         })
     }
 
-    /// Generate a self-signed certificate for `domains`.
-    ///
-    /// **Not available in a production build.** The runtime serves ACME-issued
-    /// certificates and nothing else: a certificate the runtime minted for
-    /// itself is one an operator can mint too, so it cannot distinguish this
-    /// enclave from a process impersonating it — the attestation binding is
-    /// what carries that weight, and it binds whatever certificate is being
-    /// served, including one that was forged.
-    ///
-    /// It survives behind `testing` because the test harnesses and the QEMU
-    /// emulator have no domain and no reachable CA. A binary built without that
-    /// feature refuses `--tls self-signed` outright rather than quietly
-    /// generating one, and `rcgen` is not in it at all.
-    #[cfg(any(test, feature = "testing"))]
+    /// Generate a self-signed certificate for `domains` (`localhost` if none),
+    /// with a key that exists only in this process's memory: what the enclave
+    /// serves, made fresh at every boot. See the module docs for why no CA.
     pub fn self_signed(domains: &[String]) -> Result<Self> {
         let names: Vec<String> = if domains.is_empty() {
             vec!["localhost".to_string()]
@@ -160,38 +153,6 @@ impl TlsIdentity {
             "generated a self-signed TLS certificate inside the enclave"
         );
         Ok(identity)
-    }
-}
-
-/// Where the serving certificate comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsMode {
-    /// Plaintext HTTP. Development, and behind a trusted terminator only —
-    /// which inside an enclave means nowhere.
-    Off,
-    /// Obtain one from an ACME provider over TLS-ALPN-01.
-    Acme,
-}
-
-impl TlsMode {
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "off" | "none" | "plaintext" => Ok(TlsMode::Off),
-            // Named explicitly so a deployment that asks for it is told why it
-            // cannot have it, rather than "expected one of …". No build has
-            // this mode, testing included: the QEMU harness was the last user
-            // and it now runs a real ACME order against a local Pebble, which
-            // is the path production takes.
-            "self-signed" | "selfsigned" => Err(
-                "this runtime serves ACME-issued certificates only. A self-signed \
-                 certificate is one an operator can mint too, so it cannot tell this \
-                 enclave apart from something impersonating it. Use --tls acme, \
-                 pointing --acme-directory at a test CA if there is no public one."
-                    .to_string(),
-            ),
-            "acme" | "letsencrypt" => Ok(TlsMode::Acme),
-            other => Err(format!("expected one of off, acme; got {other:?}")),
-        }
     }
 }
 
@@ -224,28 +185,10 @@ mod tests {
         assert_ne!(a.certificate_der, b.certificate_der);
     }
 
-    #[test]
-    fn modes_parse_the_documented_values() {
-        assert_eq!(TlsMode::parse("off"), Ok(TlsMode::Off));
-        assert_eq!(TlsMode::parse("ACME"), Ok(TlsMode::Acme));
-        assert!(TlsMode::parse("maybe").is_err());
-    }
-
-    /// No build serves a certificate it minted itself, and the refusal says
-    /// what to do instead — a runtime that answered "expected one of off, acme"
-    /// would leave an operator guessing at a decision that was deliberate.
-    #[test]
-    fn a_self_signed_deployment_is_refused_with_a_reason() {
-        let err = TlsMode::parse("self-signed").unwrap_err();
-        assert!(err.contains("ACME-issued certificates only"), "{err}");
-        assert!(err.contains("--acme-directory"), "{err}");
-    }
-
     /// Both protocols, in preference order, on every serving identity.
     ///
-    /// `from_chain` is the single constructor — `self_signed` and the ACME path
-    /// both route through it — so this is the one place the list is stated and
-    /// there is nowhere for two identities to disagree about what they speak.
+    /// `from_chain` is the single constructor — `self_signed` routes through it —
+    /// so this is the one place the list is stated.
     #[test]
     fn a_serving_identity_offers_h2_and_http11_in_that_order() {
         let identity = TlsIdentity::self_signed(&["enclave.test".to_string()])

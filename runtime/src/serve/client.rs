@@ -1,16 +1,16 @@
 //! Which tenant a request speaks for, as the guest is told.
 //!
-//! The runtime resolves a tenant from a verified WebAuthn assertion — see
-//! [`crate::auth`] — and injects it here. A guest can read this header and can
-//! never write one: it is overwritten on every request before the guest sees
-//! anything, so what arrives is the runtime's word rather than the client's.
+//! The runtime resolves a tenant from a verified sign-in — a signature by the
+//! owner's share of the wallet key, see [`crate::auth`] — and injects it here.
+//! A guest can read this header and can never write one: it is overwritten on
+//! every request before the guest sees anything, so what arrives is the
+//! runtime's word rather than the client's.
 //!
 //! There used to be a second answer to "who is calling": a TLS client
-//! certificate, hashed to its SPKI. It was removed when passkeys arrived, and
-//! not because it was broken. A certificate proves possession of a key for the
-//! life of a connection; it cannot say that a person approved *this*
-//! transaction, and two independent ways to become a tenant is where an
-//! authorization bug grows.
+//! certificate, hashed to its SPKI. It was removed, and not because it was
+//! broken. A certificate proves possession of a key for the life of a
+//! connection; it cannot say that the owner approved *this* request, and two
+//! independent ways to become a tenant is where an authorization bug grows.
 
 use hyper::header::{HeaderName, HeaderValue};
 

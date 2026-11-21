@@ -69,7 +69,7 @@ boot; a channel that cannot be reached only warns.
 
 Notifications require authentication and tenant isolation, for the same reason
 background tasks do: the tenant a wake belongs to comes from a verified
-assertion, and without a gate there is none.
+sign-in, and without a gate there is none.
 
 In the Nix deployment set `pushAppId` in `deploy/nix/deployment.nix`, and
 `push_app_id` in `deploy/tofu`, which lets the parent's role send through that
@@ -185,7 +185,7 @@ Nothing in the suite reaches AWS: the wire is covered by a transport double that
 records exactly what would have been sent, and pins its signature. **The push
 path is unverified against the real service** — its response shapes are from
 the API model, not from a live answer, and the dead-token status under token
-authentication is undocumented — the same honesty `guest_io::cloudwatch` applies
+authentication is undocumented — the same honesty `cloudwatch` applies
 to its own credential path. What is exercised end to end is leg `6b/8` of
 [`deploy/qemu-nitro/run-e2e.sh`](../deploy/qemu-nitro/run-e2e.sh), where a
 finished background task wakes an enrolled device inside an emulated enclave and

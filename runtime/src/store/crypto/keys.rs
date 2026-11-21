@@ -1,42 +1,38 @@
-//! Key hierarchy.
+//! The release's key hierarchy: what one release keeps for itself.
 //!
-//! Everything hangs off one 32-byte [`MasterSecret`]. In production that
-//! secret comes from `kms:Decrypt` with a `Recipient` attestation document, so
-//! KMS releases it only to an enclave whose PCRs match the key policy; in
-//! development and tests it comes from config. The derivation below is
-//! identical either way, which is the point: the on-disk format does not
-//! change when attestation lands.
+//! Two roots, because two parties hold the state. A tenant's data is keyed from its own key,
+//! which its owner's share and the runtime's derive together ([`crate::tenant`]). What belongs to
+//! one release — its cache of tenant keys for background work — hangs off a [`MasterSecret`] that
+//! KMS releases only to that release's PCR0 and PCR16, through [`VersionKeys`]. A new release gets
+//! a new one and inherits none of it.
 //!
 //! ```text
-//!                    MasterSecret (32 bytes, never leaves memory)
-//!                            │
-//!             HKDF-SHA384(salt = fs_uuid, info = purpose)
-//!         ┌──────────────────┼──────────────────┐
-//!         ▼                  ▼                  ▼
-//!   Ed25519 seed       runtime seal key     pool dm-crypt key
-//!   (anchor signing)   (AES-256-GCM)        (AES-XTS, via [`hkdf`])
+//!   MasterSecret (KMS, one release)
+//!        │
+//!   HKDF-SHA384(salt = fs_uuid ‖ vid, info = purpose)
+//!   ┌────┴─────────┐
+//!   ▼              ▼
+//!  tenant-key     anonymous
+//!  cache key      tenant key
 //! ```
 //!
-//! Separate keys per purpose so that a weakness in one use cannot be pivoted
-//! into another.
+//! Separate keys per purpose so that a weakness in one use cannot be pivoted into another.
 
 use aws_lc_rs::aead::{LessSafeKey, UnboundKey, AES_256_GCM};
 use aws_lc_rs::hkdf::{KeyType, Salt, HKDF_SHA384};
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::tenant::TenantKey;
 
 use crate::store::error::{StoreError, StoreResult};
 
 /// HKDF info strings. Versioned so a future format revision can rotate
-/// derived keys without changing the master secret.
-const INFO_ROOTSIGN: &[u8] = b"enclave/anchor-sign/v1";
-/// Seals the runtime's own secrets — the ACME account key and the TLS
-/// certificate's private key — which live in the roots bucket.
+/// derived keys without changing the secret they come from.
 ///
-/// In the bucket rather than on the pool, because a certificate has to be
-/// served before anything else is, and a separate label keeps it
-/// cryptographically distinct from everything else derived here.
-const INFO_RUNTIME_SEAL: &[u8] = b"enclave/runtime-seal/v1";
+/// Seals each tenant key this release keeps for background work.
+const INFO_TENANT_CACHE: &[u8] = b"aegira/version/tenant-key-cache/v1";
+/// The key of the anonymous tenant a deployment with no gate serves.
+const INFO_ANONYMOUS: &[u8] = b"aegira/version/anonymous-tenant/v1";
 
 /// Length of an Ed25519 public key and of a raw signing seed.
 pub const ED25519_PUBLIC_KEY_LEN: usize = 32;
@@ -57,7 +53,7 @@ impl MasterSecret {
     /// Named to be conspicuous at the call site. There is exactly one
     /// legitimate reason to reach in here — sealing the secret so it can be
     /// stored — and everything else should take a `&MasterSecret` and derive
-    /// what it needs through [`KeyMaterial`], which is why no plain `as_bytes`
+    /// what it needs through [`VersionKeys`], which is why no plain `as_bytes`
     /// exists.
     pub fn expose_secret(&self) -> &[u8; 32] {
         &self.0
@@ -104,129 +100,80 @@ impl KeyType for OkmLen {
     }
 }
 
-/// HKDF-SHA384 from the master secret. Public for keys that live outside
-/// [`KeyMaterial`], such as the pool's dm-crypt key.
-pub fn hkdf(secret: &MasterSecret, salt: &[u8], info: &[u8], out: &mut [u8]) -> StoreResult<()> {
-    let prk = Salt::new(HKDF_SHA384, salt).extract(&secret.0);
+/// HKDF-SHA384 over raw input key material.
+pub fn hkdf_raw(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) -> StoreResult<()> {
+    let prk = Salt::new(HKDF_SHA384, salt).extract(ikm);
     prk.expand(&[info], OkmLen(out.len()))
         .and_then(|okm| okm.fill(out))
         .map_err(|_| StoreError::Io("HKDF expansion failed".to_string()))
 }
 
-/// All keys derived from one master secret, for one filesystem.
-pub struct KeyMaterial {
-    runtime_seal_key: LessSafeKey,
-    signing_key: Ed25519KeyPair,
-    public_key: [u8; ED25519_PUBLIC_KEY_LEN],
-    fs_uuid: [u8; 16],
+/// HKDF-SHA384 from the master secret.
+pub fn hkdf(secret: &MasterSecret, salt: &[u8], info: &[u8], out: &mut [u8]) -> StoreResult<()> {
+    hkdf_raw(&secret.0, salt, info, out)
 }
 
-impl KeyMaterial {
-    /// Derive every per-purpose key.
-    ///
-    /// `fs_uuid` is the HKDF salt, so two filesystems formatted from the same
-    /// master secret still get independent keys. It is in every anchor, and
-    /// is not a secret.
-    pub fn derive(master: &MasterSecret, fs_uuid: [u8; 16]) -> StoreResult<Self> {
-        let mut seal_bytes = [0u8; 32];
-        hkdf(master, &fs_uuid, INFO_RUNTIME_SEAL, &mut seal_bytes)?;
-        let runtime_seal_key = LessSafeKey::new(
-            UnboundKey::new(&AES_256_GCM, &seal_bytes)
-                .map_err(|_| StoreError::Io("AES key setup failed".to_string()))?,
-        );
-        seal_bytes.zeroize();
+pub(crate) fn aes_key(bytes: &[u8; 32]) -> StoreResult<LessSafeKey> {
+    Ok(LessSafeKey::new(
+        UnboundKey::new(&AES_256_GCM, bytes)
+            .map_err(|_| StoreError::Io("AES key setup failed".to_string()))?,
+    ))
+}
 
-        let mut seed = [0u8; 32];
-        hkdf(master, &fs_uuid, INFO_ROOTSIGN, &mut seed)?;
-        let signing_key = Ed25519KeyPair::from_seed_unchecked(&seed)
-            .map_err(|_| StoreError::Io("Ed25519 key derivation failed".to_string()))?;
-        seed.zeroize();
+/// What one release keeps for itself, from the master secret KMS releases to
+/// it alone.
+pub struct VersionKeys {
+    tenant_cache_key: LessSafeKey,
+    anonymous: TenantKey,
+}
 
-        let mut public_key = [0u8; ED25519_PUBLIC_KEY_LEN];
-        public_key.copy_from_slice(signing_key.public_key().as_ref());
-
-        Ok(KeyMaterial {
-            runtime_seal_key,
-            signing_key,
-            public_key,
-            fs_uuid,
+impl VersionKeys {
+    /// `salt` names the release: the filesystem id and the release's id, so two
+    /// releases under one master secret (a static development key) still keep
+    /// apart.
+    pub fn derive(master: &MasterSecret, salt: &[u8]) -> StoreResult<Self> {
+        let mut bytes = [0u8; 32];
+        hkdf(master, salt, INFO_TENANT_CACHE, &mut bytes)?;
+        let tenant_cache_key = aes_key(&bytes)?;
+        hkdf(master, salt, INFO_ANONYMOUS, &mut bytes)?;
+        let anonymous = TenantKey::from_bytes(bytes);
+        bytes.zeroize();
+        Ok(VersionKeys {
+            tenant_cache_key,
+            anonymous,
         })
     }
 
-    /// Seals runtime secrets stored outside the filesystem. See
-    /// [`INFO_RUNTIME_SEAL`].
-    pub fn runtime_seal_key(&self) -> &LessSafeKey {
-        &self.runtime_seal_key
+    /// Seals the tenant keys this release keeps for background work.
+    pub fn tenant_cache_key(&self) -> &LessSafeKey {
+        &self.tenant_cache_key
     }
 
-    pub fn signing_key(&self) -> &Ed25519KeyPair {
-        &self.signing_key
-    }
-
-    /// Public half of the anchor-signing key. Written into each anchor so an
-    /// external auditor can verify the chain without the master secret.
-    pub fn public_key(&self) -> &[u8; ED25519_PUBLIC_KEY_LEN] {
-        &self.public_key
-    }
-
-    pub fn fs_uuid(&self) -> &[u8; 16] {
-        &self.fs_uuid
+    /// The anonymous tenant's key, when no gate is configured. A release's
+    /// own, so its data lasts only as long as the release.
+    pub fn anonymous(&self) -> &TenantKey {
+        &self.anonymous
     }
 }
 
-impl std::fmt::Debug for KeyMaterial {
+impl std::fmt::Debug for VersionKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KeyMaterial")
-            .field("fs_uuid", &hex16(&self.fs_uuid))
-            .field("public_key", &hex16(&self.public_key[..8]))
-            .finish_non_exhaustive()
+        f.write_str("VersionKeys(<redacted>)")
     }
-}
-
-fn hex16(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn master() -> MasterSecret {
-        MasterSecret::from_bytes([0x5a; 32])
-    }
-
+    /// Two releases under one master secret — a static development key — must
+    /// not share a cache key or an anonymous tenant.
     #[test]
-    fn derivation_is_deterministic() {
-        let a = KeyMaterial::derive(&master(), [1u8; 16]).unwrap();
-        let b = KeyMaterial::derive(&master(), [1u8; 16]).unwrap();
-        assert_eq!(a.public_key(), b.public_key());
-    }
-
-    /// The salt is what keeps two filesystems formatted from the same master
-    /// secret cryptographically separate.
-    #[test]
-    fn different_fs_uuid_gives_different_keys() {
-        let a = KeyMaterial::derive(&master(), [1u8; 16]).unwrap();
-        let b = KeyMaterial::derive(&master(), [2u8; 16]).unwrap();
-        assert_ne!(a.public_key(), b.public_key());
-    }
-
-    #[test]
-    fn different_master_gives_different_keys() {
-        let a = KeyMaterial::derive(&MasterSecret::from_bytes([1u8; 32]), [0u8; 16]).unwrap();
-        let b = KeyMaterial::derive(&MasterSecret::from_bytes([2u8; 32]), [0u8; 16]).unwrap();
-        assert_ne!(a.public_key(), b.public_key());
-    }
-
-    /// Purpose separation: two keys from the same secret and salt, differing
-    /// only in the info string. If those collided, the info strings would not
-    /// be doing anything.
-    #[test]
-    fn purposes_are_separated() {
-        let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
-        hkdf(&master(), &[0u8; 16], INFO_ROOTSIGN, &mut a).unwrap();
-        hkdf(&master(), &[0u8; 16], INFO_RUNTIME_SEAL, &mut b).unwrap();
-        assert_ne!(a, b);
+    fn releases_are_separated_by_their_salt() {
+        let master = MasterSecret::from_bytes([9; 32]);
+        let a = VersionKeys::derive(&master, b"release-a").unwrap();
+        let b = VersionKeys::derive(&master, b"release-b").unwrap();
+        assert!(!a.anonymous().ct_eq(b.anonymous()));
     }
 
     #[test]
@@ -262,8 +209,7 @@ mod tests {
         assert_eq!(s, "MasterSecret(<redacted>)");
         assert!(!s.contains("ab"));
 
-        let km = KeyMaterial::derive(&m, [0u8; 16]).unwrap();
-        let s = format!("{km:?}");
-        assert!(!s.contains("abab"));
+        let v = VersionKeys::derive(&m, b"salt").unwrap();
+        assert!(!format!("{v:?}").contains("abab"));
     }
 }
