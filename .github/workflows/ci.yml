@@ -77,7 +77,10 @@ jobs:
   # runs in the emulator instead: docs/STORAGE.md, "Running SQLite".
   e2e:
     name: the whole stack, in an emulated enclave
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: on Ubuntu 26.04 the enclave's first vsock connection to this
+    # host times out and its init dies at boot (2026-11-21). 24.04 is what this job last passed
+    # on, with the same image. Moving it means making the host's vsock work there first.
+    runs-on: ubuntu-24.04
     # The integration suites, then a cold Nix build of the image, then the
     # emulated boot. This is the only integration signal, so it carries the
     # suites that used to have their own job.
