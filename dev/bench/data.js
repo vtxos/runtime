@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795298662995,
+  "lastUpdate": 1795300093576,
   "repoUrl": "https://github.com/vtxos/runtime",
   "entries": {
     "Benchmark": [
@@ -407,6 +407,48 @@ window.BENCHMARK_DATA = {
             "name": "guest/dispatch/committing",
             "value": 1097640,
             "range": "± 65084",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "joshuaaruokhaitech@gmail.com",
+            "name": "Aruokhai Joshua",
+            "username": "aruokhai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ab001ab62bbe2f9e0c86481721f4189964bbe8e5",
+          "message": "Merge pull request #11 from vtxos/release-trial/pack\n\nThe React Native package includes the iOS framework, and a release trial checks the package",
+          "timestamp": "2026-11-22T00:22:05+02:00",
+          "tree_id": "264a406a381c17945654ff003c60968492822c59",
+          "url": "https://github.com/vtxos/runtime/commit/ab001ab62bbe2f9e0c86481721f4189964bbe8e5"
+        },
+        "date": 1795300093261,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "guest/instantiate",
+            "value": 17927,
+            "range": "± 1045",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/trivial",
+            "value": 126881,
+            "range": "± 5282",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/committing",
+            "value": 621114,
+            "range": "± 19093",
             "unit": "ns/iter"
           }
         ]
