@@ -137,7 +137,9 @@ jobs:
           restore-keys: e2e-nix-
       - name: Load them
         run: |
-          mkdir -p ~/ci-cache/images ~/ci-cache/nix
+          # The cache's own folders are made here, as this user: left to Nix, its daemon
+          # makes them as root when it first reads the cache, and the save below is refused.
+          mkdir -p ~/ci-cache/images ~/ci-cache/nix/nar ~/ci-cache/nix/realisations ~/ci-cache/nix/log
           for tar in ~/ci-cache/images/*.tar; do
             if [ -e "$tar" ]; then docker load -i "$tar"; fi
           done
@@ -160,6 +162,7 @@ jobs:
             done
           fi
           if [ "${{ steps.nix.outputs.cache-hit }}" != "true" ]; then
+            sudo chown -R "$(id -u):$(id -g)" ~/ci-cache/nix
             # What this runner built itself: no signature of the public cache. Not the
             # toolchains, which come from their own mirrors quickly, nor the final images,
             # which change with every commit.
