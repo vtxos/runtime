@@ -18,7 +18,10 @@ say "android: toolchain"
 rustup target add aarch64-linux-android x86_64-linux-android
 cargo install cargo-ndk --version "$CARGO_NDK_VERSION" --locked
 if [ ! -d "$ANDROID_NDK_HOME" ]; then
-    yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" >/dev/null
+    # `yes` is cut off when sdkmanager has read enough, and under pipefail that would fail the
+    # script after a good install: only sdkmanager's own result counts.
+    (yes 2>/dev/null || true) \
+        | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" >/dev/null
 fi
 
 cd "$REPO/clients/react-native"
