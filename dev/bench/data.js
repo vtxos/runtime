@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792278383543,
+  "lastUpdate": 1795296704715,
   "repoUrl": "https://github.com/vtxos/runtime",
   "entries": {
     "Benchmark": [
@@ -323,6 +323,48 @@ window.BENCHMARK_DATA = {
             "name": "guest/dispatch/committing",
             "value": 1234064,
             "range": "± 82149",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "joshuaaruokhaitech@gmail.com",
+            "name": "Aruokhai Joshua",
+            "username": "aruokhai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "63869b2c875d845805ca959f4016afd360425a1c",
+          "message": "Merge pull request #9 from vtxos/client-keyed-tenants\n\nOwner-keyed tenants, enclave:signer, tasks through AWS, and a client for native apps",
+          "timestamp": "2026-11-21T23:19:39+02:00",
+          "tree_id": "bd1b360e3213d6846ec9e5e779af0c9c86fcd383",
+          "url": "https://github.com/vtxos/runtime/commit/63869b2c875d845805ca959f4016afd360425a1c"
+        },
+        "date": 1795296704164,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "guest/instantiate",
+            "value": 32818,
+            "range": "± 2300",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/trivial",
+            "value": 128786,
+            "range": "± 6767",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/committing",
+            "value": 963821,
+            "range": "± 1260268",
             "unit": "ns/iter"
           }
         ]
