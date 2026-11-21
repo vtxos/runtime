@@ -15,9 +15,14 @@
 # `@vtxos` scope.
 name: React Native release
 
+# To try a release without making one, push a branch named release-trial/<anything>, or run
+# this workflow by hand: both platforms are built exactly as for a release, and nothing is
+# published. Only a tag publishes.
 on:
   push:
     tags: ["react-native-wallet-v*"]
+    branches: ["release-trial/**"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -90,6 +95,7 @@ jobs:
   publish:
     name: Publish to npm
     needs: [android, ios]
+    if: startsWith(github.ref, 'refs/tags/react-native-wallet-v')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
