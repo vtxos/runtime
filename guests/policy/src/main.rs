@@ -1,4 +1,4 @@
-//! The cosigner, as a Wasm component.
+//! The policy, as a Wasm component.
 //!
 //! One instance serves one wallet: which wallet is configuration, not something a caller names per
 //! request — that is what removes the whole class of confusion the old `/u/{group_key}/...` routing
@@ -6,7 +6,7 @@
 //! address.
 //!
 //! There is no listener here and no transport. The component exports `enclave:rpc/service`: the
-//! runtime owns the socket, the TLS, HTTP/2 and gRPC's framing, and calls [`Policy::call`] once
+//! runtime owns the socket, the TLS, HTTP/2 and gRPC's framing, and calls [`Component::call`] once
 //! per call with its messages as a stream. It also exports `run-task`, which the runtime calls on
 //! its own schedule. Both are in `enclave_wit`'s `guest` world, read from the runtime's own WIT.
 //!
@@ -20,15 +20,15 @@ use enclave_wit::exports::enclave::rpc::service as rpc;
 use enclave_wit::{wit_future, wit_stream};
 use policy::status::{Code, Status};
 use policy::wire::{Wire, WireFuture};
-use policy::{config, session, store, Cosigner};
+use policy::{config, session, store, Policy};
 use wit_bindgen::{FutureReader, StreamReader, StreamWriter};
 
-/// What the seal is filed under when `COSIGNER_GROUP_KEY` says nothing — see [`open_cosigner`].
+/// What the seal is filed under when `COSIGNER_GROUP_KEY` says nothing — see [`open_policy`].
 const DEFAULT_GROUP_KEY: &str = "wallet";
 
-struct Policy;
+struct Component;
 
-impl rpc::Guest for Policy {
+impl rpc::Guest for Component {
     async fn call(
         method: String,
         requests: StreamReader<Vec<u8>>,
@@ -60,8 +60,8 @@ impl rpc::Guest for Policy {
 /// The runtime calls this on its own schedule with no request in flight, so it opens the wallet
 /// itself rather than sharing one — there is no instance kept between a request and a task to
 /// share. When the sealed delegate has come due it runs it against the ASP its settings name —
-/// see `Cosigner::run_task_with` — and wakes the owner only when it cannot.
-impl enclave_wit::Guest for Policy {
+/// see `Policy::run_task_with` — and wakes the owner only when it cannot.
+impl enclave_wit::Guest for Component {
     fn run_task(task_id: String, payload: Vec<u8>) -> Result<Vec<u8>, String> {
         // The runtime records a failed run's error inside the sealed task record, where nobody
         // reads it; stderr reaches the console. Said here too, so a watch that keeps failing
@@ -69,7 +69,7 @@ impl enclave_wit::Guest for Policy {
         println!("run-task {task_id}: start");
         let run = || {
             let cfg = config::Config::from_environment();
-            let mut wallet = open_cosigner(&cfg).map_err(|e| e.to_string())?;
+            let mut wallet = open_policy(&cfg).map_err(|e| e.to_string())?;
             // The ASP, when the settings name one — a due delegate is then run here, not handed
             // back to a phone. A native build (clippy, the fake host's wire types) has no client.
             #[cfg(target_arch = "wasm32")]
@@ -85,7 +85,7 @@ impl enclave_wit::Guest for Policy {
     }
 }
 
-enclave_wit::export!(Policy);
+enclave_wit::export!(Component);
 
 /// The call's two streams, as the router reads and writes them.
 struct Streams {
@@ -124,11 +124,11 @@ async fn serve(method: &str, wire: Box<dyn Wire>) -> Result<(), Status> {
             )));
         }
 
-        let cosigner = Arc::new(Mutex::new(open_cosigner(&cfg)?));
+        let policy = Arc::new(Mutex::new(open_policy(&cfg)?));
         let server_info = policy::wallet_proto::GetServerInfoResponse {
             bitcoin_network: cfg.bitcoin_network.clone(),
         };
-        Ok(session::Session::new(cosigner, server_info))
+        Ok(session::Session::new(policy, server_info))
     })();
 
     match opened {
@@ -147,7 +147,7 @@ async fn serve(method: &str, wire: Box<dyn Wire>) -> Result<(), Status> {
 ///
 /// Shared by the request path and the background task, which both need the whole wallet and get it
 /// the same way: there is no instance kept between them to inherit.
-fn open_cosigner(cfg: &config::Config) -> Result<Cosigner, Status> {
+fn open_policy(cfg: &config::Config) -> Result<Policy, Status> {
     // The only thing this instance opens: its own store, a directory on the filesystem the runtime
     // scoped to this client. No ASP connection, no push channel — the caller drives the Ark
     // protocol and the host wakes devices.
@@ -171,7 +171,7 @@ fn open_cosigner(cfg: &config::Config) -> Result<Cosigner, Status> {
     let group_key =
         std::env::var("COSIGNER_GROUP_KEY").unwrap_or_else(|_| DEFAULT_GROUP_KEY.to_string());
 
-    Cosigner::open(store, group_key)
+    Policy::open(store, group_key)
 }
 
 fn main() {}

@@ -1,4 +1,4 @@
-//! `Recover`: the half of a wallet's key the runtime recomputes, and the ways the cosigner refuses
+//! `Recover`: the half of a wallet's key the runtime recomputes, and the ways the policy refuses
 //! to hand it over.
 //!
 //! The arithmetic — that this share plus the wallet's own rebuilds the wallet's share — is the
@@ -23,9 +23,9 @@ fn recover_returns_the_dealt_share_to_the_wallets_own_identifier() {
         return;
     };
     let wallet = common::wallet();
-    let cosigner = common::open_holding(&store, &wallet);
+    let policy = common::open_holding(&store, &wallet);
 
-    let resp = cosigner.lock().unwrap().recover(asking_as(&wallet.user.identifier))
+    let resp = policy.lock().unwrap().recover(asking_as(&wallet.user.identifier))
         .expect("the owner's own identifier must be answered");
 
     assert_eq!(resp.dealt_share, wallet.dealt_share(), "the share the runtime recomputes");
@@ -36,7 +36,7 @@ fn recover_returns_the_dealt_share_to_the_wallets_own_identifier() {
     );
 
     // Nothing was installed: it answers again the same way.
-    let again = cosigner.lock().unwrap().recover(asking_as(&wallet.user.identifier))
+    let again = policy.lock().unwrap().recover(asking_as(&wallet.user.identifier))
         .expect("recovering must not consume or re-key the wallet");
     assert_eq!(again.group_key, resp.group_key);
     assert_eq!(again.dealt_share, resp.dealt_share);
@@ -49,9 +49,9 @@ fn recover_refuses_before_there_is_a_wallet() {
     };
     let wallet = common::wallet();
     // A runtime holding no key for this tenant.
-    let cosigner = common::open_cosigner(&store, &wallet.group_key());
+    let policy = common::open_policy(&store, &wallet.group_key());
 
-    let err = cosigner.lock().unwrap().recover(asking_as(&wallet.user.identifier))
+    let err = policy.lock().unwrap().recover(asking_as(&wallet.user.identifier))
         .expect_err("there is nothing to recover before a DKG");
     assert!(format!("{err:?}").contains("has no key"), "unexpected refusal: {err:?}");
 }
@@ -62,12 +62,12 @@ fn recover_refuses_an_identifier_the_key_does_not_record() {
         return;
     };
     let wallet = common::wallet();
-    let cosigner = common::open_holding(&store, &wallet);
+    let policy = common::open_holding(&store, &wallet);
 
     // A passkey whose PRF answered differently derives a different identifier. It would rebuild a
     // share that cannot sign, so it is refused rather than served.
     let other = common::wallet();
-    let err = cosigner.lock().unwrap().recover(asking_as(&other.user.identifier))
+    let err = policy.lock().unwrap().recover(asking_as(&other.user.identifier))
         .expect_err("a stranger's identifier must not be answered");
     assert!(
         format!("{err:?}").contains("does not derive this wallet"),

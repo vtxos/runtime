@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use policy::cosigner::{
+use policy::policy::{
     Outcome, Task, CATEGORY_DELEGATE_SETTLED, CATEGORY_SETTLE_DUE, WATCH_TASK_ID,
 };
 use policy::session::proto;

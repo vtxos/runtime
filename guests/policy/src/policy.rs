@@ -1,4 +1,4 @@
-//! The cosigner: the Ark sessions and the ASP connection for the one wallet this process serves.
+//! The policy: the Ark sessions and the ASP connection for the one wallet this process serves.
 //! Its FROST rounds are `crate::sign`'s, and the wallet key behind them is the runtime's.
 
 use std::sync::Arc;
@@ -24,12 +24,12 @@ use crate::store::Store;
 
 // --- The settle watch --------------------------------------------------------------------------
 //
-// When a sealed delegate comes due, the cosigner runs it. A VTXO expires. The wallet signs a
-// delegate to refresh it while it is here — see `crate::renew` — and the cosigner seals it and
+// When a sealed delegate comes due, the policy runs it. A VTXO expires. The wallet signs a
+// delegate to refresh it while it is here — see `crate::renew` — and the policy seals it and
 // enqueues this watch for the moment it becomes valid. Then, with no request in flight and nobody
 // connected, the task opens the wallet, registers the sealed intent with the ASP its settings name,
-// follows the round, and signs the tree with the cosigner's own key. See
-// [`Cosigner::run_task_with`].
+// follows the round, and signs the tree with the policy's own key. See
+// [`Policy::run_task_with`].
 //
 // Waking the owner is the fallback, for when it cannot: the settings name no ASP, or the round
 // failed. A failure is a conclusion of this run, not an error — an error is retried five times and
@@ -48,7 +48,7 @@ pub const WATCH_INTERVAL_MS: u64 = 30 * 60 * 1000;
 /// delegate could not be run here, so the owner can refresh in person.
 pub const CATEGORY_SETTLE_DUE: &str = "settle-due";
 
-/// Raised after the cosigner refreshed the funds itself: the refreshed VTXO has no delegate yet, and
+/// Raised after the policy refreshed the funds itself: the refreshed VTXO has no delegate yet, and
 /// the next time the owner is here the wallet renews the delegate.
 pub const CATEGORY_DELEGATE_SETTLED: &str = "delegate-settled";
 
@@ -71,7 +71,7 @@ pub enum Task {
 pub enum Outcome {
     /// Nothing is owed yet.
     NotDue { deadline_secs: u64, now_secs: u64 },
-    /// The cosigner ran the delegate: the funds are refreshed.
+    /// The policy ran the delegate: the funds are refreshed.
     Settled { commitment_txid: String },
     /// Due, and not run here — no ASP, or the round failed. The devices were woken.
     Woke { deadline_secs: u64 },
@@ -79,7 +79,7 @@ pub enum Outcome {
     NothingToSettle,
 }
 
-pub struct Cosigner {
+pub struct Policy {
     /// The wallet's delegate, and whether its round is running.
     pub(crate) renew_session: Option<RenewSession>,
     /// In-flight boarding settle, held across the commitment-FROST pause. Transient — never
@@ -95,8 +95,8 @@ pub struct Cosigner {
     pub(crate) vtxos: Vec<VtxoEntry>,
 }
 
-impl Cosigner {
-    /// Load this cosigner's state, then hand back something callable. The runtime it runs inside
+impl Policy {
+    /// Load this policy's state, then hand back something callable. The runtime it runs inside
     /// (its task queue, its push channel and the wallet key) is reached through `enclave_wit`.
     ///
     /// Eagerly, not on first use: per-request there is no later use to amortise a lazy restore
@@ -107,16 +107,16 @@ impl Cosigner {
         store: Arc<Store>,
         group_key: String,
     ) -> Result<Self, Status> {
-        let mut cosigner = Self::new(store.clone(), group_key.clone());
+        let mut policy = Self::new(store.clone(), group_key.clone());
         // A seal that is there and cannot be read is not the same as no seal: opening as an empty
         // wallet would forget its VTXOs and its delegate, and the seal is the only copy of them.
-        crate::store::restore_snapshot(&mut cosigner, &store, &group_key).map_err(|e| {
+        crate::store::restore_snapshot(&mut policy, &store, &group_key).map_err(|e| {
             Status::failed_precondition(format!(
                 "this wallet's sealed state is present but unreadable ({e}); refusing to open it \
                  as an empty wallet"
             ))
         })?;
-        Ok(cosigner)
+        Ok(policy)
     }
 
     pub fn group_key(&self) -> &str {
@@ -176,7 +176,7 @@ impl Cosigner {
     /// is not trusted here.
     ///
     /// NOT trusted: ownership. Every VTXO this wallet can spend sits under a scriptPubKey derived
-    /// from the cosigner's OWN owner key and one of the two exit delays the ASP published — so an
+    /// from the policy's OWN owner key and one of the two exit delays the ASP published — so an
     /// `exit_delay` outside that pair names a script this wallet does not control, and is refused
     /// outright. A caller cannot widen what it owns by asserting it.
     ///
@@ -431,7 +431,7 @@ impl Cosigner {
         Ok(Outcome::Woke { deadline_secs })
     }
 
-    /// Seal this cosigner's state, logging a failure rather than returning it.
+    /// Seal this policy's state, logging a failure rather than returning it.
     pub fn seal(&mut self) {
         if let Err(e) = self.try_seal() {
             eprintln!("{e}");
@@ -440,7 +440,7 @@ impl Cosigner {
 
     /// Seal, and say whether it took. For a change that must not be acted on unless it is durable:
     /// a release signed but not written down is a payment that can be asked for again, and a key
-    /// announced but not written down is one a wallet funds and the cosigner then forgets.
+    /// announced but not written down is one a wallet funds and the policy then forgets.
     pub fn try_seal(&mut self) -> Result<(), String> {
         let store = self.store.clone();
         let group_key = self.group_key.clone();
@@ -474,7 +474,7 @@ impl Cosigner {
     }
 
     /// Rebuild a wallet on a new device, from nothing but its passkey: hand back the half of its
-    /// share this cosigner dealt, with the public material to check it against.
+    /// share this policy dealt, with the public material to check it against.
     ///
     /// # Why half a key is sitting here
     ///
@@ -488,8 +488,8 @@ impl Cosigner {
     /// The wallet's own dealer is derived from the passkey's PRF output, which the platform syncs
     /// with the passkey, so a new phone that can use the passkey can reproduce `f_wallet` exactly —
     /// and with it `id_wallet`, which is derived from `a0·G`. The second term it cannot reproduce:
-    /// the cosigner's polynomial is derived from the operator master, which only the runtime holds.
-    /// So the runtime recomputes the one scalar the cosigner dealt out, and it is handed back here.
+    /// the policy's polynomial is derived from the operator master, which only the runtime holds.
+    /// So the runtime recomputes the one scalar the policy dealt out, and it is handed back here.
     ///
     /// # What this is not
     ///
@@ -519,7 +519,7 @@ impl Cosigner {
         })
     }
 
-    /// The half of the wallet's share the cosigner dealt at DKG, for the wallet that is
+    /// The half of the wallet's share the policy dealt at DKG, for the wallet that is
     /// [identifier], recomputed by the runtime.
     ///
     /// `Recover` hands it to a device that has nothing. `Sign`, `Send` and `Renew` hand it back on
@@ -553,7 +553,7 @@ impl Cosigner {
     }
 }
 
-impl Cosigner {
+impl Policy {
     /// Open a send: build the off-chain send tx (after `GetInfo`) and hand back the session
     /// alongside the sighashes the client must FROST-sign. Nothing about it is stored here.
     pub fn create_send_session(
@@ -671,7 +671,7 @@ pub(crate) fn build_send(
 }
 
 /// Put the wallet's signatures, as the wire carried them, into [session], and hand back what the
-/// caller submits: the ark tx and its checkpoints. The cosigner signs; the caller submits.
+/// caller submits: the ark tx and its checkpoints. The policy signs; the caller submits.
 pub(crate) fn sign_and_prepare(
     session: &mut SendSession,
     signatures: &[Vec<u8>],

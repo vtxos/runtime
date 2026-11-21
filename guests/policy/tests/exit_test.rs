@@ -2,7 +2,7 @@
 //!
 //! What matters here is that the exit is *complete* when the wallet gets it: a real 2-of-2
 //! signature over the VTXO's exit leaf, in a transaction anybody can broadcast. That is the only
-//! thing the wallet cannot obtain later, because obtaining it needs this cosigner.
+//! thing the wallet cannot obtain later, because obtaining it needs this policy.
 
 mod common;
 
@@ -56,7 +56,7 @@ fn vtxo(txid: char, amount_sats: u64) -> VtxoInput {
     }
 }
 
-/// The wallet's half of the round, over every message the cosigner committed to.
+/// The wallet's half of the round, over every message the policy committed to.
 fn wallet_answers(
     kp_user: &KeyPackage,
     messages: &[Vec<u8>],
@@ -101,7 +101,7 @@ struct Renewed {
 
 /// A wallet as DKG leaves it, on a host that accepts whatever its renewals schedule.
 struct Wallet {
-    cosigner: Arc<Mutex<policy::Cosigner>>,
+    policy: Arc<Mutex<policy::Policy>>,
     test: common::TestWallet,
     store: std::sync::Arc<policy::store::Store>,
 }
@@ -109,18 +109,18 @@ struct Wallet {
 fn wallet() -> Option<Wallet> {
     let store = common::try_store()?;
     let test = common::wallet();
-    let cosigner = Arc::new(Mutex::new(reopen_at(&store, &test)));
-    Some(Wallet { cosigner, test, store })
+    let policy = Arc::new(Mutex::new(reopen_at(&store, &test)));
+    Some(Wallet { policy, test, store })
 }
 
 /// A new instance over the store: what the runtime does on every request.
 fn reopen_at(
     store: &std::sync::Arc<policy::store::Store>,
     test: &common::TestWallet,
-) -> policy::Cosigner {
+) -> policy::Policy {
     // Renewing arms the settle watch, so the runtime must hold the key and take the task.
     common::Recorder::holding(test);
-    policy::Cosigner::open(store.clone(), test.group_key()).expect("open")
+    policy::Policy::open(store.clone(), test.group_key()).expect("open")
 }
 
 /// Run a whole renewal on [w]: open it, answer its round as the wallet would, and finish.
@@ -131,7 +131,7 @@ fn renew_on(w: &mut Wallet, vtxos: Vec<VtxoInput>, exit_script: &[u8]) -> Renewe
         exit_script_pubkey: exit_script.to_vec(),
         device_token: String::new(),
     };
-    let (renew, to_sign) = match DelegateRenew::build(&w.cosigner, request) {
+    let (renew, to_sign) = match DelegateRenew::build(&w.policy, request) {
         Ok(opened) => opened,
         Err(e) => panic!("the renewal must work offline: {e}"),
     };
@@ -142,7 +142,7 @@ fn renew_on(w: &mut Wallet, vtxos: Vec<VtxoInput>, exit_script: &[u8]) -> Renewe
         .into_iter()
         .map(|h| proto::WalletRound { hiding: h.hiding, binding: h.binding, share: h.share })
         .collect();
-    let renewed = renew.finalise(&w.cosigner, rounds, "").expect("renew");
+    let renewed = renew.finalise(&w.policy, rounds, "").expect("renew");
     Renewed { exits: renewed.exit_txs }
 }
 
@@ -162,7 +162,7 @@ fn renew(vtxos: Vec<VtxoInput>, exit_script: &[u8]) -> Option<Renewed> {
 }
 
 /// What [c] would seal now, parsed.
-fn snapshot(c: &policy::Cosigner) -> serde_json::Value {
+fn snapshot(c: &policy::Policy) -> serde_json::Value {
     serde_json::from_slice(&c.to_snapshot().expect("snapshot")).expect("json")
 }
 
@@ -217,18 +217,18 @@ fn dust_gets_no_exit_but_does_not_fail_the_renewal() {
 }
 
 /// Each delegate signs its round with a tree-signing key of its own, drawn when it is built. It
-/// used to be one key for the wallet's life — the cosigner's own DKG secret — which every round
+/// used to be one key for the wallet's life — the policy's own DKG secret — which every round
 /// showed the ASP, and which joined to the wallet's half of the DKG would have been the whole key.
 #[test]
 fn every_delegate_has_a_tree_signing_key_of_its_own() {
     let Some(mut w) = wallet() else { return };
     renew_on(&mut w, vec![vtxo('a', 100_000)], &destination());
-    let first = delegate_in(&snapshot(&w.cosigner.lock().unwrap()));
+    let first = delegate_in(&snapshot(&w.policy.lock().unwrap()));
     renew_on(&mut w, vec![vtxo('a', 100_000)], &destination());
-    let second = delegate_in(&snapshot(&w.cosigner.lock().unwrap()));
+    let second = delegate_in(&snapshot(&w.policy.lock().unwrap()));
     assert_ne!(first["delegate_cosigner_pk_hex"], second["delegate_cosigner_pk_hex"]);
     assert!(
-        snapshot(&w.cosigner.lock().unwrap()).get("ark_cosigner_secret_hex").is_none(),
+        snapshot(&w.policy.lock().unwrap()).get("ark_cosigner_secret_hex").is_none(),
         "no wallet-wide key is sealed beside the delegate"
     );
 }
@@ -239,8 +239,8 @@ fn every_delegate_has_a_tree_signing_key_of_its_own() {
 fn a_delegate_comes_back_from_the_seal_with_its_key() {
     let Some(mut w) = wallet() else { return };
     renew_on(&mut w, vec![vtxo('a', 100_000)], &destination());
-    w.cosigner.lock().unwrap().seal();
-    let sealed = delegate_in(&snapshot(&w.cosigner.lock().unwrap()));
+    w.policy.lock().unwrap().seal();
+    let sealed = delegate_in(&snapshot(&w.policy.lock().unwrap()));
     let reopened = reopen_at(&w.store, &w.test);
     assert_eq!(delegate_in(&snapshot(&reopened)), sealed, "the delegate came back, key and all");
 }
@@ -252,8 +252,8 @@ fn a_delegate_whose_id_was_sealed_beside_it_still_restores() {
     let Some(mut w) = wallet() else { return };
     renew_on(&mut w, vec![vtxo('a', 100_000)], &destination());
 
-    // The seal as the old cosigner wrote it.
-    let mut old = snapshot(&w.cosigner.lock().unwrap());
+    // The seal as the old policy wrote it.
+    let mut old = snapshot(&w.policy.lock().unwrap());
     let mut delegate = delegate_in(&old);
     delegate.as_object_mut().unwrap().remove("intent_id");
     old["delegate_json"] = delegate.to_string().into();

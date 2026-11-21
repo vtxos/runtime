@@ -7,13 +7,13 @@
 //! `try_store` call gets its own isolated database.
 //!
 //! These tests run as wasm inside `guests/fake-host` (`fake-host-run`, cargo's runner here), so
-//! the cosigner calls the runtime's interfaces exactly as a release does and the fake host
+//! the policy calls the runtime's interfaces exactly as a release does and the fake host
 //! answers. The wallet key is the runtime's, so a test that signs deals it itself and hands the
 //! runtime's half to the fake host ([`Recorder::hold`]): a plain 2-of-2 with both polynomials
 //! random, because the guest sees only the public package, the dealt share and the rounds, and
 //! how the runtime derives its half is the runtime's to test.
 
-use policy::Cosigner;
+use policy::Policy;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -38,7 +38,7 @@ pub fn try_store() -> Option<Arc<Store>> {
     ))
 }
 
-/// A wallet that has run its DKG with the runtime: the app's key package, and the cosigner's half
+/// A wallet that has run its DKG with the runtime: the app's key package, and the policy's half
 /// the runtime keeps.
 pub struct TestWallet {
     pub user: KeyPackage,
@@ -46,12 +46,12 @@ pub struct TestWallet {
 }
 
 impl TestWallet {
-    /// The group key, compressed, hex — what the cosigner's seal is filed under in these tests.
+    /// The group key, compressed, hex — what the policy's seal is filed under in these tests.
     pub fn group_key(&self) -> String {
         hex::encode(self.key.group_key())
     }
 
-    /// The share the cosigner dealt this wallet, as the runtime recomputes it.
+    /// The share the policy dealt this wallet, as the runtime recomputes it.
     pub fn dealt_share(&self) -> Vec<u8> {
         self.key.dealt.clone()
     }
@@ -112,18 +112,18 @@ pub fn wallet() -> TestWallet {
     }
 }
 
-/// Open the cosigner this process serves, in a runtime that holds no wallet key and no tasks.
-pub fn open_cosigner(store: &Arc<Store>, group_key: &str) -> Mutex<Cosigner> {
+/// Open the policy this process serves, in a runtime that holds no wallet key and no tasks.
+pub fn open_policy(store: &Arc<Store>, group_key: &str) -> Mutex<Policy> {
     Recorder::default();
-    let cosigner = Cosigner::open(store.clone(), group_key.to_string());
-    Mutex::new(cosigner.expect("open cosigner"))
+    let policy = Policy::open(store.clone(), group_key.to_string());
+    Mutex::new(policy.expect("open policy"))
 }
 
 /// Open it inside a runtime that holds [wallet]'s key.
-pub fn open_holding(store: &Arc<Store>, wallet: &TestWallet) -> Mutex<Cosigner> {
+pub fn open_holding(store: &Arc<Store>, wallet: &TestWallet) -> Mutex<Policy> {
     Recorder::holding(wallet);
-    let cosigner = Cosigner::open(store.clone(), wallet.group_key());
-    Mutex::new(cosigner.expect("open cosigner"))
+    let policy = Policy::open(store.clone(), wallet.group_key());
+    Mutex::new(policy.expect("open policy"))
 }
 
 /// The wallet's half of a signing session over [messages]: a fresh nonce for each, then a share
@@ -173,7 +173,7 @@ pub fn block_seal(dir: &std::path::Path, name: &str) {
 /// Driving `Session::route` with messages, as the runtime delivers them.
 ///
 /// A request from [request] is every message the client sends, then its close, so a test can open
-/// a stream and read what the cosigner says first, but cannot answer it: a stream opened and left
+/// a stream and read what the policy says first, but cannot answer it: a stream opened and left
 /// is cut off mid-ceremony, and ends `Cancelled`.
 pub mod wire {
     use std::cell::RefCell;
@@ -187,7 +187,7 @@ pub mod wire {
     use policy::status::Status;
     use policy::wallet_proto::GetServerInfoResponse;
     use policy::wire::{Wire, WireFuture};
-    use policy::Cosigner;
+    use policy::Policy;
 
     /// Drive a future to completion on this thread.
     ///
@@ -219,7 +219,7 @@ pub mod wire {
         }
     }
 
-    /// What the cosigner said, and how the call ended.
+    /// What the policy said, and how the call ended.
     pub struct Response {
         messages: Vec<Vec<u8>>,
         outcome: Result<(), Status>,
@@ -245,7 +245,7 @@ pub mod wire {
         Answer { messages, code, message }
     }
 
-    /// The router, over a cosigner, as the runtime calls it.
+    /// The router, over a policy, as the runtime calls it.
     pub struct Service(Session);
 
     impl Service {
@@ -258,14 +258,14 @@ pub mod wire {
         }
     }
 
-    pub fn service(cosigner: Cosigner) -> Service {
+    pub fn service(policy: Policy) -> Service {
         Service(Session::new(
-            Arc::new(Mutex::new(cosigner)),
+            Arc::new(Mutex::new(policy)),
             GetServerInfoResponse { bitcoin_network: "regtest".into() },
         ))
     }
 
-    /// The client's messages, then its close; and what the cosigner said back.
+    /// The client's messages, then its close; and what the policy said back.
     struct Scripted {
         requests: VecDeque<Vec<u8>>,
         replies: Rc<RefCell<Vec<Vec<u8>>>>,
@@ -319,7 +319,7 @@ impl Recorder {
         );
     }
 
-    /// Everything the cosigner asked to have enqueued, as `(id, payload, run_at_ms, interval_ms)`.
+    /// Everything the policy asked to have enqueued, as `(id, payload, run_at_ms, interval_ms)`.
     pub fn enqueued(&self) -> Vec<(String, Vec<u8>, u64, Option<u64>)> {
         control::enqueued()
             .into_iter()

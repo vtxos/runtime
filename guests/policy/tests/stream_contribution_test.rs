@@ -1,13 +1,13 @@
-//! The half of the wallet's share the cosigner dealt, handed back on the streams that sign.
+//! The half of the wallet's share the policy dealt, handed back on the streams that sign.
 //!
 //! The wallet keeps no share between operations. Each one re-derives the wallet's own half from its
-//! passkey and adds the half the cosigner dealt it at DKG — which the runtime recomputes, and which
+//! passkey and adds the half the policy dealt it at DKG — which the runtime recomputes, and which
 //! rides the first round of `Sign`, `Send`, `Renew` and `Board`, under the approval the stream
 //! already has. These tests are about what may come back, to whom, and how often:
 //!
 //!  * to the identifier the wallet key records, and to no other;
 //!  * once per stream, on its first round;
-//!  * and never the cosigner's *own* share, which is a different scalar and leaves for nobody.
+//!  * and never the policy's *own* share, which is a different scalar and leaves for nobody.
 //!
 //! On tenants. One tenant is one instance over one store; the runtime scopes the filesystem and
 //! this component never sees another tenant's seal. There is no in-guest tenant table to test, so
@@ -15,7 +15,7 @@
 //! two stores, each asked with the other's wallet, each refusing.
 //!
 //! Driven through `route`, over real frames, because the property is about the wire. A body is
-//! written whole before the handler runs, so a test reads what the cosigner says first and cannot
+//! written whole before the handler runs, so a test reads what the policy says first and cannot
 //! answer it — the stream then ends `Cancelled`, which is what a wallet vanishing looks like.
 
 mod common;
@@ -23,7 +23,7 @@ mod common;
 use policy::status::Code;
 use policy::session::proto;
 use policy::wallet_proto as wp;
-use policy::Cosigner;
+use policy::Policy;
 
 use common::wire::{block_on, collect, request, service, Answer};
 
@@ -31,7 +31,7 @@ use common::wire::{block_on, collect, request, service, Answer};
 const ASP_XONLY: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
 struct Wallet {
-    cosigner: Cosigner,
+    policy: Policy,
     test: common::TestWallet,
 }
 
@@ -45,8 +45,8 @@ impl Wallet {
 fn wallet() -> Option<Wallet> {
     let store = common::try_store()?;
     let test = common::wallet();
-    let cosigner = common::open_holding(&store, &test);
-    Some(Wallet { cosigner: cosigner.into_inner().unwrap(), test })
+    let policy = common::open_holding(&store, &test);
+    Some(Wallet { policy: policy.into_inner().unwrap(), test })
 }
 
 fn ark_info() -> wp::ArkInfo {
@@ -194,20 +194,20 @@ fn board_open(identifier: Vec<u8>) -> proto::RenewClientMsg {
 fn open(stream: &str, w: Wallet, identifier: Vec<u8>) -> First {
     match stream {
         "Sign" => First::Sign(collect(block_on(
-            service(w.cosigner).route(request("Sign", &[sign_open(identifier)])),
+            service(w.policy).route(request("Sign", &[sign_open(identifier)])),
         ))),
         "Send" => {
             let open = send_open(&w, identifier);
             First::Send(collect(block_on(
-                service(w.cosigner).route(request("Send", &[open])),
+                service(w.policy).route(request("Send", &[open])),
             )))
         }
         "Renew" => First::Renew(collect(block_on(
-            service(w.cosigner).route(request("Renew", &[renew_open(identifier)])),
+            service(w.policy).route(request("Renew", &[renew_open(identifier)])),
         ))),
         // `Board` speaks `Renew`'s messages; only its open differs.
         "Board" => First::Renew(collect(block_on(
-            service(w.cosigner).route(request("Board", &[board_open(identifier)])),
+            service(w.policy).route(request("Board", &[board_open(identifier)])),
         ))),
         other => panic!("no such stream: {other}"),
     }
@@ -233,17 +233,17 @@ fn every_signing_stream_returns_the_dealt_share_to_the_wallets_own_identifier() 
     }
 }
 
-/// What comes back is what the cosigner DEALT, never what it HOLDS. They are different scalars, and
+/// What comes back is what the policy DEALT, never what it HOLDS. They are different scalars, and
 /// the second one signs.
 #[test]
-fn the_cosigners_own_share_never_leaves() {
+fn the_policys_own_share_never_leaves() {
     for stream in STREAMS {
         let Some(w) = wallet() else { return };
-        // The cosigner's share, as the runtime holds it.
+        // The policy's share, as the runtime holds it.
         let own = threshold::scalar::scalar_to_bytes(&w.test.key.key_package.secret_share).to_vec();
         let id = w.identifier();
         let dealt = open(stream, w, id).dealt();
-        assert_ne!(dealt, own, "{stream} returned the cosigner's own signing share");
+        assert_ne!(dealt, own, "{stream} returned the policy's own signing share");
     }
 }
 
@@ -311,8 +311,8 @@ fn a_tenant_with_no_wallet_key_cannot_sign() {
     for stream in STREAMS {
         let Some(store) = common::try_store() else { return };
         let test = common::wallet();
-        let cosigner = common::open_cosigner(&store, &test.group_key()).into_inner().unwrap();
-        let w = Wallet { cosigner, test };
+        let policy = common::open_policy(&store, &test.group_key()).into_inner().unwrap();
+        let w = Wallet { policy, test };
         let id = w.identifier();
         let first = open(stream, w, id);
         assert_eq!(first.code(), Code::FailedPrecondition as u32, "{stream}: {}", first.message());
@@ -330,7 +330,7 @@ fn a_key_path_sign_is_refused_by_name() {
         o.script_path_spend = false;
     }
     let answer = collect::<proto::SignServerMsg>(block_on(
-        service(w.cosigner).route(request("Sign", &[open])),
+        service(w.policy).route(request("Sign", &[open])),
     ));
     assert_eq!(answer.code, Code::InvalidArgument as u32, "{}", answer.message);
     assert!(answer.messages.is_empty(), "no share may go out for a round that will not run");

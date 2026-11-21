@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use enclave_wit::enclave::notify::notify;
 
-use crate::cosigner::Cosigner;
+use crate::policy::Policy;
 use crate::renew::{DelegateRenew, DelegateStream};
 use crate::sign::SigningSession;
 use crate::status::Status;
@@ -45,14 +45,14 @@ use proto::{
 const PREFIX: &str = "/cosigner.v1.Cosigner/";
 
 pub struct Session {
-    cosigner: Arc<Mutex<Cosigner>>,
+    policy: Arc<Mutex<Policy>>,
     server_info: wp::GetServerInfoResponse,
 }
 
 impl Session {
-    pub fn new(cosigner: Arc<Mutex<Cosigner>>, server_info: wp::GetServerInfoResponse) -> Self {
+    pub fn new(policy: Arc<Mutex<Policy>>, server_info: wp::GetServerInfoResponse) -> Self {
         Self {
-            cosigner,
+            policy,
             server_info,
         }
     }
@@ -75,7 +75,7 @@ impl Session {
         macro_rules! ceremony {
             ($handler:path) => {{
                 let duplex = Duplex::new(wire);
-                let outcome = $handler(Arc::clone(&self.cosigner), &duplex).await;
+                let outcome = $handler(Arc::clone(&self.policy), &duplex).await;
                 duplex.flush().await;
                 outcome
             }};
@@ -93,7 +93,7 @@ impl Session {
             "RegisterDevice" => unary(wire, register_device).await,
             "ForgetDevice" => unary(wire, forget_device).await,
             "DeviceCount" => unary(wire, device_count).await,
-            "Recover" => unary(wire, |req| lock(&self.cosigner).recover(req)).await,
+            "Recover" => unary(wire, |req| lock(&self.policy).recover(req)).await,
             other => {
                 eprintln!("{other}: no such method");
                 return Err(Status::unimplemented(format!("no such method: {other}")));
@@ -124,7 +124,7 @@ where
 
 // --- Devices -----------------------------------------------------------------------------------
 //
-// Forwarded to the runtime and not stored here. The cosigner has no push channel of its own and
+// Forwarded to the runtime and not stored here. The policy has no push channel of its own and
 // never sees a token twice; `device_count` returns a number because it is not meant to be able to
 // enumerate a tenant's devices.
 
@@ -143,13 +143,13 @@ fn device_count(_: proto::DeviceCountRequest) -> Result<proto::DeviceCountRespon
     Ok(proto::DeviceCountResponse { devices })
 }
 
-/// The cosigner, with a poisoned lock recovered rather than propagated.
+/// The policy, with a poisoned lock recovered rather than propagated.
 ///
 /// A panic mid-ceremony leaves the wallet's in-memory state as it was — its authority comes from
 /// the seal, not from this guard — and taking down every later call because one caller panicked
 /// would turn a single failed request into a dead instance.
-pub(crate) fn lock(cosigner: &Arc<Mutex<Cosigner>>) -> MutexGuard<'_, Cosigner> {
-    cosigner.lock().unwrap_or_else(|e| e.into_inner())
+pub(crate) fn lock(policy: &Arc<Mutex<Policy>>) -> MutexGuard<'_, Policy> {
+    policy.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ===============================================================================================
@@ -159,15 +159,15 @@ pub(crate) fn lock(cosigner: &Arc<Mutex<Cosigner>>) -> MutexGuard<'_, Cosigner> 
 /// One signature, as one signing session.
 ///
 /// The wallet used to commit first, in `SignOpen`. It cannot: its nonce is hedged with its share,
-/// and it holds no share until this stream's first answer brings the half the cosigner dealt it.
-/// So this is the round `Send` and `Renew` already run — the cosigner commits first, the wallet
+/// and it holds no share until this stream's first answer brings the half the policy dealt it.
+/// So this is the round `Send` and `Renew` already run — the policy commits first, the wallet
 /// answers with its commitments and its share together — over a single message.
 ///
-/// Script-path only, like every signing session: the cosigner signs untweaked and `aggregate`
+/// Script-path only, like every signing session: the policy signs untweaked and `aggregate`
 /// checks each share, so a key-path share could never have aggregated here. It is refused by name
 /// rather than left to fail as a bad share.
 async fn sign(
-    cosigner: Arc<Mutex<Cosigner>>,
+    policy: Arc<Mutex<Policy>>,
     duplex: &Duplex<SignClientMsg, SignServerMsg>,
 ) -> Result<(), Status> {
     // --- Round 1: open --------------------------------------------------------------------
@@ -182,7 +182,7 @@ async fn sign(
 
     if !open.script_path_spend {
         return Err(Status::invalid_argument(
-            "Sign is script-path only: the cosigner signs untweaked, so a key-path share cannot \
+            "Sign is script-path only: the policy signs untweaked, so a key-path share cannot \
              aggregate",
         ));
     }
@@ -194,7 +194,7 @@ async fn sign(
 
     // The wallet's half of its own share, before any nonce exists: a caller that is not this
     // wallet is refused with nothing to abandon.
-    let dealt = lock(&cosigner).dealt_share_for(&open.identifier)?;
+    let dealt = lock(&policy).dealt_share_for(&open.identifier)?;
 
     // The round is OURS, as an ordinary local. The lock is released before we wait on the client —
     // a slow client blocks nobody.
@@ -254,11 +254,11 @@ async fn sign(
 ///
 /// The unary form parked the half-built transactions on the actor between "build it" and "submit
 /// it", and called the ASP itself for both `SubmitTx` and `FinalizeTx`. Here the session is a local
-/// on this handler and the caller makes those two calls: the cosigner hands over what to send and
+/// on this handler and the caller makes those two calls: the policy hands over what to send and
 /// seals only once the ASP has accepted it, so an interrupted send leaves neither a half-signed
 /// transaction addressable by the next request nor a recorded spend that never happened.
 async fn send(
-    cosigner: Arc<Mutex<Cosigner>>,
+    policy: Arc<Mutex<Policy>>,
     duplex: &Duplex<proto::SendClientMsg, proto::SendServerMsg>,
 ) -> Result<(), Status> {
     let first = duplex.expect("it opened").await?;
@@ -272,14 +272,14 @@ async fn send(
     // The wallet's half of its own share, before anything is built — see `dealt_share_for`. It
     // rides the first sighashes and nothing after: a trailing delegate renewal reuses what the
     // wallet rebuilt.
-    let dealt = lock(&cosigner).dealt_share_for(&open.identifier)?;
+    let dealt = lock(&policy).dealt_share_for(&open.identifier)?;
 
     let info = open
         .ark_info
         .ok_or_else(|| Status::invalid_argument("SendOpen carried no ark_info"))
         .and_then(|i| crate::util::server_info(i).map_err(Status::invalid_argument))?;
 
-    // The caller names its inputs, and the cosigner validates every one against the scriptPubKey it
+    // The caller names its inputs, and the policy validates every one against the scriptPubKey it
     // derives from its own owner key before selecting — so naming a VTXO here cannot widen what the
     // wallet owns.
     let (session, change_exit_delay, sighashes) = {
@@ -288,17 +288,17 @@ async fn send(
             amount: open.amount,
             vtxos: open.vtxos.iter().cloned().map(Into::into).collect(),
         };
-        lock(&cosigner).create_send_session(step1, &info).map_err(Status::internal)?
+        lock(&policy).create_send_session(step1, &info).map_err(Status::internal)?
     };
 
-    drive_send(&cosigner, duplex, &session_id, session, change_exit_delay, sighashes, dealt).await
+    drive_send(&policy, duplex, &session_id, session, change_exit_delay, sighashes, dealt).await
 }
 
 /// A send's rounds, from its sighashes to its change recorded and an optional delegate renewal —
 /// on whichever stream carries them ([`SendStream`]). [dealt] rides the first sighashes: the wallet's dealt share when this is the
 /// stream's first reconstruction of it, empty when the wallet has already rebuilt its share.
 async fn drive_send<S: SendStream>(
-    cosigner: &Arc<Mutex<Cosigner>>,
+    policy: &Arc<Mutex<Policy>>,
     duplex: &Duplex<S::In, S>,
     session_id: &str,
     mut session: ark::client::send::SendSession,
@@ -334,7 +334,7 @@ async fn drive_send<S: SendStream>(
         .finish(signed.rounds.into_iter().map(Into::into).collect())
         .map_err(Status::invalid_argument)?;
     let (ark_tx_b64, checkpoint_txs) =
-        crate::cosigner::sign_and_prepare(&mut session, &signatures).map_err(Status::internal)?;
+        crate::policy::sign_and_prepare(&mut session, &signatures).map_err(Status::internal)?;
 
     say(2, proto::send_server_msg::Body::Submit(proto::SendSubmit {
         ark_tx_b64,
@@ -361,7 +361,7 @@ async fn drive_send<S: SendStream>(
         _ => return Err(Status::invalid_argument("expected SendFinalized")),
     }
     {
-        let mut c = lock(cosigner);
+        let mut c = lock(policy);
         c.finalise_send_session(session, change_exit_delay);
         c.seal();
     }
@@ -384,7 +384,7 @@ async fn drive_send<S: SendStream>(
                 ))
             }
         };
-        DelegateRenew::run(cosigner, duplex, request, session_id, 5, vec![]).await?;
+        DelegateRenew::run(policy, duplex, request, session_id, 5, vec![]).await?;
     }
     Ok(())
 }
@@ -418,11 +418,11 @@ impl SendStream for proto::SendServerMsg {
 
 /// Renewing the VTXOs held, with the caller driving the ASP round.
 ///
-/// The cosigner answers each relayed event with what to send the ASP next and never opens a socket
+/// The policy answers each relayed event with what to send the ASP next and never opens a socket
 /// of its own. `ark_info` arrives from the caller for the same reason: it is the one talking to the
-/// ASP. See `Cosigner::renew_begin` for why that cannot redirect funds.
+/// ASP. See `Policy::renew_begin` for why that cannot redirect funds.
 async fn renew(
-    cosigner: Arc<Mutex<Cosigner>>,
+    policy: Arc<Mutex<Policy>>,
     duplex: &Duplex<proto::RenewClientMsg, proto::RenewServerMsg>,
 ) -> Result<(), Status> {
     let first = duplex.expect("it opened").await?;
@@ -436,7 +436,7 @@ async fn renew(
     // The wallet's half of its own share — see `dealt_share_for`. Taken by the FIRST sighashes this
     // stream sends, whichever path sends them, and gone after: a renewal signs two or three rounds
     // and the wallet rebuilds its share once.
-    let mut dealt = Some(lock(&cosigner).dealt_share_for(&open.identifier)?);
+    let mut dealt = Some(lock(&policy).dealt_share_for(&open.identifier)?);
     println!("Renew: returning the dealt share to the wallet's own identifier");
 
     let wire_info = open
@@ -452,17 +452,17 @@ async fn renew(
             exit_script_pubkey: open.exit_script_pubkey,
         };
         let dealt = dealt.take().unwrap_or_default();
-        return DelegateRenew::run(&cosigner, duplex, request, &session_id, 1, dealt).await;
+        return DelegateRenew::run(&policy, duplex, request, &session_id, 1, dealt).await;
     }
     let vtxos = open.vtxos.into_iter().map(Into::into).collect();
-    let sighashes = lock(&cosigner).renew_begin(vtxos, info).map_err(Status::internal)?;
-    drive_round(&cosigner, duplex, &session_id, dealt, sighashes).await
+    let sighashes = lock(&policy).renew_begin(vtxos, info).map_err(Status::internal)?;
+    drive_round(&policy, duplex, &session_id, dealt, sighashes).await
 }
 
 /// Boarding one on-chain output into Ark: the round `renew` drives, opened with `BoardOpen` on a
 /// stream of its own.
 async fn board(
-    cosigner: Arc<Mutex<Cosigner>>,
+    policy: Arc<Mutex<Policy>>,
     duplex: &Duplex<proto::RenewClientMsg, proto::RenewServerMsg>,
 ) -> Result<(), Status> {
     let first = duplex.expect("it opened").await?;
@@ -474,7 +474,7 @@ async fn board(
     // Authenticated by the runtime at open — see `sign` above.
 
     // The wallet's half of its own share, as `renew` hands it out: with the first sighashes.
-    let dealt = lock(&cosigner).dealt_share_for(&open.identifier)?;
+    let dealt = lock(&policy).dealt_share_for(&open.identifier)?;
     println!("Board: returning the dealt share to the wallet's own identifier");
 
     let info = open
@@ -485,15 +485,15 @@ async fn board(
         .utxo
         .map(|u| (u.txid, u.vout, u.amount_sats))
         .ok_or_else(|| Status::invalid_argument("BoardOpen carried no utxo"))?;
-    let sighashes = lock(&cosigner).board_begin(utxo, &info).map_err(Status::internal)?;
-    drive_round(&cosigner, duplex, &session_id, Some(dealt), sighashes).await
+    let sighashes = lock(&policy).board_begin(utxo, &info).map_err(Status::internal)?;
+    drive_round(&policy, duplex, &session_id, Some(dealt), sighashes).await
 }
 
 /// The round `renew` and `board` share: from the first sighashes to `RenewComplete`, and the
 /// delegate's renewal the caller may ask for after it. [dealt] goes out with the first sighashes,
 /// unless the stream already spent it.
 async fn drive_round(
-    cosigner: &Arc<Mutex<Cosigner>>,
+    policy: &Arc<Mutex<Policy>>,
     duplex: &Duplex<proto::RenewClientMsg, proto::RenewServerMsg>,
     session_id: &str,
     mut dealt: Option<Vec<u8>>,
@@ -507,7 +507,7 @@ async fn drive_round(
     // The FROST round that is waiting for the wallet's half. A renewal signs twice — the intent
     // proof, and for a boarding settle the commitment transaction later — so this is set each time
     // sighashes go out and taken when the matching `Signed` comes back. Holding it here rather than
-    // on the cosigner is what keeps the nonces on this stream's stack, where a dropped stream takes
+    // on the policy is what keeps the nonces on this stream's stack, where a dropped stream takes
     // them with it.
     let mut pending_round: Option<SigningSession> = None;
 
@@ -545,7 +545,7 @@ async fn drive_round(
                     exit_delay: sub.exit_delay,
                 };
                 {
-                    let mut c = lock(cosigner);
+                    let mut c = lock(policy);
                     c.apply_boarding_settle(sub);
                     c.seal();
                 }
@@ -567,7 +567,7 @@ async fn drive_round(
                     };
                     // No share with it: the renewal's first round already carried one.
                     let next = seq + 1;
-                    DelegateRenew::run(cosigner, duplex, request, session_id, next, vec![])
+                    DelegateRenew::run(policy, duplex, request, session_id, next, vec![])
                         .await?;
                 }
                 return Ok(());
@@ -588,7 +588,7 @@ async fn drive_round(
         // connection while this stream was parked; signing rides this stream now, so nothing else
         // takes this lock mid-renewal — but holding a guard across an await is still the wrong
         // habit.
-        let mut c = lock(cosigner);
+        let mut c = lock(policy);
         step = match body {
             proto::renew_client_msg::Body::Signed(s) => {
                 let round = pending_round.take().ok_or_else(|| {

@@ -1,4 +1,4 @@
-//! Conversions between the wire types and the cosigner's own, and the projections of its records
+//! Conversions between the wire types and the policy's own, and the projections of its records
 //! onto the wire.
 
 use crate::status::Status;
@@ -34,13 +34,13 @@ impl From<crate::types::Commitment> for proto::Commitment {
     }
 }
 
-/// The identifier every commitment in a batch shares — they are all the cosigner's.
+/// The identifier every commitment in a batch shares — they are all the policy's.
 fn identifier_of(commitments: &[crate::types::Commitment]) -> String {
     commitments.first().map(|c| c.identifier_hex.clone()).unwrap_or_default()
 }
 
 impl proto::SendSighashes {
-    /// A send's sighashes with the cosigner's half of round one. Always script-path: the cosigner
+    /// A send's sighashes with the policy's half of round one. Always script-path: the policy
     /// signs untweaked, and a round on the stream cannot compensate a tweak — see `crate::sign`.
     pub(crate) fn round(messages_to_sign: Vec<Vec<u8>>, commitments: Vec<crate::types::Commitment>) -> Self {
         Self {
@@ -54,7 +54,7 @@ impl proto::SendSighashes {
 }
 
 impl proto::RenewSighashes {
-    /// A renewal's sighashes with the cosigner's half of round one — see
+    /// A renewal's sighashes with the policy's half of round one — see
     /// [`proto::SendSighashes::round`].
     pub(crate) fn round(messages_to_sign: Vec<Vec<u8>>, commitments: Vec<crate::types::Commitment>) -> Self {
         Self {

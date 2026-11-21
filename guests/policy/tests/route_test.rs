@@ -9,14 +9,14 @@ mod common;
 use policy::status::Code;
 use policy::session::proto;
 use policy::wallet_proto::{GetServerInfoRequest, GetServerInfoResponse};
-use policy::Cosigner;
+use policy::Policy;
 
 use threshold::keys::KeyPackage;
 
 use common::wire::{block_on, collect, request, service};
 
 /// A `SignOpen` from the wallet that owns [kp_user]. No commitments: the wallet has no share to
-/// hedge a nonce with until the cosigner's first answer brings the half it dealt.
+/// hedge a nonce with until the policy's first answer brings the half it dealt.
 fn sign_open(kp_user: &KeyPackage) -> proto::SignClientMsg {
     proto::SignClientMsg {
         session_id: "s1".into(),
@@ -30,12 +30,12 @@ fn sign_open(kp_user: &KeyPackage) -> proto::SignClientMsg {
     }
 }
 
-/// A cosigner whose runtime holds a wallet's key, and that wallet.
-fn seeded() -> Option<(Cosigner, common::TestWallet)> {
+/// A policy whose runtime holds a wallet's key, and that wallet.
+fn seeded() -> Option<(Policy, common::TestWallet)> {
     let store = common::try_store()?;
     let wallet = common::wallet();
-    let cosigner = common::open_holding(&store, &wallet);
-    Some((cosigner.into_inner().unwrap(), wallet))
+    let policy = common::open_holding(&store, &wallet);
+    Some((policy.into_inner().unwrap(), wallet))
 }
 
 /// A ceremony that is cut off mid-round ends as a cancellation, not as a success.
@@ -45,9 +45,9 @@ fn seeded() -> Option<(Cosigner, common::TestWallet)> {
 /// client its round completed.
 #[test]
 fn a_stream_that_ends_mid_ceremony_is_a_cancellation() {
-    let Some((cosigner, wallet)) = seeded() else { return };
+    let Some((policy, wallet)) = seeded() else { return };
     let answer = collect::<proto::SignServerMsg>(block_on(
-        service(cosigner).route(request("Sign", &[sign_open(&wallet.user)])),
+        service(policy).route(request("Sign", &[sign_open(&wallet.user)])),
     ));
     assert_eq!(answer.code, Code::Cancelled as u32, "got {}", answer.message);
     assert_eq!(answer.messages.len(), 1, "the commitments round went out before the client vanished");
@@ -57,17 +57,17 @@ fn a_stream_that_ends_mid_ceremony_is_a_cancellation() {
 /// reading only the head would otherwise see a perfectly successful call.
 #[test]
 fn an_unknown_method_is_unimplemented_in_the_trailers() {
-    let Some((cosigner, _)) = seeded() else { return };
+    let Some((policy, _)) = seeded() else { return };
     let resp = block_on(
-        service(cosigner).route(request::<GetServerInfoRequest>("Nope", &[])),
+        service(policy).route(request::<GetServerInfoRequest>("Nope", &[])),
     );
     assert_eq!(collect::<GetServerInfoResponse>(resp).code, Code::Unimplemented as u32);
 }
 
 #[test]
 fn get_server_info_answers_a_single_framed_message() {
-    let Some((cosigner, _)) = seeded() else { return };
-    let answer = collect::<GetServerInfoResponse>(block_on(service(cosigner).route(request(
+    let Some((policy, _)) = seeded() else { return };
+    let answer = collect::<GetServerInfoResponse>(block_on(service(policy).route(request(
         "GetServerInfo",
         &[GetServerInfoRequest::default()],
     ))));

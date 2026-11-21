@@ -1,6 +1,6 @@
-//! One cosigner, serving one wallet.
+//! One policy, serving one wallet.
 //!
-//! [`Cosigner`] is that wallet: its keys, its FROST ceremonies, its Ark sessions, loaded from its
+//! [`Policy`] is that wallet: its keys, its FROST ceremonies, its Ark sessions, loaded from its
 //! seal when the process opens. Tenancy is deliberately absent — the runtime this is built for
 //! hands an instance a filesystem already scoped to one client, so there is nothing here to route
 //! between — and so are outbound sockets: the ASP is driven by whoever calls, and waking a device
@@ -13,7 +13,7 @@
 pub mod asp;
 pub mod boarding;
 pub mod config;
-pub mod cosigner;
+pub mod policy;
 pub mod handlers;
 pub mod renew;
 pub mod session;
@@ -24,7 +24,7 @@ pub mod types;
 mod util;
 pub mod wire;
 
-pub use cosigner::Cosigner;
+pub use policy::Policy;
 pub use types::ArkTxEntry;
 pub use util::valid_label;
 

@@ -9,12 +9,12 @@ The vtxos policy guest: a `wasm32-wasip2` component that this repository's runti
 | [`runtime/src/signer`](../../runtime/src/signer/), [`crates/threshold`](../../crates/threshold/) | The wallet key the runtime makes and signs with for this component, and the FROST/DKG cryptography under it |
 | [`crates/ark`](../../crates/ark/) | The Ark sessions this component drives, built on Arkade's `ark-core` (which builds every transaction and computes every sighash), and arkd's protos |
 | [`crates/enclave-client`](../../crates/enclave-client/) | Attestation verification, for clients |
-| [`protocol/protos`](../../protocol/protos/) | The guest's wire (still `cosigner.v1` / `Cosigner`), which is the source of truth for every client |
+| [`protocol/protos`](../../protocol/protos/) | The guest's wire (still `cosigner.v1` / `Policy`), which is the source of truth for every client |
 | [`guests/fake-host`](../fake-host/) | A small host that runs the shipped component through a wallet's life |
 
 The wallet uses the crates and protos from this repository.
 
-The component holds no FROST secret and does not build `threshold`. The wallet key's DKG runs in the runtime, inside the passkey's registration, and the runtime keeps the cosigner's share and signs with it: the component asks for its rounds over `enclave:signer`, and its seal holds only VTXOs and the delegate. Its MuSig2 tree signing, for the delegate and for boarding, stays here, through `ark`. See [the wallet key](../../docs/CLIENT_INTEGRATION.md#the-wallet-key).
+The component holds no FROST secret and does not build `threshold`. The wallet key's DKG runs in the runtime, inside the passkey's registration, and the runtime keeps the policy's share and signs with it: the component asks for its rounds over `enclave:signer`, and its seal holds only VTXOs and the delegate. Its MuSig2 tree signing, for the delegate and for boarding, stays here, through `ark`. See [the wallet key](../../docs/CLIENT_INTEGRATION.md#the-wallet-key).
 
 ## Build and test
 
@@ -33,7 +33,7 @@ The runtime's interfaces come from [`enclave-wit`](../../wit/), a crate whose di
 
 The tests are wasm too. [`.cargo/config.toml`](.cargo/config.toml) builds them for `wasm32-wasip2` and hands each test binary to `fake-host-run`, which runs it against the fake host's runtime: the code under test calls `enclave:signer`, `enclave:tasks` and `enclave:notify` exactly as a release does. A test sets its runtime up and reads it back through `enclave:fake-host/control` (`tests/common`'s `Recorder`): the wallet key it dealt, and what was enqueued, cancelled and woken. One fake host runs a whole test binary, so each test starts it over.
 
-[`guests/fake-host/`](../fake-host/) is a small wasmtime host that also runs the component a release ships, rather than a native build of its library. It links the component the way the runtime does: WASI, outgoing `wasi:http`, and the runtime's tasks, notify, telemetry and signer, the last over a `threshold` stand-in for the runtime's wallet key. It calls the component's `enclave:rpc/service` export as the runtime does, with real streams. Each call gets a fresh instance over one tenant directory, so anything that has to survive between calls must go through the cosigner's seal.
+[`guests/fake-host/`](../fake-host/) is a small wasmtime host that also runs the component a release ships, rather than a native build of its library. It links the component the way the runtime does: WASI, outgoing `wasi:http`, and the runtime's tasks, notify, telemetry and signer, the last over a `threshold` stand-in for the runtime's wallet key. It calls the component's `enclave:rpc/service` export as the runtime does, with real streams. Each call gets a fresh instance over one tenant directory, so anything that has to survive between calls must go through the policy's seal.
 
 The fakes behave like the runtime in the ways that matter:
 
@@ -41,13 +41,13 @@ The fakes behave like the runtime in the ways that matter:
 - **The runtime's rule for background work is enforced.** Only a request may arm a task or enrol a device. A background run may only wake its owner.
 - **The ASP** is answered in process. The component's HTTP calls to it never leave the host, and every call is recorded. Any other outgoing request is denied.
 
-[`guests/fake-host/tests/flow.rs`](../fake-host/tests/flow.rs) plays the wallet over the cosigner's service:
+[`guests/fake-host/tests/flow.rs`](../fake-host/tests/flow.rs) plays the wallet over the policy's service:
 
 1. DKG, as the runtime runs it at registration, and a device enrolled.
 2. Registering, counting and forgetting devices.
 3. A signature, checked as BIP-340 under the group key.
-4. Renewing the delegate, which arms the cosigner's watch.
-5. In the background, the cosigner refreshing the funds on its own. It registers the sealed delegate's intent with the ASP, follows the batch to `Settled`, and wakes its owner.
+4. Renewing the delegate, which arms the policy's watch.
+5. In the background, the policy refreshing the funds on its own. It registers the sealed delegate's intent with the ASP, follows the batch to `Settled`, and wakes its owner.
 
 The tests also cover two failure paths. An ASP that refuses the intent leaves the owner woken with `settle-due`, and the refresh then succeeds on a later run. A background run that asks for anything more than a wake is refused.
 

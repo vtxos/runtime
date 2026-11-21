@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One VTXO this cosigner holds. `created_at`/`expires_at` come from the ASP and feed the
+/// One VTXO this policy holds. `created_at`/`expires_at` come from the ASP and feed the
 /// delegate's renewal deadline; rows lacking them deserialize to 0 — unknown expiry, treated
 /// conservatively.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +64,7 @@ pub struct SnapshotState {
 }
 
 // ===========================================================================
-// Actor method inputs. Plain-data request structs passed to the `Cosigner` signing/session
+// Actor method inputs. Plain-data request structs passed to the `Policy` signing/session
 // methods the registry calls (`sign_step1`, `send_vtxo_step1`, `generate_delegate`, …).
 // ===========================================================================
 
@@ -87,7 +87,7 @@ pub struct Commitment {
 }
 
 // ===========================================================================
-// Actor method outputs. Typed return values for the `Cosigner` methods the registry
+// Actor method outputs. Typed return values for the `Policy` methods the registry
 // calls directly. Plain in-process data — no serde needed (never crosses a boundary).
 // ===========================================================================
 

@@ -1,6 +1,6 @@
 //! What opening from the seal does when the seal is not what it should be.
 //!
-//! The cosigner's seal is the only copy of its VTXOs and its delegate. So "there is no seal" and
+//! The policy's seal is the only copy of its VTXOs and its delegate. So "there is no seal" and
 //! "there is a seal and it cannot be read" are different situations with different right answers:
 //! the first is a new wallet; the second is a read fault, and opening it as the first would forget
 //! what the seal holds.
@@ -11,9 +11,9 @@ mod common;
 fn open(
     store: std::sync::Arc<policy::store::Store>,
     group_key: String,
-) -> Result<policy::Cosigner, policy::status::Status> {
+) -> Result<policy::Policy, policy::status::Status> {
     common::Recorder::default();
-    policy::Cosigner::open(store, group_key)
+    policy::Policy::open(store, group_key)
 }
 
 /// A seal that is there and cannot be read refuses to open as an empty wallet.
@@ -23,9 +23,9 @@ fn a_present_but_unreadable_seal_refuses_to_open_as_a_fresh_wallet() {
         return;
     };
     let group_key = "wallet".to_string();
-    let cosigner = common::open_cosigner(&store, &group_key);
-    cosigner.lock().unwrap().try_seal().expect("seal");
-    drop(cosigner);
+    let policy = common::open_policy(&store, &group_key);
+    policy.lock().unwrap().try_seal().expect("seal");
+    drop(policy);
 
     // Not hex at all.
     store.put("sealed_state", &group_key, "not-hex").expect("put");

@@ -1,6 +1,6 @@
 //! A call's messages, as `async fn`s the ceremonies read like a script.
 //!
-//! The runtime ends gRPC (`enclave:rpc/service`), so what reaches the cosigner is already one
+//! The runtime ends gRPC (`enclave:rpc/service`), so what reaches the policy is already one
 //! protobuf message at a time, in order, and what it hands back is framed by the runtime. A
 //! [`Wire`] is that pair of streams. In a release it is the export's own two; in tests it is a
 //! queue, which is the only reason this is a trait.

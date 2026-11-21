@@ -1,10 +1,10 @@
-//! The 2-of-2 cooperative sign, driven the way the `Sign` stream drives it: the cosigner commits
-//! first, the wallet answers with its commitments and its share together, the cosigner aggregates.
+//! The 2-of-2 cooperative sign, driven the way the `Sign` stream drives it: the policy commits
+//! first, the wallet answers with its commitments and its share together, the policy aggregates.
 //! It is the signing session `Send` and `Renew` run, over one message — the wallet cannot commit
 //! first any more, because it holds no share until the stream's first answer brings the half the
-//! cosigner dealt it. The user/client half is simulated host-side.
+//! policy dealt it. The user/client half is simulated host-side.
 //!
-//! The cosigner's half is the runtime's, played here by `common::Recorder` over `threshold`: the
+//! The policy's half is the runtime's, played here by `common::Recorder` over `threshold`: the
 //! guest asks for a round and hands back the wallet's answer.
 //!
 //! Persistence is in-process SQLite. The ASP channel is lazy and never used on the signing path.
@@ -24,14 +24,14 @@ fn a_sign_session_verifies_under_the_group_key() {
     };
     let wallet = common::wallet();
     let message = vec![0x42u8; 32];
-    let _cosigner = common::open_holding(&store, &wallet);
+    let _policy = common::open_holding(&store, &wallet);
 
-    // Round 1. The round leaves the cosigner with the reply; nothing is parked behind it.
+    // Round 1. The round leaves the policy with the reply; nothing is parked behind it.
     let (round, theirs) =
         SigningSession::begin(std::slice::from_ref(&message)).expect("round one");
     assert_eq!(theirs.len(), 1, "one message, one commitment");
 
-    // The client's round-trip, with no lock held on the cosigner.
+    // The client's round-trip, with no lock held on the policy.
     let ours = common::wallet_answers(&wallet.user, std::slice::from_ref(&message), &theirs);
 
     // Round 2. The round goes back in by value and is consumed.
@@ -57,7 +57,7 @@ fn a_sign_session_verifies_under_the_group_key() {
 /// The property the design rests on: an abandoned ceremony leaves nothing reusable behind.
 ///
 /// A FROST nonce may be used once — signing twice under one nonce leaks the secret share. The round
-/// is a value: drop it and the nonce is gone, and a second round on the same cosigner gets fresh
+/// is a value: drop it and the nonce is gone, and a second round on the same policy gets fresh
 /// commitments.
 #[test]
 fn abandoned_ceremony_leaves_no_reusable_nonce() {
@@ -67,11 +67,11 @@ fn abandoned_ceremony_leaves_no_reusable_nonce() {
 
     let wallet = common::wallet();
     let message = vec![0x42u8; 32];
-    let _cosigner = common::open_holding(&store, &wallet);
+    let _policy = common::open_holding(&store, &wallet);
 
     // Open a round and abandon it, as an interrupted stream does.
     let (_, first) = SigningSession::begin(std::slice::from_ref(&message)).unwrap();
-    // Same cosigner, same message: a second round must not reuse the first one's nonce.
+    // Same policy, same message: a second round must not reuse the first one's nonce.
     let (_, second) = SigningSession::begin(std::slice::from_ref(&message)).unwrap();
 
     assert_ne!(first[0].hiding, second[0].hiding, "hiding commitment must not repeat");

@@ -1,9 +1,9 @@
-//! The cosigner's own connection to its ASP — for renewing funds with nobody connected.
+//! The policy's own connection to its ASP — for renewing funds with nobody connected.
 //!
 //! Everything interactive still goes through the caller: a send or a settle is driven by the app,
-//! which relays each ASP event on the stream and makes each ASP call the cosigner asks for. That
+//! which relays each ASP event on the stream and makes each ASP call the policy asks for. That
 //! works because the app is there. A **sealed delegate** exists for when it is not: the wallet has
-//! already signed the intent and the forfeits, so executing it needs only the cosigner's own key —
+//! already signed the intent and the forfeits, so executing it needs only the policy's own key —
 //! and a connection to the ASP, which is what this module is.
 //!
 //! The guest learns the address from `ASP_URL` in its environment, a setting written into the guest

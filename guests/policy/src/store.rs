@@ -1,9 +1,9 @@
-//! Where this cosigner keeps what outlives a request: a key-value store over plain files.
+//! Where this policy keeps what outlives a request: a key-value store over plain files.
 //!
 //! [`Store`] is the whole of it. It was `SharedServices`, then `Upstreams`, then a `Store` trait
 //! with one implementation behind an `Arc<dyn ...>` — shared meaning shared between tenants,
 //! upstreams meaning the ASP connection and the push channel alongside the store. There is one
-//! cosigner now and it has no sockets, so what is left is storage, and one backend needs no trait
+//! policy now and it has no sockets, so what is left is storage, and one backend needs no trait
 //! to choose between.
 //!
 //! # Why not SQLite
@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::cosigner::Cosigner;
+use crate::policy::Policy;
 
 /// Errors from the persistence layer.
 #[derive(Debug)]
@@ -276,7 +276,7 @@ pub(crate) fn now_secs() -> i64 {
 }
 
 // ===========================================================================
-// The seal: the cosigner's durable state, written whole on every mutation.
+// The seal: the policy's durable state, written whole on every mutation.
 // ===========================================================================
 
 /// The sealed-state tree: one opaque blob per group key. Identity-sealed JSON today, enclave AEAD
@@ -284,7 +284,7 @@ pub(crate) fn now_secs() -> i64 {
 const SEALED_STATE_TREE: &str = "sealed_state";
 
 pub(crate) fn seal_snapshot(
-    actor: &mut Cosigner,
+    actor: &mut Policy,
     store: &Store,
     group_key: &str,
 ) -> Result<(), String> {
@@ -299,9 +299,9 @@ pub(crate) fn seal_snapshot(
 /// keys from the sealed blob, so the caller can SKIP `InstallPolicy` (no plaintext key read).
 /// `false` when there's no stored blob (first run) or restore failed.
 /// `Ok(false)` is a wallet that has never sealed anything. `Err` is a seal that is there and
-/// cannot be read — which is not that, and must not be treated as it: see `Cosigner::open`.
+/// cannot be read — which is not that, and must not be treated as it: see `Policy::open`.
 pub(crate) fn restore_snapshot(
-    actor: &mut Cosigner,
+    actor: &mut Policy,
     store: &Store,
     group_key: &str,
 ) -> Result<bool, String> {

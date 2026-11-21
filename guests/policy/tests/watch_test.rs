@@ -1,4 +1,4 @@
-//! The settle watch: what the cosigner does in the background, with an ASP and without one.
+//! The settle watch: what the policy does in the background, with an ASP and without one.
 //!
 //! A guest reaches only the origins its image allowlists. Where that includes the ASP, a due
 //! delegate is executed in the task itself. Where it does not — as here, since these tests pass no
@@ -10,7 +10,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use ark::client::Info;
-use policy::cosigner::{Outcome, Task, CATEGORY_SETTLE_DUE, WATCH_TASK_ID};
+use policy::policy::{Outcome, Task, CATEGORY_SETTLE_DUE, WATCH_TASK_ID};
 use common::Recorder;
 use policy::renew::DelegateRenew;
 use policy::valid_label;
@@ -26,8 +26,8 @@ fn open_with(
     store: &Arc<policy::store::Store>,
     _host: Arc<Recorder>,
     group_key: &str,
-) -> policy::Cosigner {
-    policy::Cosigner::open(store.clone(), group_key.to_string())
+) -> policy::Policy {
+    policy::Policy::open(store.clone(), group_key.to_string())
         .expect("open")
 }
 
@@ -104,7 +104,7 @@ fn arming_enqueues_a_repeating_watch() {
 fn wallet(
     store: &Arc<policy::store::Store>,
     host: Arc<Recorder>,
-) -> (Arc<Mutex<policy::Cosigner>>, KeyPackage) {
+) -> (Arc<Mutex<policy::Policy>>, KeyPackage) {
     let test = common::wallet();
     host.hold(&test);
     let c = Mutex::new(open_with(store, host, &test.group_key()));
@@ -113,7 +113,7 @@ fn wallet(
 
 /// Renew the delegate over one VTXO expiring at [expires_at], answering its round as the wallet
 /// would. Renewing is what arms the watch.
-fn renew_expiring_at(c: &Arc<Mutex<policy::Cosigner>>, kp_user: &KeyPackage, expires_at: i64) {
+fn renew_expiring_at(c: &Arc<Mutex<policy::Policy>>, kp_user: &KeyPackage, expires_at: i64) {
     let request = proto::RenewDelegate {
         vtxos: vec![proto::VtxoInput {
             txid: "a".repeat(64),
@@ -180,15 +180,15 @@ fn wire_info() -> policy::wallet_proto::ArkInfo {
     }
 }
 
-/// Build a cosigner holding a real, signed delegate — the state the watch exists to watch.
+/// Build a policy holding a real, signed delegate — the state the watch exists to watch.
 fn with_delegate(
     store: &Arc<policy::store::Store>,
     host: Arc<Recorder>,
-) -> Option<(policy::Cosigner, String)> {
+) -> Option<(policy::Policy, String)> {
     let test = common::wallet();
     let group_key = test.group_key();
     host.hold(&test);
-    let mut c = policy::Cosigner::open(store.clone(), group_key.clone())
+    let mut c = policy::Policy::open(store.clone(), group_key.clone())
         .expect("open");
     c.accept_vtxos(
         vec![VtxoInput {
@@ -201,7 +201,7 @@ fn with_delegate(
         &ark_info(),
     )
     .expect("accept vtxos");
-    // Transport-free: the delegate is built from the cosigner's own key and the caller's ArkInfo.
+    // Transport-free: the delegate is built from the policy's own key and the caller's ArkInfo.
     match c.generate_delegate(&ark_info(), false) {
         Ok(_) => Some((c, group_key)),
         Err(e) => {
@@ -310,7 +310,7 @@ impl policy::asp::AspApi for ScriptedAsp {
 
 /// The guest's `run-task`, with no ASP to run a delegate against — so a due delegate wakes the
 /// owner instead.
-fn run_task(c: &mut policy::Cosigner, task_id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+fn run_task(c: &mut policy::Policy, task_id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
     block_on(c.run_task_with::<policy::asp::NoAsp>(task_id, payload, None))
 }
 
@@ -450,7 +450,7 @@ fn renewing_without_a_known_expiry_is_refused() {
 
 /// Renewing the delegate re-arms the watch for its own deadline. The runtime refuses an id reused
 /// with different input, so the old watch is cancelled and forgotten first — without that, the
-/// second renewal a wallet ever made failed, and the first time the cosigner refreshed funds
+/// second renewal a wallet ever made failed, and the first time the policy refreshed funds
 /// itself, the wallet could never protect them again.
 #[test]
 fn arming_again_for_a_new_deadline_replaces_the_watch() {

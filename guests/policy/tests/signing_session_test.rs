@@ -76,28 +76,28 @@ fn bip340_ok(pkp: &PublicKeyPackage, message: &[u8], signature: &[u8]) -> bool {
     secp.verify_schnorr(&sig, &Message::from_digest(digest), &key).is_ok()
 }
 
-/// A cosigner whose runtime holds a wallet's key, the wallet's key package (alone, at index 0),
+/// A policy whose runtime holds a wallet's key, the wallet's key package (alone, at index 0),
 /// and the group's public package.
-fn seeded() -> Option<(policy::Cosigner, Vec<KeyPackage>, PublicKeyPackage)> {
+fn seeded() -> Option<(policy::Policy, Vec<KeyPackage>, PublicKeyPackage)> {
     let store = common::try_store()?;
     let wallet = common::wallet();
-    let cosigner = common::open_holding(&store, &wallet);
+    let policy = common::open_holding(&store, &wallet);
     let pkp = wallet.key.public_key_package.clone();
-    Some((cosigner.into_inner().unwrap(), vec![wallet.user], pkp))
+    Some((policy.into_inner().unwrap(), vec![wallet.user], pkp))
 }
 
-/// Round one over [messages], through the runtime [cosigner] runs inside.
-fn begin(_cosigner: &policy::Cosigner, messages: &[Vec<u8>]) -> (SigningSession, Vec<Commitment>) {
+/// Round one over [messages], through the runtime [policy] runs inside.
+fn begin(_policy: &policy::Policy, messages: &[Vec<u8>]) -> (SigningSession, Vec<Commitment>) {
     SigningSession::begin(messages).expect("round one")
 }
 
 /// Three sighashes, one round trip, three signatures the chain would accept.
 #[test]
 fn a_batch_signs_in_one_round_trip() {
-    let Some((cosigner, kps, pkp)) = seeded() else { return };
+    let Some((policy, kps, pkp)) = seeded() else { return };
     let messages: Vec<Vec<u8>> = (0u8..3).map(|i| vec![0x40 + i; 32]).collect();
 
-    let (round, theirs) = begin(&cosigner, &messages);
+    let (round, theirs) = begin(&policy, &messages);
     assert_eq!(theirs.len(), 3, "one commitment per message");
 
     let ours = wallet_answers(&kps[0], &messages, &theirs);
@@ -117,10 +117,10 @@ fn a_batch_signs_in_one_round_trip() {
 /// what proves the order the wallet answers in actually carries meaning.
 #[test]
 fn each_signature_belongs_to_its_own_message() {
-    let Some((cosigner, kps, pkp)) = seeded() else { return };
+    let Some((policy, kps, pkp)) = seeded() else { return };
     let messages: Vec<Vec<u8>> = vec![vec![0x11; 32], vec![0x22; 32]];
 
-    let (round, theirs) = begin(&cosigner, &messages);
+    let (round, theirs) = begin(&policy, &messages);
     let signatures = round
         .finish(wallet_answers(&kps[0], &messages, &theirs))
         .expect("finish");
@@ -134,10 +134,10 @@ fn each_signature_belongs_to_its_own_message() {
 /// Before, a bad share surfaced as the ASP rejecting a transaction with nothing useful to say.
 #[test]
 fn a_bad_share_is_refused_and_named() {
-    let Some((cosigner, kps, _)) = seeded() else { return };
+    let Some((policy, kps, _)) = seeded() else { return };
     let messages: Vec<Vec<u8>> = vec![vec![0x33; 32], vec![0x44; 32]];
 
-    let (round, theirs) = begin(&cosigner, &messages);
+    let (round, theirs) = begin(&policy, &messages);
     // Answer message 1 with a share computed over message 0's bytes.
     let mut ours = wallet_answers(&kps[0], &messages, &theirs);
     let wrong = wallet_answers(&kps[0], &[messages[0].clone()], &theirs[1..2]);
@@ -156,10 +156,10 @@ fn a_bad_share_is_refused_and_named() {
 /// One answer short is refused outright, rather than signing every message against its neighbour.
 #[test]
 fn a_short_batch_is_refused() {
-    let Some((cosigner, kps, _)) = seeded() else { return };
+    let Some((policy, kps, _)) = seeded() else { return };
     let messages: Vec<Vec<u8>> = vec![vec![0x55; 32], vec![0x66; 32]];
 
-    let (round, theirs) = begin(&cosigner, &messages);
+    let (round, theirs) = begin(&policy, &messages);
     let mut ours = wallet_answers(&kps[0], &messages, &theirs);
     ours.pop();
 
@@ -172,12 +172,12 @@ fn a_short_batch_is_refused() {
 /// the key.
 #[test]
 fn nonces_are_fresh_every_round() {
-    let Some((cosigner, kps, pkp)) = seeded() else { return };
+    let Some((policy, kps, pkp)) = seeded() else { return };
     let messages: Vec<Vec<u8>> = vec![vec![0x77; 32]];
 
-    let (round_a, theirs_a) = begin(&cosigner, &messages);
-    let (round_b, theirs_b) = begin(&cosigner, &messages);
-    assert_ne!(theirs_a[0].hiding, theirs_b[0].hiding, "the cosigner's nonce must not repeat");
+    let (round_a, theirs_a) = begin(&policy, &messages);
+    let (round_b, theirs_b) = begin(&policy, &messages);
+    assert_ne!(theirs_a[0].hiding, theirs_b[0].hiding, "the policy's nonce must not repeat");
 
     let a = round_a
         .finish(wallet_answers(&kps[0], &messages, &theirs_a))

@@ -3,17 +3,17 @@
 //! `crate::boarding`.
 //!
 //! **Signing a delegate.** At the end of a send or a renewal — on the same stream, under the same
-//! approval — the wallet tells the cosigner what it now holds, the cosigner builds an intent to
+//! approval — the wallet tells the policy what it now holds, the policy builds an intent to
 //! refresh all of it (valid from the earliest expiry less the safety margin) and the forfeits it
 //! will need (`ALL|ANYONECANPAY`, so the round's connector can be added later), and the wallet
 //! FROST-signs them. That signed delegate is sealed, and the settle watch is armed for the moment
-//! it becomes valid — see `Cosigner::run_task_with` for what runs it. `RenewOpen.delegate_only`
+//! it becomes valid — see `Policy::run_task_with` for what runs it. `RenewOpen.delegate_only`
 //! does the same on its own, for funds that arrived by a receive.
 //!
-//! **Running a round.** What the cosigner contributes to an ASP round is signatures: the intent
+//! **Running a round.** What the policy contributes to an ASP round is signatures: the intent
 //! proof, the MuSig2 tree nonces and signatures, the forfeit transactions. Every step that produces
 //! those is synchronous and transport-free, so the loop inverts: the caller relays each event and
-//! the cosigner answers with what to send the ASP next. The watch drives a due delegate the same
+//! the policy answers with what to send the ASP next. The watch drives a due delegate the same
 //! way, with its own ASP connection standing in for the caller.
 
 use std::sync::{Arc, Mutex};
@@ -24,8 +24,8 @@ use ark::client::{exit_delay_value, Info};
 use ark::exit::{self, ExitInput, ExitSpend};
 
 use crate::boarding::BoardingSettleSession;
-use crate::cosigner::{
-    Cosigner, Task, CATEGORY_SETTLE_DUE, WATCH_INTERVAL_MS, WATCH_TASK_ID,
+use crate::policy::{
+    Policy, Task, CATEGORY_SETTLE_DUE, WATCH_INTERVAL_MS, WATCH_TASK_ID,
 };
 use crate::status::Status;
 use crate::util::valid_label;
@@ -34,7 +34,7 @@ use enclave_wit::enclave::tasks::queue;
 use crate::session::{enrol_device, lock, proto};
 use crate::types::{BoardingSettleSubmitted, VtxoInput};
 
-/// One ASP call the caller must make on the cosigner's behalf.
+/// One ASP call the caller must make on the policy's behalf.
 pub enum AspCall {
     ConfirmRegistration {
         intent_id: String,
@@ -73,11 +73,11 @@ pub enum RenewStep {
     Complete(BoardingSettleSubmitted),
 }
 
-impl Cosigner {
+impl Policy {
     /// Open a renewal and hand back the sighashes the caller must FROST-sign.
     ///
     /// `info` comes from the caller because the caller is the one talking to the ASP. It cannot
-    /// redirect funds with it: every output is still derived from the cosigner's own key, so a
+    /// redirect funds with it: every output is still derived from the policy's own key, so a
     /// wrong `signer_pubkey` yields a transaction the ASP rejects rather than one that pays
     /// somebody else.
     pub fn renew_begin(
@@ -354,7 +354,7 @@ pub(crate) trait DelegateStream: prost::Message + Sized {
     fn renewed(session_id: &str, seq: u64, renewed: proto::DelegateRenewed) -> Self;
 }
 
-/// What the delegate's round signs: the delegate's messages, then the exits', and this cosigner's
+/// What the delegate's round signs: the delegate's messages, then the exits', and this policy's
 /// commitments for all of them.
 pub struct ToSign {
     pub delegate: Vec<Vec<u8>>,
@@ -373,7 +373,7 @@ impl DelegateRenew {
     /// Renew the delegate [request] asks for, on [duplex]: the round's sighashes at [seq], the
     /// wallet's signatures in, and the renewed delegate at `seq + 1`.
     pub(crate) async fn run<S: DelegateStream>(
-        cosigner: &Arc<Mutex<Cosigner>>,
+        policy: &Arc<Mutex<Policy>>,
         duplex: &Duplex<S::In, S>,
         mut request: proto::RenewDelegate,
         session_id: &str,
@@ -381,11 +381,11 @@ impl DelegateRenew {
         wallet_dealt_share: Vec<u8>,
     ) -> Result<(), Status> {
         let device_token = std::mem::take(&mut request.device_token);
-        let (renew, to_sign) = Self::build(cosigner, request)?;
+        let (renew, to_sign) = Self::build(policy, request)?;
         duplex.send(S::sighashes(session_id, seq, to_sign, wallet_dealt_share));
         let rounds = S::signed(duplex.next_body("the delegate's signatures").await?)
             .ok_or_else(|| Status::invalid_argument("expected the delegate's signatures"))?;
-        let renewed = renew.finalise(cosigner, rounds, &device_token)?;
+        let renewed = renew.finalise(policy, rounds, &device_token)?;
         duplex.send(S::renewed(session_id, seq + 1, renewed));
         Ok(())
     }
@@ -394,14 +394,14 @@ impl DelegateRenew {
     /// the round that signs it. Refused when no expiry is known: a delegate valid "now" would be a
     /// refresh the owner did not ask for, and one valid never would renew nothing.
     pub fn build(
-        cosigner: &Arc<Mutex<Cosigner>>,
+        policy: &Arc<Mutex<Policy>>,
         request: proto::RenewDelegate,
     ) -> Result<(Self, ToSign), Status> {
         let info = request
             .ark_info
             .ok_or_else(|| Status::invalid_argument("RenewDelegate carried no ark_info"))
             .and_then(|i| crate::util::server_info(i).map_err(Status::invalid_argument))?;
-        let mut c = lock(cosigner);
+        let mut c = lock(policy);
         c.accept_vtxos(request.vtxos.into_iter().map(Into::into).collect(), &info)
             .map_err(Status::failed_precondition)?;
         if c.vtxos.is_empty() {
@@ -419,7 +419,7 @@ impl DelegateRenew {
 
         // One exit transaction per held VTXO, paying `exit_script_pubkey`.
         //
-        // Built here rather than by the wallet because signing something this cosigner did not
+        // Built here rather than by the wallet because signing something this policy did not
         // build would make it a signing oracle. The wallet builds the same transactions from the
         // same inputs and refuses the round unless the sighashes match, so neither side has to
         // trust the other's arithmetic.
@@ -466,12 +466,12 @@ impl DelegateRenew {
     /// wakes that watch sends, when the request carried one.
     pub fn finalise(
         self,
-        cosigner: &Arc<Mutex<Cosigner>>,
+        policy: &Arc<Mutex<Policy>>,
         rounds: Vec<proto::WalletRound>,
         device_token: &str,
     ) -> Result<proto::DelegateRenewed, Status> {
         let device_enrolled = enrol_device(device_token);
-        let mut c = lock(cosigner);
+        let mut c = lock(policy);
         // A bad share is the caller's fault, and is reported as such.
         let signatures = self
             .signing

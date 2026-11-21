@@ -53,10 +53,10 @@ fn a_boarded_vtxo_is_visible_to_a_send() {
         return;
     };
     let wallet = common::wallet();
-    let cosigner = common::open_holding(&store, &wallet);
+    let policy = common::open_holding(&store, &wallet);
 
     {
-        let mut c = cosigner.lock().unwrap();
+        let mut c = policy.lock().unwrap();
         assert!(c.vtxos().is_empty(), "a fresh wallet owns nothing");
         c.apply_boarding_settle(boarded("aa", 50_000, 144));
 
@@ -83,8 +83,8 @@ fn the_owned_set_survives_a_reopen() {
     let group_key = wallet.group_key();
 
     {
-        let cosigner = common::open_holding(&store, &wallet);
-        let mut c = cosigner.lock().unwrap();
+        let policy = common::open_holding(&store, &wallet);
+        let mut c = policy.lock().unwrap();
         c.apply_boarding_settle(boarded("bb", 25_000, 144));
         c.seal();
     }
@@ -98,9 +98,9 @@ fn the_owned_set_survives_a_reopen() {
     let _ = store.delete("sealed_state", &group_key);
 }
 
-/// The caller supplies the set; the cosigner decides what of it this wallet could own.
+/// The caller supplies the set; the policy decides what of it this wallet could own.
 ///
-/// Every spendable VTXO sits under a script derived from the cosigner's own owner key and one of
+/// Every spendable VTXO sits under a script derived from the policy's own owner key and one of
 /// the ASP's two exit delays. A delay outside that pair names a script this wallet does not
 /// control, so asserting it must not widen what the wallet will spend.
 #[test]
@@ -109,8 +109,8 @@ fn a_caller_cannot_widen_what_it_owns() {
         return;
     };
     let wallet = common::wallet();
-    let cosigner = common::open_holding(&store, &wallet);
-    let mut c = cosigner.lock().unwrap();
+    let policy = common::open_holding(&store, &wallet);
+    let mut c = policy.lock().unwrap();
 
     // Both of the wallet's own delays are accepted — a mixed set is the normal case.
     c.accept_vtxos(
