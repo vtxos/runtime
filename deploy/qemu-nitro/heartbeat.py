@@ -14,9 +14,9 @@ script, listening on the host's own AF_VSOCK. It cannot be a Unix socket:
 `vhost-device-vsock`'s `uds-path` backend only accepts packets addressed to the
 host CID (2), and the enclave dials **CID 3**, the Nitro parent convention. It
 drops the rest with `dropping packet for unknown cid: 3`. So the backend runs
-with `forward-cid=1` instead, which turns the guest's connection into a real
-host vsock connection to the loopback CID — and that needs `vsock_loopback`
-loaded on the host.
+with `forward-cid` instead (vsock-cid.py finds which), which turns the guest's
+connection into a real vsock connection on the host, to itself — and that needs
+`vsock_loopback` loaded on the host.
 
 Usage: heartbeat.py <port>
 """

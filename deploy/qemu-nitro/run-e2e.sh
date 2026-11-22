@@ -12,7 +12,7 @@
 #   nbd-stub.py vsock:10809 ◀── NBD over vsock ── the ZFS pool, on dm-crypt
 #   gvproxy --listen vsock://:1024 ────────────▶ gvforwarder → tap0 .2
 #           expose :8443 → 192.168.127.2:443 ──▶ rustls :443
-#   vhost-device-vsock --forward-cid 1
+#   vhost-device-vsock --forward-cid <this machine's>
 #   heartbeat.py :9000  ───────────────────────▶ init's boot heartbeat
 #   nitro-attest ──────────────────────────────▶ x-enclave-attestation
 #
