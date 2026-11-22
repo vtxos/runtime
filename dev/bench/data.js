@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795300093576,
+  "lastUpdate": 1795337981167,
   "repoUrl": "https://github.com/vtxos/runtime",
   "entries": {
     "Benchmark": [
@@ -449,6 +449,48 @@ window.BENCHMARK_DATA = {
             "name": "guest/dispatch/committing",
             "value": 621114,
             "range": "± 19093",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "joshuaaruokhaitech@gmail.com",
+            "name": "Aruokhai Joshua",
+            "username": "aruokhai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3f0df455feb18ad58990eb57da1914fa2e1062fc",
+          "message": "Merge pull request #12 from vtxos/fix/vsock-own-cid\n\nfix(qemu): the enclave reaches gvproxy through a listener that binds every CID",
+          "timestamp": "2026-11-22T10:53:37+02:00",
+          "tree_id": "0112fccb529b264c28a4e06480daa26bea3f55d0",
+          "url": "https://github.com/vtxos/runtime/commit/3f0df455feb18ad58990eb57da1914fa2e1062fc"
+        },
+        "date": 1795337980566,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "guest/instantiate",
+            "value": 24501,
+            "range": "± 1837",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/trivial",
+            "value": 169349,
+            "range": "± 14733",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/committing",
+            "value": 1539914,
+            "range": "± 1319742",
             "unit": "ns/iter"
           }
         ]
