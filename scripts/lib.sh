@@ -52,10 +52,9 @@ prepare_enclave_host() {
         sudo udevadm trigger --name-match=kvm
     fi
 
-    # The harness forwards the enclave's vsock connections to this machine's own
-    # listeners, which needs the loopback transport. Asked of the module and not
-    # of /dev/vsock: a VM with a vsock device of its own has /dev/vsock without it.
-    if [[ ! -d /sys/module/vsock_loopback ]]; then
+    # The harness forwards the enclave's vsock connections to host loopback,
+    # which needs the loopback transport present.
+    if [[ ! -e /dev/vsock ]]; then
         say "loading vsock_loopback"
         sudo modprobe vsock_loopback || fail "could not load vsock_loopback"
     fi
