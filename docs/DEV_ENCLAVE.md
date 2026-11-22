@@ -239,7 +239,7 @@ so does deleting it by hand while the enclave is down.
 | | |
 |---|---|
 | `no /dev/vsock` | `sudo modprobe vsock_loopback` |
-| `this machine does not reach its own vsock port` | the same: a VM with a vsock device has `/dev/vsock` without the loopback |
+| `this machine does not reach its own vsock port` | the same: `/dev/vsock` can be there without the loopback transport |
 | `no /dev/kvm` | the `nitro-enclave` machine needs KVM; it will not run in a VM without nested virtualisation |
 | `missing QEMU image` | `docker build -t enclave-qemu-nitro:latest deploy/qemu-nitro` |
 | `... is not tracked by git` | Nix flakes copy only tracked files; `git add deploy/qemu-nitro/` |

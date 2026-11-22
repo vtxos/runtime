@@ -4,10 +4,9 @@
 `vhost-device-vsock --forward-cid N` sends the enclave's connections to CID N on this machine.
 The listeners here are of two kinds. heartbeat.py, nbd-stub.py and test-hooks.py bind every
 CID. gvproxy binds the one the kernel reports as this machine's own, and only a connection to
-that CID finds it:
-
-- the loopback's, 1, when no other vsock transport is loaded: a workstation, a GitHub runner;
-- the machine's own, when it is a VM with a vsock device, or 2 when it hosts vsock guests.
+that CID finds it. Which CID that is depends on the vsock transports the kernel has: the
+loopback's, 1, on a workstation and on GitHub's Ubuntu 24.04 runner; another where the machine
+is itself a VM with a vsock device, or hosts vsock guests.
 
 So the answer is asked for, not assumed: the kernel's CID first, then 1, and the first one a
 connection to the port succeeds on. Run it once gvproxy is listening.
