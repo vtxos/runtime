@@ -10,7 +10,7 @@
 #   ────                                        ────────────
 #   MinIO :9000 ◀── gvproxy ──192.168.127.254──  anchors, boot records, the guest
 #   nbd-stub.py vsock:10809 ◀── NBD over vsock ── the ZFS pool, on dm-crypt
-#   gvproxy --listen vsock://:1024 ────────────▶ gvforwarder → tap0 .2
+#   gvproxy ◀── vsock-relay.py vsock:1024 ─────▶ gvforwarder → tap0 .2
 #           expose :8443 → 192.168.127.2:443 ──▶ rustls :443
 #   vhost-device-vsock --forward-cid 1
 #   heartbeat.py :9000  ───────────────────────▶ init's boot heartbeat
@@ -522,14 +522,27 @@ stack:
 EOF
     "$GV_DIR/bin/gvproxy" \
         --config "$RUNDIR/gvproxy.yml" \
-        --listen "vsock://:1024" \
         --listen "unix://$RUNDIR/network.sock" \
         > "$RUNDIR/gvproxy.log" 2>&1 &
     pids+=($!)
     for _ in $(seq 50); do [[ -S "$RUNDIR/network.sock" ]] && break; sleep 0.1; done
     [[ -S "$RUNDIR/network.sock" ]] \
         || { echo "gvproxy never opened its API socket:" >&2; cat "$RUNDIR/gvproxy.log" >&2; exit 1; }
-    echo "gvproxy listening on host vsock port 1024"
+
+    # The enclave reaches gvproxy on vsock port 1024. Not gvproxy's own vsock listener: that
+    # binds one CID, the kernel's choice, and the enclave's connections arrive on the loopback's.
+    # vsock-relay.py binds every CID and hands each connection to the socket above.
+    python3 "$REPO/deploy/qemu-nitro/vsock-relay.py" 1024 "$RUNDIR/network.sock" \
+        > "$RUNDIR/vsock-relay.log" 2>&1 &
+    pids+=($!)
+    for _ in $(seq 50); do
+        grep -q listening "$RUNDIR/vsock-relay.log" && break
+        kill -0 "${pids[-1]}" 2>/dev/null || break
+        sleep 0.1
+    done
+    grep -q listening "$RUNDIR/vsock-relay.log" \
+        || { echo "nothing is listening on vsock port 1024:" >&2; cat "$RUNDIR/vsock-relay.log" >&2; exit 1; }
+    echo "gvproxy reached on host vsock port 1024"
 }
 
 # Before the enclave boots, so the first client to try finds the forward there.
@@ -584,6 +597,7 @@ fail() {
     echo "FAIL: $*" >&2
     echo "--- console (last 40) ---" >&2; plain | tail -40 >&2
     echo "--- gvproxy ---" >&2;          tail -10 "$RUNDIR/gvproxy.log" >&2
+    echo "--- vsock relay ---" >&2;      tail -10 "$RUNDIR/vsock-relay.log" >&2
     echo "--- heartbeat ---" >&2;        cat "$RUNDIR/heartbeat.log" >&2
     exit 1
 }

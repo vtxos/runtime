@@ -10,7 +10,7 @@
 #   ────                                        ────────────
 #   MinIO :9000 ◀── gvproxy ──192.168.127.254──  anchors, the registry, the guest
 #   nbd-stub.py vsock:10809 ◀── NBD over vsock ── the ZFS pool, on dm-crypt
-#   gvproxy --listen vsock://:1024 ────────────▶ gvforwarder → tap0 .2
+#   gvproxy ◀── vsock-relay.py vsock:1024 ─────▶ gvforwarder → tap0 .2
 #           expose :8443 → 192.168.127.2:443 ──▶ rustls :443
 #   vhost-device-vsock --forward-cid 1
 #   heartbeat.py :9000  ───────────────────────▶ init's boot heartbeat
