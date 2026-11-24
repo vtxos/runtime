@@ -59,8 +59,8 @@ One setting. Empty means off.
 Requests go to `pinpoint.<region>.amazonaws.com` in the runtime's region, signed
 (SigV4, service `mobiletargeting`) at the trusted clock's time as the instance's
 role. The role comes from the metadata service and nowhere else: the image names
-`http://192.168.127.253` as its address, which gvproxy maps for the runtime alone
-(`deploy/ami/units/gvproxy.yml`), and no guest can reach it.
+`http://192.168.127.253` as its address, which the parent's gvproxy maps for the
+runtime alone, and no guest can reach it.
 
 At boot the runtime reads the application's FCM channel. One that is disabled,
 holds no Firebase service account, or would authenticate with the legacy server
@@ -71,10 +71,10 @@ Notifications require authentication and tenant isolation, for the same reason
 background tasks do: the tenant a wake belongs to comes from a verified
 sign-in, and without a gate there is none.
 
-In the Nix deployment set `pushAppId` in `deploy/nix/deployment.nix`, and
-`push_app_id` in `deploy/tofu`, which lets the parent's role send through that
-one application. Set the channel up once, from the CLI — it keeps the service
-account out of tofu state:
+In the deployment's file set `pushAppId`, and give the parent's role
+permission to send through that one application and read its channel. Set the
+channel up once, from the CLI — it keeps the service account out of any
+infrastructure state:
 
 ```sh
 aws pinpoint create-app --create-application-request Name=wakes
@@ -187,7 +187,7 @@ path is unverified against the real service** — its response shapes are from
 the API model, not from a live answer, and the dead-token status under token
 authentication is undocumented — the same honesty `cloudwatch` applies
 to its own credential path. What is exercised end to end is leg `6b/8` of
-[`deploy/qemu-nitro/run-e2e.sh`](../deploy/qemu-nitro/run-e2e.sh), where a
+[`tests/qemu/run-e2e.sh`](../tests/qemu/run-e2e.sh), where a
 finished background task wakes an enrolled device inside an emulated enclave and
 a stub records that the request was signed for the service, carried only
 `RawContent`, and that the message carried no content.

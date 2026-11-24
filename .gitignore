@@ -12,11 +12,6 @@ Cargo.lock.bak
 .DS_Store
 /wasm-cache/
 
-# OpenTofu/Terraform working directory: vendored provider binaries, hundreds of
-# MB, re-fetched by `tofu init`. The lock file IS committed — it pins provider
-# versions and belongs under review.
-deploy/tofu/.terraform/
-
 # Run artifacts that scripts/ci-bench.sh and scripts/ci-sqlite.sh drop in the
 # repository root. `bench.txt` exists only long enough for the benchmark tracker
 # to read it, and `runtime.log` is the SQLite job's server output; both are

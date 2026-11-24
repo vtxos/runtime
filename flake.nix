@@ -7,9 +7,9 @@
   # this replaces ran `apt-get update` on `debian:bookworm-slim`, so it produced
   # a different PCR0 every week and attested to nothing reproducible.
   #
-  # Only the *enclave* is built here. The parent instance is built with Packer,
-  # because the parent is the party the enclave excludes — nothing it contains
-  # is attested, so reproducing it buys no security property.
+  # Only the *enclave* is built here. The parent instance is not: it is the
+  # party the enclave excludes, so nothing it contains is attested, and
+  # reproducing it buys no security property.
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -201,8 +201,8 @@
         # a workaround: eif_build is the tool that *computes PCR0*, and letting
         # its dependency set float would mean the measurement was produced by
         # something slightly different each time.
-        postPatch = "cp ${./deploy/nix/eif_build-Cargo.lock} Cargo.lock";
-        cargoLock.lockFile = ./deploy/nix/eif_build-Cargo.lock;
+        postPatch = "cp ${./nix/eif_build-Cargo.lock} Cargo.lock";
+        cargoLock.lockFile = ./nix/eif_build-Cargo.lock;
         cargoBuildFlags = [ "-p" "eif_build" ];
         doCheck = false;
 
@@ -264,10 +264,10 @@
       # all resolve, and needs no hand-written replacement.
       busybox = pkgs.pkgsStatic.busybox;
 
-      # Which store the production image belongs to. Baked in, so PCR0 covers
-      # it — see deploy/nix/deployment.nix for why that has to be true. A
-      # deployment kept elsewhere builds its image with `lib.mkEif`.
-      deployment = import ./deploy/nix/deployment.nix;
+      # The deployment the e2e boots, in the shape a real deployment's file has
+      # (tests/qemu/deployment.nix). A real deployment keeps its own,
+      # with its infrastructure, and builds its image with `lib.mkEif`.
+      e2eDeployment = import ./tests/qemu/deployment.nix;
 
       # What both the production and emulator images are made of. Only the
       # environment differs between them.
@@ -332,27 +332,18 @@
           # never reaches a guest either.
           AWS_EC2_METADATA_SERVICE_ENDPOINT = "http://192.168.127.253";
 
-          # The store this image is for. Attested, because a receipt only
-          # means "no pool here" if the host cannot choose "here".
-          ENCLAVE_ROOTS_BUCKET = deployment.rootsBucket;
-          ENCLAVE_BUCKET_PREFIX = deployment.bucketPrefix;
+          # The deployment's name, which names every AWS resource it uses, by
+          # one rule its infrastructure follows: the `<name>-roots` bucket, each
+          # release's KMS key under `alias/<name>/`, its sealed master secret
+          # and the operator's master under `/<name>/` in SSM, the log group,
+          # the metrics namespace and the task resources. Attested, so the host
+          # cannot point the image at another store or another key.
+          ENCLAVE_NAME = deployment.name;
+          ENCLAVE_BUCKET_PREFIX = deployment.bucketPrefix or "";
           ENCLAVE_ID = deployment.fsId;
           AWS_REGION = deployment.region;
-
-          # Each release's master secret is minted by KMS inside the enclave
-          # and released only against an attestation whose PCR0 and PCR16
-          # match its key's policy. A release finds its key under this alias
-          # prefix, as `<prefix>/<sha256(pcr0 ‖ pcr16)>`, and its ciphertext
-          # under the parameter base the same way. They come from the
-          # deployment, since they name resources this repository does not own.
-          ENCLAVE_KMS_KEY_ALIAS = deployment.kmsKeyAlias;
-          ENCLAVE_MASTER_KEY_PARAMETER = deployment.masterKeyParameter;
-          # What each wallet key's runtime half is derived from and its share
-          # sealed under, written by the operator after boot and read on the
-          # first registration or sign-in. Setting it is what turns
-          # authentication on: every request that could reach the guest then
-          # needs a fresh approval signed with its tenant's wallet share.
-          ENCLAVE_OPERATOR_MASTER_PARAMETER = deployment.operatorMasterParameter;
+          # Which the task queue's URL and the scheduler role's ARN carry.
+          ENCLAVE_ACCOUNT_ID = deployment.accountId or "";
 
           # This runtime release's number, written into every anchor. Bump it
           # with every release, and never reuse one.
@@ -362,30 +353,25 @@
           # and how long the roots bucket outlives the deployment.
           ENCLAVE_ROOT_RETENTION_SECS = toString deployment.rootRetentionSecs;
 
-          # Guest stdout and stderr go to CloudWatch as well as the console.
-          # The enclave calls PutLogEvents itself, over the same path it uses
-          # for S3 and KMS, so TLS terminates inside and the parent carries
-          # ciphertext. The group and its `guest` stream are created by
-          # Terraform; this runtime holds `logs:PutLogEvents` and cannot make
-          # them.
-          ENCLAVE_GUEST_LOG_GROUP = deployment.guestLogGroup;
+          # Guest stdout and stderr to CloudWatch as well as the console, in
+          # the `/<name>/guest` group. The enclave calls PutLogEvents itself,
+          # over the same path it uses for S3 and KMS, so TLS terminates inside
+          # and the parent carries ciphertext. The group and its `guest` stream
+          # are created by the deployment; this runtime holds `logs:PutLogEvents`
+          # and cannot make them.
+          ENCLAVE_GUEST_LOGS = lib.boolToString (deployment.guestLogs or false);
 
           # Guest telemetry (wit/telemetry). With `xray`, each guest invocation
-          # goes to X-Ray as one trace, attributed to its tenant; with a
-          # `metricsNamespace`, guest metrics go to CloudWatch under it through
-          # PutMetricData. Called from inside, like the log group, so each needs
-          # its IAM grant (deploy/tofu `telemetry`). Defaulted, so a
-          # deployment.nix written before telemetry still builds, with it off.
+          # goes to X-Ray as one trace, attributed to its tenant; with
+          # `metrics`, guest metrics go to CloudWatch under the `<name>`
+          # namespace through PutMetricData. Called from inside, like the log
+          # group, so each needs its IAM grant.
           ENCLAVE_XRAY = lib.boolToString (deployment.xray or false);
-          ENCLAVE_METRICS_NAMESPACE = deployment.metricsNamespace or "";
+          ENCLAVE_METRICS = lib.boolToString (deployment.metrics or false);
 
-          # Where background tasks are recorded, scheduled and delivered
-          # (runtime/src/tasks): all four, or none. Defaulted, so a
-          # deployment.nix written before them still builds, with tasks off.
-          ENCLAVE_TASK_TABLE = deployment.taskTable or "";
-          ENCLAVE_TASK_QUEUE_URL = deployment.taskQueueUrl or "";
-          ENCLAVE_TASK_SCHEDULE_GROUP = deployment.taskScheduleGroup or "";
-          ENCLAVE_TASK_SCHEDULER_ROLE_ARN = deployment.taskSchedulerRoleArn or "";
+          # Background tasks (runtime/src/tasks), recorded, scheduled and
+          # delivered through the `<name>-tasks` resources the deployment makes.
+          ENCLAVE_TASKS = lib.boolToString (deployment.tasks or false);
 
           # Registration is open: anyone who can reach the port may create a
           # tenant of their own. There is nothing to provision, and nothing an
@@ -393,10 +379,12 @@
         };
       };
 
-      runtimeImage = runtimeImageFor deployment;
+      # The production binary under the e2e's settings: `packages.eif`, which
+      # `nix build .#eif --rebuild` checks reproduces. Nothing deploys it.
+      runtimeImage = runtimeImageFor e2eDeployment;
 
-      # The production image for a deployment kept outside this repository —
-      # a file in deployment.nix's shape:
+      # The production image for a deployment, from its own file in
+      # tests/qemu/deployment.nix's shape:
       #
       #   packages.x86_64-linux.eif = enclave-runtime.lib.x86_64-linux.mkEif (import ./deployment.nix);
       #
@@ -420,18 +408,9 @@
         };
         closureRoots = [ enclave-runtime-testing busybox pkgs.cacert ] ++ zfsTools;
         name = "enclave-qemu";
-        # The key settings go: this image keeps the static key below, and the
-        # runtime refuses one alongside KMS settings rather than pick between them.
-        env = builtins.removeAttrs runtimeImage.env [
-          "ENCLAVE_KMS_KEY_ALIAS"
-          "ENCLAVE_MASTER_KEY_PARAMETER"
-          "ENCLAVE_OPERATOR_MASTER_PARAMETER"
-          # The emulator reaches no AWS, so its tasks are held in memory.
-          "ENCLAVE_TASK_TABLE"
-          "ENCLAVE_TASK_QUEUE_URL"
-          "ENCLAVE_TASK_SCHEDULE_GROUP"
-          "ENCLAVE_TASK_SCHEDULER_ROLE_ARN"
-        ] // {
+        # The e2e's own settings (tests/qemu/deployment.nix), and what
+        # only a `testing` build can be told: the emulator reaches no AWS.
+        env = runtimeImage.env // {
           ENCLAVE_CLOCK_SOURCE = "host";
 
           # QEMU's NSM does not sign at all: its source says "we don't
@@ -447,7 +426,7 @@
           # operator controls — but it means the client code developed against
           # the emulator is the code that runs against Nitro, rather than a
           # relaxed variant of it. The root is reported on the console at
-          # startup; `deploy/qemu-nitro/lib.sh` captures it for the clients.
+          # startup; `tests/qemu/lib.sh` captures it for the clients.
           #
           # Testing-only: the production binary has no such flag, so no
           # deployment can sign its own attestations.
@@ -466,22 +445,13 @@
           # would refuse an invented registration token anyway. What the e2e
           # checks is what the *runtime* sends, and the stub records exactly
           # that. The `http://` endpoint is the same downgrade
-          # `--guest-log-endpoint` already is, and PCR0 records it. A real
-          # application replaces both below.
-          ENCLAVE_PUSH_APP_ID = "e2e";
-          # Off. Inherited from the production image, and there is no AWS
-          # here to send to: the harness's credentials are MinIO's, which
-          # CloudWatch would reject. Empty means off, which is why
-          # `guest_log_config` treats an empty setting as unset rather than as
-          # a typo.
-          ENCLAVE_GUEST_LOG_GROUP = "";
+          # `ENCLAVE_GUEST_LOG_ENDPOINT` already is, and PCR0 records it. A real
+          # application replaces it below.
           ENCLAVE_ENDPOINT = "http://192.168.127.254:9000";
           ENCLAVE_FORCE_PATH_STYLE = "1";
-          ENCLAVE_ROOTS_BUCKET = "e2e-roots";
           ENCLAVE_MASTER_KEY = "00000000000000000000000000000000000000000000000000000000000000ab";
           AWS_ACCESS_KEY_ID = "minioadmin";
           AWS_SECRET_ACCESS_KEY = "minioadmin";
-          AWS_REGION = "us-east-1";
           RUST_LOG = "info";
         } // nixpkgs.lib.optionalAttrs (pushAppId == null) {
           ENCLAVE_PUSH_ENDPOINT = "http://192.168.127.254:9180";
@@ -503,12 +473,13 @@
         # Built with CGO disabled, which upstream already does for gvforwarder
         # but not for gvproxy. Nix's gvproxy is dynamically linked against a
         # glibc in the store, so it runs nowhere that lacks that exact store
-        # path — not on this host outside a Nix namespace, and not on the
-        # Amazon Linux parent the AMI bakes. Static, it is one file that runs
+        # path — not on this host outside a Nix namespace, and not on a
+        # parent instance. Static, it is one file that runs
         # anywhere, which is what a binary crossing out of Nix needs to be.
         gvproxy = gvproxy-static;
 
-        # The production image.
+        # The production binary under the e2e's settings, which
+        # `nix build .#eif --rebuild` checks reproduces.
         eif = callEif runtimeImage;
 
         # The same runtime, configured for the emulator. Neither image contains
@@ -562,8 +533,6 @@
             cpio
             jq
             eif-build
-            opentofu
-            packer
           ];
         };
       };

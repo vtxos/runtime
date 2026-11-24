@@ -18,7 +18,7 @@ env:
 
 # Three stages, each a checkout, a toolchain, and one script. The scripts are the
 # recipes: they live in scripts/ so a job can be run locally with the same
-# command CI uses, and so deploy/qemu-nitro/run-e2e.sh can share them instead of
+# command CI uses, and so tests/qemu/run-e2e.sh can share them instead of
 # keeping a second copy that has to agree.
 #
 # There are deliberately no `needs:` edges. Gating the long jobs behind the
@@ -121,7 +121,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/ci-cache/images
-          key: e2e-images-${{ hashFiles('deploy/qemu-nitro/Dockerfile', 'scripts/minio-image.sh', 'scripts/localemu-image.sh') }}
+          key: e2e-images-${{ hashFiles('tests/qemu/Dockerfile', 'scripts/minio-image.sh', 'scripts/localemu-image.sh') }}
       # The enclave image's expensive parts: the kernel with ZFS, and the
       # runtime's dependencies as Nix builds them. A plain directory used as a
       # binary cache, so nothing is asked of the Actions cache API per store

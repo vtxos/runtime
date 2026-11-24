@@ -30,7 +30,7 @@ A region's claim is checked before the region is mapped, so no tenant's pool is 
 
 **Each release keeps** the keys of tenants with background work, sealed under a key only it is released (`versions/<vid>/tenant-keys/<tid>`), and attaches them at boot. A new release starts with none: a tenant's tasks and wakes wait until its owner signs in to it.
 
-An anchor names the pool it speaks for — its pool id and tenant id, signed (`ZFSANCH3`) — and the releases that wrote it. Each pool anchors on its own chain, under `zfs/pools/<pool_id>/anchors/`, with its own last-anchor lock, so two tenants anchor independently: one held mid-anchor does not stop another. Each attach claims the pool's next **generation** (`zfs/pools/<pool_id>/generations/<g>`, signed by the pool's key), and an enclave stops anchoring a pool once a higher generation exists, so an older enclave cannot acknowledge a write a newer one has forked away from. A pool is kept attached for the life of the process; the number of pools is bounded by how many regions the disk holds, and registration is refused once none is free.
+An anchor names the pool it speaks for — its pool id and tenant id, signed (`ZFSANCH3`) — and the releases that wrote it. Each pool anchors on its own chain, under `zfs/pools/<pool_id>/anchors/`, with its own last-anchor lock, so two tenants anchor independently: one held mid-anchor does not stop another. Each attach claims the pool's next **generation** (`zfs/pools/<pool_id>/generations/<g>`, signed by the pool's key), and an enclave stops anchoring a pool once a higher generation exists, so an older enclave cannot acknowledge a write a newer one has forked away from. Each attach that opens a pool then publishes an anchor of its own before it serves anything: the older enclave may have published past the tip this one checked its disk against, before the claim, and whichever of the two publishes that next anchor first decides it — the other's put fails. A pool is kept attached for the life of the process; the number of pools is bounded by how many regions the disk holds, and registration is refused once none is free.
 
 Because a tenant's data is its own pool, the same-nonce cross-tenant steal the single pool was prone to — one tenant's write landing between another's anchor marker and its sync — cannot happen: an anchor only ever covers its own pool, and a tenant is serialised against itself. Each pool is verified on attach (below), so a rolled-back or forked tenant disk is refused when that tenant is next attached.
 
@@ -98,7 +98,7 @@ There is no rewind. Before this, boot imported with `zpool import -T <anchored t
 
 Anchors are found by their retained versions, by galloping then bisecting, because they are contiguous and none can be deleted. A host cannot hide the newest one behind a delete marker.
 
-**Releases.** Every anchor carries the runtime release (`ENCLAVE_RELEASE`, measured into PCR0) and the guest release (`AEGIRA_RELEASE` in the guest file's settings, measured into PCR16) that wrote it. Attaching refuses a pool whose newest anchor names a higher number of either, before it claims a generation. When an older release's anchor is the newest, attaching anchors once at once, so the older release can no longer open the pool.
+**Releases.** Every anchor carries the runtime release (`ENCLAVE_RELEASE`, measured into PCR0) and the guest release (`AEGIRA_RELEASE` in the guest file's settings, measured into PCR16) that wrote it. Attaching refuses a pool whose newest anchor names a higher number of either, before it claims a generation. Since every attach that opens a pool anchors at once, an older release whose anchor was the newest can no longer open the pool afterwards.
 
 ### When a write is durable
 
@@ -135,7 +135,7 @@ No guest can reach `runtime` or another tenant (a different pool, a different en
 | `failmode` | `panic` | A pool that lost its disk stops the enclave; the next boot decides |
 | `zfs_txg_timeout` | 3600 s | No txg on a timer; syncs come from anchors |
 | `zfs_arc_max`, `zfs_dirty_data_max` | 256 MiB | Enclave memory is fixed |
-| Anchor retention | 10 years (`--root-retention-secs`) | COMPLIANCE: nobody can shorten it |
+| Anchor retention | 10 years (`ENCLAVE_ROOT_RETENTION_SECS`) | COMPLIANCE: nobody can shorten it |
 
 ### Cost
 
@@ -156,23 +156,23 @@ A release is a runtime image and a guest: one PCR0 and one PCR16. Boot reads bot
 
 | Observed | Outcome |
 |---|---|
-| None | **Version genesis.** Mint the release's master secret (KMS, under the key aliased `<ENCLAVE_KMS_KEY_ALIAS>/<vid>`) and write its sealed form once. That write is the release's lease: of two first boots, one wins. |
+| None | **Version genesis.** Mint the release's master secret (KMS, under the key aliased `alias/<ENCLAVE_NAME>/<vid>`) and write its sealed form once. That write is the release's lease: of two first boots, one wins. |
 | Present | **Version resume.** Open it; KMS releases it only to this pair. |
 
 Then the disk is brought up and the tenants whose keys this release kept are attached. No other pool is touched until its owner signs in.
 
-The bucket's identity lives in the measured image: `ENCLAVE_ROOTS_BUCKET` is part of PCR0.
+The bucket's identity lives in the measured image: it is `<ENCLAVE_NAME>-roots`, and the name is part of PCR0.
 
 ## The parent side
 
 | | Emulator | Nitro |
 |---|---|---|
-| Disk | A sparse file served by [`deploy/qemu-nitro/nbd-stub.py`](../deploy/qemu-nitro/nbd-stub.py) | A gp3 EBS volume ([`deploy/tofu`](../deploy/tofu/main.tf), `pool_size_gib`), served by stock nbdkit from the Amazon Linux 2023 repositories ([`nbdkit.service`](../deploy/ami/units/nbdkit.service)) |
+| Disk | A sparse file served by [`tests/qemu/nbd-stub.py`](../tests/qemu/nbd-stub.py) | A gp3 EBS volume the deployment attaches to the parent, served by stock nbdkit from the Amazon Linux 2023 repositories |
 | Kernel | [`nix/kernel-zfs.nix`](../nix/kernel-zfs.nix) | Same image |
 
 [`nix/kernel-zfs.nix`](../nix/kernel-zfs.nix) is AWS's `aws-nitro-enclaves-sdk-bootstrap` recipe: Linux 6.6, their config, and their two patches, including the vsock fix that stops parent and enclave deadlocking when both send queues fill. It adds NBD and dm-crypt, and builds OpenZFS against the result. The build user and host are pinned, so the kernel's version string, and with it PCR0, is the same on every machine.
 
-[`deploy/qemu-nitro/run-zfs-spike.sh`](../deploy/qemu-nitro/run-zfs-spike.sh) plays the hostile host:
+[`tests/qemu/run-zfs-spike.sh`](../tests/qemu/run-zfs-spike.sh) plays the hostile host:
 - two tenants write, and cross-tenant paths are refused;
 - a restart resumes;
 - a rolled-back disk is refused;
@@ -180,7 +180,7 @@ The bucket's identity lives in the measured image: `ENCLAVE_ROOTS_BUCKET` is par
 - the abandoned fork is refused;
 - the disk as of an anchor's marker, before its sync, is refused.
 
-The testing build stops at named points in an anchor and asks the host, over vsock port 9101, whether to go on (`hook` in [`zfs.rs`](../runtime/src/store/zfs.rs), answered by [`test-hooks.py`](../deploy/qemu-nitro/test-hooks.py)). A leg can hold an anchor there, copy the disk at that exact moment, or kill the enclave between two steps.
+The testing build stops at named points in an anchor and asks the host, over vsock port 9101, whether to go on (`hook` in [`zfs.rs`](../runtime/src/store/zfs.rs), answered by [`test-hooks.py`](../tests/qemu/test-hooks.py)). A leg can hold an anchor there, copy the disk at that exact moment, or kill the enclave between two steps.
 
 ### The flaw the last leg is for
 
@@ -200,7 +200,7 @@ Leg 6 showed the same flaw in an honest crash. Three txgs past anchor 107, `-T 8
 scripts/wasi-sdk.sh
 scripts/build-guest.sh sqlite
 
-deploy/qemu-nitro/dev-enclave.sh \
+tests/qemu/dev-enclave.sh \
   --guest examples/guest-sqlite/target/wasm32-wasip2/release/guest-sqlite.wasm
 ```
 

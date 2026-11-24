@@ -4,18 +4,18 @@ A real enclave on your own machine, to develop a client against.
 
 ```bash
 sudo modprobe vsock_loopback                       # once per boot
-docker build -t enclave-qemu-nitro:latest deploy/qemu-nitro   # QEMU with the nitro-enclave machine; ~680 MB
+docker build -t enclave-qemu-nitro:latest tests/qemu   # QEMU with the nitro-enclave machine; ~680 MB
 cargo install vhost-device-vsock --root target/qemu-nitro/tools
 
-deploy/qemu-nitro/dev-enclave.sh --guest path/to/your-component.wasm
+tests/qemu/dev-enclave.sh --guest path/to/your-component.wasm
 ```
 
 It prints the URL and the three values a client must pin, then stays up until
 you stop it.
 
-This is the same stack [`run-e2e.sh`](../deploy/qemu-nitro/run-e2e.sh) asserts
+This is the same stack [`run-e2e.sh`](../tests/qemu/run-e2e.sh) asserts
 against — both scripts share
-[`deploy/qemu-nitro/lib.sh`](../deploy/qemu-nitro/lib.sh), so the thing you
+[`tests/qemu/lib.sh`](../tests/qemu/lib.sh), so the thing you
 develop against is the thing CI checks. The difference is only what happens
 after the enclave starts serving: the e2e asserts and exits, this waits.
 
@@ -182,7 +182,7 @@ DIR/
 ├── eif/               enclave-qemu.eif, pcr.json
 ├── bin/               gvproxy (static); nitro-attest, wallet-client, vhost-device-vsock (libc only)
 ├── images/            qemu.tar.gz, minio.tar.gz — the container images, loaded on first run
-├── deploy/qemu-nitro/ this harness, as it was when the image was built
+├── tests/qemu/ this harness, as it was when the image was built
 ├── scripts/           lib.sh, minio-up.sh, minio-image.sh, wasi-sdk.sh
 └── wit/               what guests are built against, for a consumer's drift check
 ```
@@ -191,7 +191,7 @@ A bundle runs from its own copy of the harness, so nothing from this repository 
 it — not a checkout, not the QEMU image, not Nix, cargo or git:
 
 ```
-DIR/deploy/qemu-nitro/dev-enclave.sh --prebuilt DIR --guest component.wasm --port 443 --keep-store ...
+DIR/tests/qemu/dev-enclave.sh --prebuilt DIR --guest component.wasm --port 443 --keep-store ...
 ```
 
 The host needs KVM the user can open, `vsock_loopback` (`sudo modprobe vsock_loopback`), Docker,
@@ -240,7 +240,7 @@ so does deleting it by hand while the enclave is down.
 |---|---|
 | `no /dev/vsock` | `sudo modprobe vsock_loopback` |
 | `no /dev/kvm` | the `nitro-enclave` machine needs KVM; it will not run in a VM without nested virtualisation |
-| `missing QEMU image` | `docker build -t enclave-qemu-nitro:latest deploy/qemu-nitro` |
-| `... is not tracked by git` | Nix flakes copy only tracked files; `git add deploy/qemu-nitro/` |
+| `missing QEMU image` | `docker build -t enclave-qemu-nitro:latest tests/qemu` |
+| `... is not tracked by git` | Nix flakes copy only tracked files; `git add tests/qemu/` |
 | the enclave never reported a trust root | `ENCLAVE_COSIGN_ATTESTATIONS` is unset in the image — check `eif-qemu`'s environment in `flake.nix` |
 | a port is in use | `--port`, and `--name` if you want two at once |

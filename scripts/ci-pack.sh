@@ -7,7 +7,7 @@
 # Packs the image with the image options given (`dev-enclave.sh --pack`), tars
 # it as dev-enclave-PROFILE-<rev>.tar.gz beside a .sha256, and then proves the
 # tarball is what it claims by running the whole stack from an extracted copy —
-# deploy/qemu-nitro/run-e2e.sh, all eight legs, with BUNDLE pointing at the copy
+# tests/qemu/run-e2e.sh, all eight legs, with BUNDLE pointing at the copy
 # and nothing pointing at this checkout. A bundle that needs something outside
 # itself fails here, not on a host that has nothing else.
 #
@@ -40,7 +40,7 @@ name="dev-enclave-$profile-$rev"
 
 say "packing $name"
 # --name keeps this run's directory apart from any enclave already up on this machine.
-deploy/qemu-nitro/dev-enclave.sh --name pack --pack "$out/$profile" "$@"
+tests/qemu/dev-enclave.sh --name pack --pack "$out/$profile" "$@"
 
 say "the tarball"
 tar -C "$out" --transform "s,^$profile,$name," -czf "$out/$name.tar.gz" "$profile"
@@ -52,12 +52,12 @@ nix build "$REPO#guest-release" --out-link "$out/guest" --print-build-logs >/dev
 rm -rf "$out/smoke"; mkdir -p "$out/smoke"
 tar xzf "$out/$name.tar.gz" -C "$out/smoke" --strip-components=1
 # The guest out of the store — through nix-portable's chroot when that is what `nix` is here,
-# as deploy/qemu-nitro/lib.sh's resolve_out_link does.
+# as tests/qemu/lib.sh's resolve_out_link does.
 guest="$(readlink -f "$out/guest" 2>/dev/null || true)"
 [[ -d "$guest" ]] || guest="$HOME/.nix-portable$(readlink "$out/guest")"
 [[ -f "$guest/guest.wasm" ]] || fail "no guest behind $out/guest"
 # From the copy, not the checkout: its own lib.sh, its own scripts, its own images.
-BUNDLE="$out/smoke" GUEST_WASM="$guest/guest.wasm" "$out/smoke/deploy/qemu-nitro/run-e2e.sh"
+BUNDLE="$out/smoke" GUEST_WASM="$guest/guest.wasm" "$out/smoke/tests/qemu/run-e2e.sh"
 
 say "bundle ready"
 echo "$out/$name.tar.gz"

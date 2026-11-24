@@ -57,6 +57,10 @@ const MAX_PAYLOAD: usize = 64 * 1024;
 const MAX_ATTEMPTS: u32 = 5;
 /// Recurring tasks repeat in whole minutes: the smallest rate EventBridge Scheduler has.
 const MINUTE_MS: u64 = 60_000;
+/// The last time a task can name, 9999-12-31T23:59:59Z: the last whole second RFC 3339 can
+/// write, which is how a schedule's `at()` and a delivery's time are written. It also bounds
+/// an interval, so no occurrence arithmetic can overflow.
+pub(crate) const LATEST_RUN_AT: u64 = 253_402_300_799_000;
 
 /// How long one attempt at a background task may run. Fixed, not a setting: a task that drives a
 /// round with an outside service waits on that service's schedule, which is minutes, and a limit
@@ -67,6 +71,10 @@ pub const TASK_TIMEOUT: Duration = Duration::from_secs(600);
 const VISIBILITY: Duration = Duration::from_secs(900);
 /// How far a delivery may be ahead of the enclave's clock and still run.
 const SKEW_MS: u64 = 60_000;
+/// How much sooner than a whole interval after the latest a recurring occurrence may be. Two
+/// scheduled times compared with each other, not with a clock: the scheduler writes them whole
+/// seconds, exactly an interval apart, so this only absorbs rounding.
+const OCCURRENCE_SLACK_MS: u64 = 1_000;
 /// A one-time task due this soon goes straight on the queue, delayed, rather than through a
 /// schedule: SQS delays a message up to fifteen minutes.
 const IMMEDIATE_MS: u64 = 15 * 60_000;
@@ -250,6 +258,8 @@ pub struct TaskQueue {
     table: Arc<dyn TaskTable>,
     schedules: Arc<dyn Schedules>,
     deliveries: Arc<dyn Deliveries>,
+    /// Tenants whose catch-up failed when they attached: the reconciler tries them again.
+    behind: std::sync::Mutex<std::collections::BTreeSet<[u8; 16]>>,
     #[cfg(any(test, feature = "testing"))]
     clockwork: Option<Arc<schedules::MemorySchedules>>,
 }
@@ -258,13 +268,14 @@ pub struct TaskQueue {
 impl TenantLoader for TaskQueue {
     /// A tenant just attached: run what came due while it could not be, and say whether it has
     /// tasks, so its key is kept for the next boot. A failure here must not fail the sign-in, so it
-    /// is logged; the occurrences wait for the next attach.
+    /// is logged, and the reconciler tries again until it succeeds.
     async fn load_tenant(&self, tenant: [u8; 16]) -> Result<bool> {
         match self.catch_up(tenant).await {
             Ok(background) => Ok(background),
             Err(e) => {
                 tracing::warn!(tenant = %hex::encode(tenant), error = format!("{e:#}"),
-                    "could not catch up a tenant's tasks; they wait for its next attach");
+                    "could not catch up a tenant's tasks; the reconciler tries again");
+                self.behind.lock().expect("behind mutex").insert(tenant);
                 Ok(false)
             }
         }
@@ -289,6 +300,7 @@ impl TaskQueue {
             table: backend.table,
             schedules: backend.schedules,
             deliveries: backend.deliveries,
+            behind: Default::default(),
             #[cfg(any(test, feature = "testing"))]
             clockwork: backend.clockwork,
         });
@@ -314,8 +326,16 @@ impl TaskQueue {
         ensure!(valid_id(&id), "invalid task id");
         ensure!(payload.len() <= MAX_PAYLOAD, "task payload exceeds 64 KiB");
         ensure!(
+            run_at <= LATEST_RUN_AT,
+            "run_at is later than the year 9999"
+        );
+        ensure!(
             interval_ms.is_none_or(|i| i >= MINUTE_MS && i % MINUTE_MS == 0),
             "interval must be a whole number of minutes, at least one"
+        );
+        ensure!(
+            interval_ms.is_none_or(|i| i <= LATEST_RUN_AT),
+            "interval is longer than any schedule can run"
         );
         let keys = self.zfs.task_keys(tenant)?;
         // The tenant's pool must be re-attached on the next boot, or its tasks wait for its owner
@@ -393,7 +413,8 @@ impl TaskQueue {
         let when = match record.interval_ms {
             None if record.run_at <= now.saturating_add(IMMEDIATE_MS) => {
                 let delay = Duration::from_millis(record.run_at.saturating_sub(now));
-                let due = Message::due(record.tenant, &record.id, record.generation, record.run_at);
+                let due =
+                    Message::due(record.tenant, &record.id, record.generation, record.run_at)?;
                 return self.deliveries.send(&due, delay).await;
             }
             None => When::At(record.run_at),
@@ -600,6 +621,30 @@ impl TaskQueue {
             return self.deliveries.delete(&delivery.receipt).await;
         }
         let job = verified.job;
+        // A recurring task's occurrence is its message's time, which the scheduler writes — and
+        // the parent can write too, on a message it puts on the queue itself. The signed interval
+        // is what says how often the task runs: an occurrence sooner after the latest than that is
+        // not the schedule's, and running it would give the parent a fresh run of a daily task
+        // every few seconds, each with a run id of its own. The latest again is a redelivery, which
+        // the claim deals with.
+        if let Some(interval) = job.interval_ms {
+            let latest = self
+                .table
+                .latest_run(job.tenant, &job.id, job.generation)
+                .await?;
+            if let Some(latest) = latest.filter(|l| l.occurrence != job.occurrence) {
+                let next = latest
+                    .occurrence
+                    .saturating_add(interval)
+                    .saturating_sub(OCCURRENCE_SLACK_MS);
+                if job.occurrence < next {
+                    tracing::warn!(tenant = %hex::encode(job.tenant), task = %job.id,
+                        occurrence = job.occurrence, latest = latest.occurrence,
+                        "an occurrence sooner than its task's interval was dropped");
+                    return self.deliveries.delete(&delivery.receipt).await;
+                }
+            }
+        }
         let Some(turn) = runner.turn(job.tenant) else {
             // A busy tenant never spends an attempt.
             let after = Duration::from_secs((5 * u64::from(delivery.receives)).min(60));
@@ -607,7 +652,15 @@ impl TaskQueue {
         };
         let run = match self.claim(&job, &delivery.body).await? {
             Claim::Run(run) => run,
-            Claim::Finished => return self.deliveries.delete(&delivery.receipt).await,
+            Claim::Finished => {
+                // Recorded before. A one-time task may still not know: the attempt that recorded
+                // its outcome can end — a crash, a failed write — before the task is settled, and
+                // nothing else would settle it.
+                if job.interval_ms.is_none() {
+                    self.settle_from_run(&job).await?;
+                }
+                return self.deliveries.delete(&delivery.receipt).await;
+            }
             Claim::Leased(ms) => {
                 return self
                     .deliveries
@@ -797,8 +850,31 @@ impl TaskQueue {
     /// A one-time task's only occurrence ended, and with it the task — unless a cancel got there
     /// first.
     async fn settle(&self, job: &Job, state: TaskState) -> Result<()> {
-        let record = self.table.task(job.tenant, &job.id).await?.filter(|r| {
-            r.generation == job.generation
+        self.settle_task(job.tenant, &job.id, job.generation, state)
+            .await
+    }
+
+    /// Settle a one-time task from its occurrence's own record, when that has ended.
+    async fn settle_from_run(&self, job: &Job) -> Result<()> {
+        let run = self
+            .table
+            .run(job.tenant, &job.id, job.generation, job.occurrence)
+            .await?;
+        match run.and_then(|r| ended(r.state)) {
+            Some(state) => self.settle(job, state).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn settle_task(
+        &self,
+        tenant: [u8; 16],
+        id: &str,
+        generation: [u8; 16],
+        state: TaskState,
+    ) -> Result<()> {
+        let record = self.table.task(tenant, id).await?.filter(|r| {
+            r.generation == generation
                 && matches!(r.state, TaskState::Scheduling | TaskState::Scheduled)
         });
         if let Some(mut record) = record {
@@ -893,6 +969,25 @@ impl TaskQueue {
     /// Finish what was left half done, and restore a trigger the host removed. Only for tenants
     /// attached here: a task is acted on only once it verifies.
     async fn reconcile(&self) -> Result<()> {
+        let behind: Vec<[u8; 16]> = self
+            .behind
+            .lock()
+            .expect("behind mutex")
+            .iter()
+            .copied()
+            .collect();
+        for tenant in behind {
+            match self.catch_up(tenant).await {
+                Ok(background) => {
+                    if background {
+                        self.zfs.mark_background(tenant).await?;
+                    }
+                    self.behind.lock().expect("behind mutex").remove(&tenant);
+                }
+                Err(e) => tracing::warn!(tenant = %hex::encode(tenant),
+                    error = format!("{e:#}"), "still could not catch up a tenant's tasks"),
+            }
+        }
         let now = self.now();
         for record in self.table.tasks_in(TaskState::Scheduling).await? {
             if record.updated_at.saturating_add(STALE_MS) > now || !self.verifies(&record) {
@@ -939,18 +1034,25 @@ impl TaskQueue {
             }
             return Ok(());
         }
-        let fired = self
+        let latest = self
             .table
             .latest_run(record.tenant, &record.id, record.generation)
-            .await?
-            .is_some();
+            .await?;
+        // Its occurrence ended and the task was never told: settle it now. Left, it would read as
+        // pending, and once the run record expired it would be sent, and run, again.
+        if let Some(state) = latest.as_ref().and_then(|r| ended(r.state)) {
+            return self
+                .settle_task(record.tenant, &record.id, record.generation, state)
+                .await;
+        }
+        let fired = latest.is_some();
         // From when it was scheduled, not when it was due: one enqueued to run at once was due
         // before it existed.
         let since = record.run_at.max(record.updated_at);
         if !fired && since.saturating_add(LOST_MS) < now {
             tracing::warn!(tenant = %hex::encode(record.tenant), task = %record.id,
                 "a task's firing never arrived; sent again");
-            let due = Message::due(record.tenant, &record.id, record.generation, record.run_at);
+            let due = Message::due(record.tenant, &record.id, record.generation, record.run_at)?;
             self.deliveries.send(&due, Duration::ZERO).await?;
         }
         Ok(())
@@ -965,6 +1067,15 @@ impl TaskQueue {
             self.handle(runner, delivery).await;
         }
         n
+    }
+}
+
+/// What a one-time task becomes when its occurrence ended this way, if it did.
+fn ended(run: RunState) -> Option<TaskState> {
+    match run {
+        RunState::Completed => Some(TaskState::Done),
+        RunState::Failed => Some(TaskState::Failed),
+        _ => None,
     }
 }
 

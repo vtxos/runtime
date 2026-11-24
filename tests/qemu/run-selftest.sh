@@ -30,7 +30,7 @@ CONSOLE="$RUNDIR/console.log"
 # Built by Nix now, so the image is reproducible and the shell script that
 # used to assemble it is gone. `build-eif.sh` remains only as documentation of
 # the layout; `nix build` is what produces the bytes.
-command -v nix >/dev/null || { echo "nix is not on PATH; see deploy/nix/README.md" >&2; exit 1; }
+command -v nix >/dev/null || { echo "nix is not on PATH; see nix/README.md" >&2; exit 1; }
 nix build "$REPO#${SELFTEST_ATTR:-eif-selftest}" --out-link "$WORK/eif-selftest" 2>&1 | tail -2
 EIF_DIR="$(readlink -f "$WORK/eif-selftest" 2>/dev/null || true)"
 # nix-portable keeps its store outside /nix except inside its own namespace; on
@@ -64,7 +64,7 @@ EOF
 }
 
 # Port 9000 is where init expects the parent.
-python3 "$REPO/deploy/qemu-nitro/heartbeat.py" 9000 \
+python3 "$REPO/tests/qemu/heartbeat.py" 9000 \
     > "$RUNDIR/heartbeat.log" 2>&1 &
 pids+=($!)
 

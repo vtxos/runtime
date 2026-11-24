@@ -636,6 +636,68 @@ async fn auth_routes_answer_without_a_token() {
     assert_eq!(status, 404);
 }
 
+/// These routes are open to anyone. A body declared larger than they accept
+/// is refused before any of it is read, and one that trickles in is cut off:
+/// both used to be read in full, or waited for, with no bound but memory.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn an_auth_body_is_bounded_in_size_and_time() {
+    let h = start().await;
+    let config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AcceptAny))
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let open = || async {
+        let socket = tokio::net::TcpStream::connect(h.addr)
+            .await
+            .expect("connect");
+        let name = rustls::pki_types::ServerName::try_from(DOMAIN).unwrap();
+        connector.connect(name, socket).await.expect("handshake")
+    };
+    let status = |raw: &[u8]| {
+        String::from_utf8_lossy(raw)
+            .split(' ')
+            .nth(1)
+            .map(str::to_string)
+    };
+
+    // A gigabyte declared, a little sent: refused at once, not waited for.
+    let mut stream = open().await;
+    stream
+        .write_all(
+            b"POST /auth/request/verify HTTP/1.1\r\nHost: enclave.test\r\n\
+              Content-Length: 1073741824\r\n\r\n{\"partial\":",
+        )
+        .await
+        .unwrap();
+    let mut raw = vec![0u8; 512];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut raw))
+        .await
+        .expect("an oversized body was waited for")
+        .unwrap();
+    assert_eq!(status(&raw[..n]).as_deref(), Some("413"));
+
+    // A body within the limit that never finishes arriving: cut off.
+    let mut stream = open().await;
+    stream
+        .write_all(
+            b"POST /auth/request/verify HTTP/1.1\r\nHost: enclave.test\r\n\
+              Content-Length: 100\r\n\r\n{",
+        )
+        .await
+        .unwrap();
+    let n = tokio::time::timeout(std::time::Duration::from_secs(30), stream.read(&mut raw))
+        .await
+        .expect("a trickled body was waited for without end")
+        .unwrap();
+    assert_eq!(status(&raw[..n]).as_deref(), Some("408"));
+}
+
 #[derive(Debug)]
 struct AcceptAny;
 

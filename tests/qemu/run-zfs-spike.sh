@@ -8,8 +8,8 @@
 # anchor, serving an abandoned fork — measures what an anchor costs, and shows
 # two tenants' pools anchoring independently.
 #
-#   deploy/qemu-nitro/run-zfs-spike.sh          a fresh store
-#   BENCH=200 deploy/qemu-nitro/run-zfs-spike.sh
+#   tests/qemu/run-zfs-spike.sh          a fresh store
+#   BENCH=200 tests/qemu/run-zfs-spike.sh
 set -euo pipefail
 
 PREFIX=zfs

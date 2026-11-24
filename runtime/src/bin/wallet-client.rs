@@ -771,6 +771,9 @@ fn dechunk(body: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Accepts any certificate, because the attestation vouches for it, but only
+/// from the holder of its key: a certificate is public, and without the
+/// handshake signatures anyone relaying a copy of the enclave's would pass.
 #[derive(Debug)]
 struct AcceptAny;
 
@@ -788,27 +791,29 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
 
     fn verify_tls12_signature(
         &self,
-        _m: &[u8],
-        _c: &rustls::pki_types::CertificateDer<'_>,
-        _d: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &signature_algorithms())
     }
 
     fn verify_tls13_signature(
         &self,
-        _m: &[u8],
-        _c: &rustls::pki_types::CertificateDer<'_>,
-        _d: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &signature_algorithms())
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        signature_algorithms().supported_schemes()
     }
+}
+
+fn signature_algorithms() -> rustls::crypto::WebPkiSupportedAlgorithms {
+    rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms
 }
 
 #[cfg(test)]

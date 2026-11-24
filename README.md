@@ -42,7 +42,7 @@ The runtime links the standard WASI 0.2 interfaces and serves each one from insi
 | The guest writes | WASI interface | What answers it inside the enclave |
 |---|---|---|
 | `SystemTime::now()` | `wasi:clocks/wall-clock` | The Nitro **PTP hardware clock** (`/dev/ptp0`, disciplined by Amazon Time Sync), not the system clock the parent can set |
-| `getrandom`, `OsRng`, key generation | `wasi:random/random` | The **Nitro Security Module**, read directly on every call with no DRBG in between |
+| `getrandom`, `OsRng`, key generation | `wasi:random/random` | The **Nitro Security Module**, read directly with no DRBG in between: every byte comes from the device, once, and a request is capped at 64 KiB |
 | Hash-table seeding | `wasi:random/insecure-seed` | A fresh NSM draw for every instance |
 | An HTTP handler | `wasi:http/incoming-handler` | TLS terminated **inside** the enclave, behind a gate that admits only requests signed with the tenant's wallet share; the runtime sets the caller's tenant in `x-enclave-tenant` |
 | A gRPC service | `enclave:rpc/service` ([this runtime's WIT](wit/rpc/rpc.wit)) | The same TLS and gate, with gRPC ended by the runtime: the guest gets each call's messages as a stream and answers on another, and never sees HTTP |
@@ -89,7 +89,7 @@ A read that fails mid-run returns the last good reading and logs a warning. A fe
 
 If the device fails, `wasi:random` stops the process rather than return predictable bytes. The clock can serve a stale reading because a stale timestamp is still a real one and a caller can notice. Predictable bytes look random to the guest, and a key built from them can never be detected downstream. A production build always reads the NSM. What libraries draw inside themselves comes from the kernel pool: TLS keys and handshakes and the KMS recipient key through `aws-lc-rs`. Inside an enclave the NSM is that pool's only seed, and requiring `/dev/nsm` at boot proves the runtime is in an enclave.
 
-`enclave-runtime --self-check` prints the chosen clock, its skew against `CLOCK_REALTIME` and a sanity check of the entropy source, then exits without touching storage.
+`ENCLAVE_SELF_CHECK=1 enclave-runtime` prints the chosen clock, its skew against `CLOCK_REALTIME` and a sanity check of the entropy source, then exits without touching storage.
 
 ### One identity
 
@@ -102,7 +102,7 @@ flowchart TB
     M --> C["Native app<br/>checks the attested /auth answer<br/>before sending its ECDH partial"]
 ```
 
-PCR0 covers configuration as well as code: the push application and the bucket identities. An app that pins PCR0 has therefore also pinned which push application can wake its devices. A guest's own settings are not image configuration: they travel in the guest file ([`guest-env.py`](deploy/qemu-nitro/guest-env.py) writes them before it is uploaded), so PCR16 measures them with the guest's code and one image serves any deployment. Where a guest can send data is not configuration: a guest reaches the public internet and nothing else, by address, so what it sends is its own code's decision — and that code is PCR16.
+PCR0 covers configuration as well as code: the push application and the deployment's name, which names its bucket and keys. An app that pins PCR0 has therefore also pinned which push application can wake its devices. A guest's own settings are not image configuration: they travel in the guest file ([`guest-env.py`](tests/qemu/guest-env.py) writes them before it is uploaded), so PCR16 measures them with the guest's code and one image serves any deployment. Where a guest can send data is not configuration: a guest reaches the public internet and nothing else, by address, so what it sends is its own code's decision — and that code is PCR16.
 
 ## Capabilities beyond WASI
 
@@ -220,7 +220,7 @@ sequenceDiagram
     App->>RT: sign in, attest, fetch the result
 ```
 
-The [QEMU harness](deploy/qemu-nitro/run-e2e.sh) runs this flow in an emulated enclave, with a stub in place of the push service that checks the wake carried no content.
+The [QEMU harness](tests/qemu/run-e2e.sh) runs this flow in an emulated enclave, with a stub in place of the push service that checks the wake carried no content.
 
 ## Try it locally
 
@@ -242,12 +242,12 @@ The harness boots the real runtime image in QEMU's `nitro-enclave` machine with 
 rustup target add wasm32-wasip2
 sudo modprobe vsock_loopback
 
-docker build -t enclave-qemu-nitro:latest deploy/qemu-nitro   # built from source; ~680 MB
+docker build -t enclave-qemu-nitro:latest tests/qemu   # built from source; ~680 MB
 cargo install vhost-device-vsock --version 0.3.0 --locked \
   --root target/qemu-nitro/tools
 
 # Builds the example guest and starts MinIO and a push stub.
-deploy/qemu-nitro/dev-enclave.sh --keep-store
+tests/qemu/dev-enclave.sh --keep-store
 ```
 
 The first run builds an enclave image and takes a while. The harness prints the URL (default `https://127.0.0.1:8443`), PCR0, PCR16 and the trust-root path, then keeps running.
@@ -276,7 +276,7 @@ With `--keep-store`, restarting the harness preserves the store and its tenants.
 ### 4. Bring your own component
 
 ```bash
-deploy/qemu-nitro/dev-enclave.sh \
+tests/qemu/dev-enclave.sh \
   --guest path/to/component.wasm \
   --keep-store \
   --guest-env SERVICE_URL=http://192.168.127.254:7070
@@ -326,7 +326,7 @@ fetch component → SHA-256 → extend PCR16 → lock → re-read the register �
 
 The runtime refuses to start if PCR16 was already extended or locked, or if the register after extending or locking does not hold what a client computes from the component (`nitro-attest --measure` and the `guest-release` build compute it). A guest-only update changes PCR16 and the client pins without an image rebuild; changes to runtime code or measured configuration change PCR0.
 
-The runtime places an enclave recipient key in an NSM attestation request. Each release has its own key, found under `<ENCLAVE_KMS_KEY_ALIAS>/<sha256(pcr0 ‖ pcr16)>`. The runtime calls `GenerateDataKey` on a release's first boot and `Decrypt` on every boot after, and accepts only `CiphertextForRecipient`, never a plaintext fallback. SSM holds the KMS ciphertext, and the roots bucket holds a pointer that is checked by digest. **The KMS key policy is what enforces release:** it must constrain both `kms:GenerateDataKey` and `kms:Decrypt` on both `kms:RecipientAttestation:PCR0` and `kms:RecipientAttestation:PCR16`. **And nobody may be able to change it.** Before every use the runtime reads the key, its policy and its grants from KMS and refuses unless the key is single-region, generated by KMS and customer managed, has no grants, and its policy allows only reading the key, deleting it, and those two actions pinned to this enclave's PCR0 and PCR16 — no `PutKeyPolicy`, no `CreateGrant`, no wildcards ([`keys/policy.rs`](runtime/src/keys/policy.rs)). Such a policy is set once (it needs `BypassPolicyLockoutSafetyCheck`) and is then permanent: what remains to an attacker is deleting the key, which stops the enclave and reveals nothing. The emulator's `testing` build takes a static key instead, which does not protect it from its operator.
+The runtime places an enclave recipient key in an NSM attestation request. Each release has its own key, found under `alias/<ENCLAVE_NAME>/<sha256(pcr0 ‖ pcr16)>`. The runtime calls `GenerateDataKey` on a release's first boot and `Decrypt` on every boot after, and accepts only `CiphertextForRecipient`, never a plaintext fallback. SSM holds the KMS ciphertext, and the roots bucket holds a pointer that is checked by digest. **The KMS key policy is what enforces release:** it must constrain both `kms:GenerateDataKey` and `kms:Decrypt` on both `kms:RecipientAttestation:PCR0` and `kms:RecipientAttestation:PCR16`. **And nobody may be able to change it.** Before every use the runtime reads the key, its policies and its grants from KMS and refuses unless the key is single-region, generated by KMS and customer managed, has no grants, has no key policy but `default` (a key shared through AWS RAM gets a second one, `AWS_RAM`, which KMS honours too), and its policy allows only reading the key, deleting it, and those two actions pinned to this enclave's PCR0 and PCR16 — no `PutKeyPolicy`, no `CreateGrant`, no wildcards ([`keys/policy.rs`](runtime/src/keys/policy.rs)). Such a policy is set once (it needs `BypassPolicyLockoutSafetyCheck`) and is then permanent: what remains to an attacker is deleting the key, which stops the enclave and reveals nothing. The emulator's `testing` build takes a static key instead, which does not protect it from its operator.
 
 A release's key protects only what that release keeps for itself: the keys of the tenants whose background work it runs. Tenants' data is not under it. Each tenant's pool opens with a key `k` that the owner's share and the cosigner's derive together at sign-in, by threshold ECDH. The app sends its half only to a release whose PCR0 and PCR16 it approves. So a new runtime or guest reads every tenant's data as soon as that tenant's owner signs in to it, and nothing is migrated ([details](docs/STORAGE.md)).
 
@@ -376,19 +376,21 @@ Rollback is what ZFS alone cannot stop, since the parent holds the disk. So befo
 
 ## Configuration
 
-Every setting is baked into the image and measured into PCR0, so changing one means building a new image, just as changing a constant would. A production binary therefore reads only what differs between deployments, and `--help` lists exactly these:
+Every setting is baked into the image and measured into PCR0, so changing one means building a new image, just as changing a constant would. A production binary therefore reads only what differs between deployments, from environment variables named after its settings (`roots_bucket` is `ENCLAVE_ROOTS_BUCKET`), and has no command line:
 
 | Setting | What it names |
 |---|---|
-| `ENCLAVE_ROOTS_BUCKET`, `ENCLAVE_BUCKET_PREFIX` | The Object-Locked bucket, and a key prefix so deployments can share one |
+| `ENCLAVE_NAME` | The deployment's name, which names every AWS resource it uses, by one rule (listed in the e2e's [`deployment.nix`](tests/qemu/deployment.nix)): the Object-Locked `<name>-roots` bucket; each release's KMS key under `alias/<name>/<release id>` and its sealed master secret under `/<name>/master-key/` in SSM, the id being `sha256(pcr0 ‖ pcr16)`; the operator master, an SSM SecureString at `/<name>/operator-master` from which each wallet key's cosigner half is derived and under which it is sealed (written by the operator after boot and never changed; the instance role needs `ssm:GetParameter` on it and `kms:Decrypt` on its key); the `/<name>/guest` log group; the `<name>` metrics namespace; and the `<name>-tasks` table, queue and schedule group with the `<name>-scheduler` role |
+| `ENCLAVE_BUCKET_PREFIX` | A key prefix inside the roots bucket |
 | `ENCLAVE_ID` | The filesystem id, which salts every key |
-| `ENCLAVE_KMS_KEY_ALIAS`, `ENCLAVE_MASTER_KEY_PARAMETER` | Where each release finds its KMS key and its sealed master secret: `<alias>/<release id>` and `<parameter>/<release id>`, the id being `sha256(pcr0 ‖ pcr16)` |
-| `ENCLAVE_OPERATOR_MASTER_PARAMETER` | The SSM SecureString holding the operator master: each wallet key's cosigner half is derived from it and sealed under it. Written by the operator after boot, and never changed. The instance role needs `ssm:GetParameter` on it and `kms:Decrypt` on its key. Setting it turns sign-in on; left unset, every request reaches the guest unauthenticated, with a warning at boot |
+| `ENCLAVE_ACCOUNT_ID` | The AWS account, which the task queue's URL and the scheduler role's ARN carry; needed only with `ENCLAVE_TASKS` |
 | `ENCLAVE_RELEASE` | This runtime release's number, written into every anchor; a pool last written by a higher one is refused |
 | `ENCLAVE_ROOT_RETENTION_SECS` | How long anchors and registry records are locked (ten years by default) |
 | `ENCLAVE_PUSH_APP_ID` | An AWS End User Messaging Push application, or empty for none |
-| `ENCLAVE_GUEST_LOG_GROUP` | A CloudWatch group for guest output, written to its `guest` stream, or empty for the console only |
-| `ENCLAVE_TASK_TABLE`, `ENCLAVE_TASK_QUEUE_URL`, `ENCLAVE_TASK_SCHEDULE_GROUP`, `ENCLAVE_TASK_SCHEDULER_ROLE_ARN` | Where background tasks are recorded, delivered and scheduled, and the role the scheduler sends with: all four, or none for no background tasks. `deploy/tofu` creates them |
+| `ENCLAVE_GUEST_LOGS` | Guest output to the deployment's log group as well as the console |
+| `ENCLAVE_TASKS` | Background tasks through the deployment's task resources; off, none |
+| `ENCLAVE_XRAY`, `ENCLAVE_METRICS` | Guest traces to X-Ray, and guest metrics to CloudWatch under the deployment's namespace |
+| `ENCLAVE_SELF_CHECK` | Report on the clock and entropy source and exit, for diagnosing a deployment |
 | `AWS_REGION` | The region |
 
 Everything else is fixed:
@@ -398,7 +400,7 @@ Everything else is fixed:
 - The server listens on :443 with a self-signed certificate made at boot.
 - The guest is `guest/guest.wasm` in the roots bucket.
 - Background tasks run when the guest exports `run-task`, scheduled where the task settings say.
-- A guest's environment is exactly the settings its file carries ([`guest-env.py`](deploy/qemu-nitro/guest-env.py) writes them), measured into PCR16 with its code. Nothing from the runtime's environment reaches it.
+- A guest's environment is exactly the settings its file carries ([`guest-env.py`](tests/qemu/guest-env.py) writes them), measured into PCR16 with its code. Nothing from the runtime's environment reaches it.
 - `RUST_LOG` sets the runtime's own logging; `guest=warn` filters guest output.
 
 The emulator's alternatives exist only in the `testing` build, which the emulator image uses: a static master key, a fixed operator master, the host clock, MinIO, stubs for push and logs, and background tasks held in memory. A production binary has none of these settings and none of that code.
@@ -435,7 +437,7 @@ cargo build --release -p enclave-runtime --features testing --bin wallet-client 
 
 `cargo test --workspace` alone does not replace these: ignored tests need `--include-ignored`, guests build separately, and some binaries need features. Keep the `testing` feature out of production images.
 
-**Deploying.** Nix builds the measured enclave image; Packer ([`deploy/ami`](deploy/ami/)) builds the parent AMI; OpenTofu ([`deploy/tofu`](deploy/tofu/)) defines buckets, retention, parent resources and logs.
+**Deploying** happens outside this repository, which builds the runtime and tests it, in an emulated enclave. A deployment keeps a file in the shape of the e2e's [`deployment.nix`](tests/qemu/deployment.nix) with its own infrastructure, and builds its image from it with this flake's `lib.x86_64-linux.mkEif`. Here, `nix build .#eif` is the production binary with the e2e's settings, for checking the build reproduces.
 
 ```bash
 nix build .#eif                                     # result/enclave.eif, result/pcr.json
@@ -443,14 +445,16 @@ nix build .#guest-release --out-link guest-release  # guest.wasm, guest-pcr16.js
 nix build .#eif --rebuild                           # rebuild and compare
 ```
 
-1. Set the bucket identities, filesystem ID, region, KMS key, master-key and operator-master parameters, root retention, guest object key and push application in [`deployment.nix`](deploy/nix/deployment.nix) — or, for a deployment kept in its own repository, in a file of the same shape built with `lib.x86_64-linux.mkEif`.
-2. Build the EIF and the guest, and keep PCR0 and PCR16 as release outputs.
-3. Provision from `deploy/tofu`. The KMS key, its policy and SSM access are provisioned separately for now; the module's outputs (`role_arn`, `security_group_id`, …) are there for a deployment that adds them.
-4. Upload the approved component and bind KMS release to the approved measurements.
-5. Start the parent's enclave and gvproxy services. The parent forwards TLS; it never terminates it.
-6. From a client pinning the release measurements, verify the boot mode, the trusted devices, key release, the TLS attestation binding, registration and sign-in, and persistence.
+What a deployment provides:
 
-Reproducibility, and which inputs remain pinned AWS prebuilt artifacts, are covered in the [Nix build guide](deploy/nix/README.md).
+1. Its image, from its own `deployment.nix` through `mkEif`, and the guest, keeping PCR0 and PCR16 as release outputs.
+2. The AWS resources its name names (the list is in [`deployment.nix`](tests/qemu/deployment.nix)): the Object-Locked roots bucket, made beforehand; the log group; and, with tasks, the table, queue and schedule group, in the shape [`tasks_aws.rs`](runtime/tests/tasks_aws.rs) creates them against LocalEmu.
+3. A KMS key per release under `alias/<name>/<release id>`, whose policy is locked to that release's PCR0 and PCR16 ([`keys/policy.rs`](runtime/src/keys/policy.rs) says what the runtime accepts). The instance role must be able to call `DescribeKey`, `GetKeyPolicy`, `ListKeyPolicies` and `ListGrants` on it.
+4. A parent that runs the enclave, gvproxy for its network, and an NBD server for the pool's disk. It forwards TLS and never terminates it.
+5. The approved guest, uploaded to `guest/guest.wasm` in the roots bucket.
+6. A check from a client that pins the release measurements: the boot mode, the trusted devices, key release, the TLS attestation binding, registration and sign-in, and persistence.
+
+Reproducibility, and which inputs remain pinned AWS prebuilt artifacts, are covered in the [Nix build guide](nix/README.md).
 
 ## Limits and remaining work
 
@@ -465,7 +469,7 @@ Reproducibility, and which inputs remain pinned AWS prebuilt artifacts, are cove
 | Recovery | None yet. A wallet key is 2-of-2, so a tenant whose app loses its share is lost. A recovery share would derive the same tenant id and data key |
 | Capacity | Each tenant gets a fixed 64 MiB region at registration, the smallest ZFS allows: about 16,000 tenants per TiB, committed whether or not the tenant stays active. Once the disk is full, registration is refused; more room means a bigger disk |
 | Single active writer | One enclave imports the pool; no failover |
-| Parent disk on Nitro | tofu creates the pool's EBS volume and the AMI serves it with stock nbdkit (`deploy/ami/units/nbdkit.service`); not yet proven on hardware. The emulator serves a disk image with `deploy/qemu-nitro/nbd-stub.py` |
+| Parent disk on Nitro | A deployment's parent serves the pool's EBS volume with stock nbdkit; not yet proven on hardware. The emulator serves a disk image with `tests/qemu/nbd-stub.py` |
 | Anchors | Serial across tenants; each is a pool sync and an S3 round trip |
 | Resource isolation | Cache and queue limits exist; per-guest memory quotas and public-service admission control do not |
 | Upgrades | A new PCR16 is not a migration. The guest owns its schema and queued-payload evolution |
@@ -485,9 +489,8 @@ The [roadmap](docs/ROADMAP.md) records milestone history.
 | [`runtime/src/store`](runtime/src/store/) | The roots bucket's S3 backend, the key hierarchy and signing |
 | [`examples`](examples/) | Guests: HTTP (tasks and notify), bidirectional gRPC, one that signs with `enclave:signer`, and SQLite |
 | [`clients/react-native`](clients/react-native/) | The client library for native apps, `@vtxos/react-native-wallet`: [`net`](clients/react-native/rust/vtxos-client/src/net/) and [`core`](clients/react-native/rust/vtxos-client/src/core/) in Rust, the UniFFI exports, the React Native package and its example app |
-| [`deploy/qemu-nitro`](deploy/qemu-nitro/) | Development enclave, emulator self-test, end-to-end harness |
-| [`deploy/nix`](deploy/nix/), [`nix`](nix/) | Measured configuration and reproducible EIF assembly |
-| [`deploy/ami`](deploy/ami/), [`deploy/tofu`](deploy/tofu/) | Parent AMI and AWS infrastructure |
+| [`tests/qemu`](tests/qemu/) | Development enclave, emulator self-test, end-to-end harness, and the deployment it boots |
+| [`nix`](nix/) | Reproducible EIF assembly |
 | [`docs`](docs/) | [Client integration](docs/CLIENT_INTEGRATION.md), [notifications](docs/NOTIFICATIONS.md), [streaming](docs/STREAMING.md), [background tasks](docs/BACKGROUND_TASKS.md), [storage](docs/STORAGE.md), [compatibility](docs/COMPATIBILITY.md), [development enclave](docs/DEV_ENCLAVE.md) |
 
 ## License

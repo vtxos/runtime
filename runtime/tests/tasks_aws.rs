@@ -71,7 +71,7 @@ fn credentials() -> aws_credential_types::Credentials {
     aws_credential_types::Credentials::new("test", "test", None, None, "localemu")
 }
 
-/// Make what `deploy/tofu` makes — the table with its index and TTL, the queue, the schedule
+/// Make what a deployment makes for background tasks — the table with its index and TTL, the queue, the schedule
 /// group — and the runtime's settings for them.
 async fn provision(emu: &LocalEmu) -> TasksConfig {
     use aws_sdk_dynamodb::types::{

@@ -87,7 +87,7 @@ pub fn from_guest(component: &[u8]) -> anyhow::Result<Vec<(String, String)>> {
 }
 
 /// `component` with `settings` appended as its [`GUEST_SETTINGS_SECTION`] — what
-/// `deploy/qemu-nitro/guest-env.py` writes, for tests that need a configured guest.
+/// `tests/qemu/guest-env.py` writes, for tests that need a configured guest.
 #[cfg(any(test, feature = "testing"))]
 pub fn with_settings_section(component: &[u8], settings: &[(&str, &str)]) -> Vec<u8> {
     fn leb128(mut value: usize, out: &mut Vec<u8>) {

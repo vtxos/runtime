@@ -70,7 +70,7 @@ pub fn web_pki_client_config() -> Result<rustls::ClientConfig> {
 
 impl HttpsTransport {
     /// `allow_plaintext` exists for the emulator harness, which points the
-    /// runtime at a local stub. It is the same downgrade `--guest-log-endpoint`
+    /// runtime at a local stub. It is the same downgrade `ENCLAVE_GUEST_LOG_ENDPOINT`
     /// already is, and PCR0 records which image was built.
     pub fn new(allow_plaintext: bool) -> Result<Self> {
         let builder =

@@ -80,7 +80,7 @@ const REGISTRATION_TTL: Duration = Duration::from_secs(300);
 /// Half-finished registrations allowed at once.
 const MAX_REGISTRATIONS: usize = 64;
 /// Ceiling on an `/auth/*` request body.
-const MAX_BODY: usize = 16 * 1024;
+pub const MAX_BODY: usize = 16 * 1024;
 
 type Body = wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 

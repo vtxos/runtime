@@ -85,7 +85,7 @@ HTTPS_PORT="${HTTPS_PORT:-8443}"
 LABEL="enclave-harness=$PREFIX"
 
 # These do *not* follow PREFIX, and must not. They are baked into the emulator
-# image as ENCLAVE_ROOTS_BUCKET (flake.nix, `eif-qemu`), which
+# image as ENCLAVE_NAME=e2e, whose bucket is `e2e-roots` (deployment.nix), which
 # means they are covered by PCR0 — an enclave image is its configuration as much
 # as its code. A run that named its buckets after itself would stand up a store
 # the enclave does not look in, and the enclave would fail at boot with
@@ -103,7 +103,7 @@ enclave_preflight() {
         return
     fi
     command -v nix >/dev/null || {
-        echo "nix is not on PATH; see deploy/nix/README.md" >&2; exit 1; }
+        echo "nix is not on PATH; see nix/README.md" >&2; exit 1; }
 
     # Flakes copy only what git tracks, which cost twenty minutes to learn: a *source* file
     # that git does not track is invisible to the build no matter that the
@@ -163,7 +163,7 @@ enclave_preflight_host() {
         }
         docker image inspect "$IMAGE" >/dev/null 2>&1 || {
             echo "missing QEMU image $IMAGE — build it:" >&2
-            echo "  docker build -t $IMAGE deploy/qemu-nitro" >&2
+            echo "  docker build -t $IMAGE tests/qemu" >&2
             exit 1
         }
     fi
@@ -313,7 +313,7 @@ enclave_build_guest() {
         # none. What PCR16 should be is then this configured file's, measured below.
         local settings
         IFS=, read -ra settings <<<"$GUEST_ENV"
-        python3 "$REPO/deploy/qemu-nitro/guest-env.py" "$RUNDIR/guests/guest.wasm" "${settings[@]}"
+        python3 "$REPO/tests/qemu/guest-env.py" "$RUNDIR/guests/guest.wasm" "${settings[@]}"
         EXPECTED_PCR16=""
         echo "guest settings: ${settings[*]%%=*}"
     fi
@@ -441,7 +441,7 @@ enclave_start_parent() {
 
     # init writes 0xB7 to the parent on port 9000 and waits. Unanswered, the
     # kernel boots and then nothing happens at all.
-    python3 "$REPO/deploy/qemu-nitro/heartbeat.py" 9000 > "$RUNDIR/heartbeat.log" 2>&1 &
+    python3 "$REPO/tests/qemu/heartbeat.py" 9000 > "$RUNDIR/heartbeat.log" 2>&1 &
     pids+=($!)
     hooks_start
 
@@ -453,7 +453,7 @@ enclave_start_parent() {
     # Not with real notifications: the image then talks to AWS, and has no stub to dial.
     PUSH_RECORD="$RUNDIR/push-messages.jsonl"
     if [[ -z "$PUSH_APP_ID" ]]; then
-        python3 "$REPO/deploy/qemu-nitro/push-stub.py" "$PUSH_RECORD" > "$RUNDIR/push-stub.log" 2>&1 &
+        python3 "$REPO/tests/qemu/push-stub.py" "$PUSH_RECORD" > "$RUNDIR/push-stub.log" 2>&1 &
         pids+=($!)
         # Listening, or dead because the port is taken. Whatever holds it — Dart DevTools, another
         # run's stub — would answer the runtime in this stub's place: its boot refuses most answers
@@ -487,7 +487,7 @@ enclave_start_parent() {
     ZFS_IMG="$RUNDIR/zfs.img"
     [[ -n "$KEEP_STORE" ]] && ZFS_IMG="$STORE_DIR/zfs.img"
     [[ -e "$ZFS_IMG" ]] || truncate -s "${ZFS_SIZE:-4G}" "$ZFS_IMG"
-    python3 "$REPO/deploy/qemu-nitro/nbd-stub.py" 10809 "$ZFS_IMG" > "$RUNDIR/nbd.log" 2>&1 &
+    python3 "$REPO/tests/qemu/nbd-stub.py" 10809 "$ZFS_IMG" > "$RUNDIR/nbd.log" 2>&1 &
     pids+=($!)
 
     # The enclave's only route to anything. Without it the runtime waits for the
@@ -532,7 +532,7 @@ EOF
     # The enclave reaches gvproxy on vsock port 1024. Not gvproxy's own vsock listener: that
     # binds one CID, the kernel's choice, and the enclave's connections arrive on the loopback's.
     # vsock-relay.py binds every CID and hands each connection to the socket above.
-    python3 "$REPO/deploy/qemu-nitro/vsock-relay.py" 1024 "$RUNDIR/network.sock" \
+    python3 "$REPO/tests/qemu/vsock-relay.py" 1024 "$RUNDIR/network.sock" \
         > "$RUNDIR/vsock-relay.log" 2>&1 &
     pids+=($!)
     for _ in $(seq 50); do
@@ -615,7 +615,7 @@ nonce() { openssl rand 20 | basenc --base64url | tr -d '='; }
 hooks_start() {
     [[ -n "${HOOKS_PID:-}" ]] && { kill "$HOOKS_PID" 2>/dev/null || true; wait "$HOOKS_PID" 2>/dev/null || true; }
     : > "$RUNDIR/hooks.rules"; : > "$RUNDIR/hooks.release"
-    python3 "$REPO/deploy/qemu-nitro/test-hooks.py" 9101 "$RUNDIR" > "$RUNDIR/hooks.log" 2>&1 &
+    python3 "$REPO/tests/qemu/test-hooks.py" 9101 "$RUNDIR" > "$RUNDIR/hooks.log" 2>&1 &
     HOOKS_PID=$!
     pids+=("$HOOKS_PID")
     for _ in $(seq 50); do grep -q listening "$RUNDIR/hooks.log" && return; sleep 0.1; done
@@ -771,7 +771,7 @@ enclave_pack() {
     # Packing does not run the image, but it does ship it.
     docker image inspect "$IMAGE" >/dev/null 2>&1 || {
         echo "missing QEMU image $IMAGE — build it:" >&2
-        echo "  docker build -t $IMAGE deploy/qemu-nitro" >&2
+        echo "  docker build -t $IMAGE tests/qemu" >&2
         exit 1
     }
     enclave_build_image
@@ -787,9 +787,9 @@ enclave_pack() {
 
     # The harness itself, the MinIO scripts it calls, the wasi-sdk pin a guest build needs, and
     # the WIT guests are built against — tracked files only, as the image build saw them. A
-    # bundle then runs from its own copy of deploy/qemu-nitro: lib.sh's REPO is the bundle, and
+    # bundle then runs from its own copy of tests/qemu: lib.sh's REPO is the bundle, and
     # nothing has to be checked out beside it.
-    git -C "$REPO" ls-files -z deploy/qemu-nitro scripts/lib.sh scripts/minio-up.sh \
+    git -C "$REPO" ls-files -z tests/qemu scripts/lib.sh scripts/minio-up.sh \
         scripts/minio-image.sh scripts/wasi-sdk.sh wit \
         | (cd "$REPO" && xargs -0 cp --parents -t "$PACK_DIR")
 

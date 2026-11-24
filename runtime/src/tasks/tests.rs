@@ -233,7 +233,7 @@ async fn a_delivery_before_its_time_is_dropped() {
     let task = aws_task(&aws, [1; 16], "later").await;
     assert_eq!(task.state, TaskState::Scheduled);
     assert!(aws.schedules.exists(&task.schedule).await.unwrap());
-    let early = Message::due([1; 16], "later", task.generation, later);
+    let early = Message::due([1; 16], "later", task.generation, later).unwrap();
     aws.deliveries.send(&early, Duration::ZERO).await.unwrap();
     q.drain(&runner(&fake)).await;
     assert!(fake.runs().is_empty(), "a task ran two hours early");
@@ -307,6 +307,72 @@ async fn retries_back_off_keep_their_run_id_and_eventually_stop() {
     let runs = fake.runs();
     assert_eq!(runs.len(), MAX_ATTEMPTS as usize);
     assert!(runs.iter().all(|j| j.run_id() == runs[0].run_id()));
+}
+
+/// The parent can put messages of its own on the queue, and a recurring task's occurrence is its
+/// message's time. Without the signed interval to hold it to, a task due every minute ran on
+/// messages a millisecond apart, each with a run id of its own.
+#[tokio::test]
+async fn an_occurrence_sooner_than_its_interval_is_dropped() {
+    let Setup { q, aws, clock } = setup(Default::default()).await;
+    let fake = Arc::new(Fake::default());
+    q.enqueue([1; 16], "beat".into(), b"tick".to_vec(), 0, Some(MINUTE_MS))
+        .await
+        .unwrap();
+    assert_eq!(aws.schedules.fire_due().await, 1);
+    q.drain(&runner(&fake)).await;
+    assert_eq!(fake.runs().len(), 1);
+    let first = fake.runs()[0].occurrence;
+    let task = aws_task(&aws, [1; 16], "beat").await;
+    for forged in [first + 1, first + 30_000, first + MINUTE_MS - 2_000] {
+        let body = Message::due([1; 16], "beat", task.generation, forged).unwrap();
+        aws.deliveries.send(&body, Duration::ZERO).await.unwrap();
+        q.drain(&runner(&fake)).await;
+    }
+    assert_eq!(
+        fake.runs().len(),
+        1,
+        "an occurrence the schedule never made ran"
+    );
+    assert!(aws.deliveries.is_empty());
+
+    // The schedule's own next one still runs.
+    clock.advance(MINUTE_MS);
+    assert_eq!(aws.schedules.fire_due().await, 1);
+    q.drain(&runner(&fake)).await;
+    assert_eq!(fake.runs().len(), 2);
+}
+
+/// An attempt can record its occurrence's outcome and end — a crash, a failed write — before its
+/// one-time task is settled. The task read as pending for good: a redelivery found the occurrence
+/// finished and dropped the message, and the reconciler only asked whether it had fired.
+#[tokio::test]
+async fn a_finished_occurrence_settles_its_task_on_redelivery_and_on_reconcile() {
+    let Setup { q, aws, .. } = setup(Default::default()).await;
+    let fake = Arc::new(Fake::default());
+    add(&q, 1, "job", 0).await;
+    let body = aws.deliveries.bodies().remove(0);
+    q.drain(&runner(&fake)).await;
+    assert_eq!(q.status([1; 16], "job").await.unwrap().status, "completed");
+
+    let unsettle = || async {
+        let mut task = aws_task(&aws, [1; 16], "job").await;
+        let expected = task.version;
+        task.state = TaskState::Scheduled;
+        task.version += 1;
+        assert!(aws.table.put_task(&task, Some(expected)).await.unwrap());
+        assert_eq!(q.status([1; 16], "job").await.unwrap().status, "pending");
+    };
+
+    unsettle().await;
+    aws.deliveries.send(&body, Duration::ZERO).await.unwrap();
+    q.drain(&runner(&fake)).await;
+    assert_eq!(fake.runs().len(), 1, "the finished occurrence ran again");
+    assert_eq!(q.status([1; 16], "job").await.unwrap().status, "completed");
+
+    unsettle().await;
+    q.reconcile().await.unwrap();
+    assert_eq!(q.status([1; 16], "job").await.unwrap().status, "completed");
 }
 
 /// Each occurrence is its own: one that fails for good does not stop the next.

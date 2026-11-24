@@ -203,13 +203,16 @@ impl KmsKeyConfig {
         )
     }
 
-    /// The SSM parameter a release's ciphertext is kept in. Per release, since
-    /// a parameter is written once and never overwritten.
-    pub fn parameter(&self, vid: &[u8; 32]) -> String {
+    /// The SSM parameter a minted ciphertext is kept in: under its release, and
+    /// named after the ciphertext itself. A parameter is written once and never
+    /// overwritten, so a first boot that failed after writing one must not leave
+    /// the name its retry needs taken.
+    pub fn parameter(&self, vid: &[u8; 32], ciphertext_sha256: &[u8; 32]) -> String {
         format!(
-            "{}/{}",
+            "{}/{}/{}",
             self.parameter.trim_end_matches('/'),
-            hex::encode(vid)
+            hex::encode(vid),
+            hex::encode(&ciphertext_sha256[..8])
         )
     }
 }
@@ -285,14 +288,34 @@ impl KmsAttestedKey {
             .with_context(|| format!("KMS DescribeKey {key_id}"))?;
         let metadata = described.key_metadata().context("KMS described no key")?;
         policy::check_key(metadata).with_context(|| format!("refusing KMS key {key_id}"))?;
+        // Every call after DescribeKey names the key itself. KMS takes an alias
+        // only there and in cryptographic operations, and a name resolved once
+        // cannot be repointed between the calls that check it.
         let resolved = metadata
             .arn()
             .unwrap_or_else(|| metadata.key_id())
             .to_string();
+        // A key shared through AWS RAM carries a second policy, `AWS_RAM`, which
+        // KMS evaluates together with `default`. Checking `default` alone would
+        // pass a key that also releases to whoever it is shared with.
+        let policies = self
+            .kms
+            .list_key_policies()
+            .key_id(&resolved)
+            .send()
+            .await
+            .context("KMS ListKeyPolicies")?;
+        let names = policies.policy_names();
+        if policies.truncated() || names.len() != 1 || names[0] != "default" {
+            bail!(
+                "refusing KMS key {key_id}: it has the key policies {names:?}, and only one named \
+                 `default` can be checked"
+            );
+        }
         let policy = self
             .kms
             .get_key_policy()
-            .key_id(key_id)
+            .key_id(&resolved)
             .policy_name("default")
             .send()
             .await
@@ -308,7 +331,7 @@ impl KmsAttestedKey {
         let grants = self
             .kms
             .list_grants()
-            .key_id(key_id)
+            .key_id(&resolved)
             .send()
             .await
             .context("KMS ListGrants")?;
@@ -368,7 +391,6 @@ impl MasterKeySource for KmsAttestedKey {
     async fn mint(&self) -> Result<(MasterSecret, SealedKey)> {
         let vid = self.vid()?;
         let key_id = self.verify_key(&self.config.alias(&vid)).await?;
-        let parameter = self.config.parameter(&vid);
         let (key, recipient) = self.recipient()?;
 
         let mut request = self
@@ -402,17 +424,20 @@ impl MasterKeySource for KmsAttestedKey {
             .as_ref();
         let secret = to_secret(key.unwrap_ciphertext(for_recipient)?)?;
 
+        let ciphertext_sha256 = nitro_attestation::sha256(&ciphertext);
+        let parameter = self.config.parameter(&vid, &ciphertext_sha256);
         let pointer = KeyPointer {
             parameter: parameter.clone(),
             key_id,
             context: self.config.context(&vid),
-            ciphertext_sha256: nitro_attestation::sha256(&ciphertext),
+            ciphertext_sha256,
         };
 
         // The parameter before the pointer. `boot.rs` writes the pointer once,
-        // after this, so a failure here leaves a release with no pointer — a
-        // first boot it can retry. The reverse order would leave a pointer
-        // aimed at nothing.
+        // after this, so a failure anywhere leaves a release with no pointer —
+        // a first boot it can retry. The retry mints again and, its ciphertext
+        // being new, writes under a new name. The reverse order would leave a
+        // pointer aimed at nothing.
         self.ssm
             .put_parameter()
             .name(&parameter)
@@ -422,9 +447,9 @@ impl MasterKeySource for KmsAttestedKey {
             // under a second key would add a second thing to get the policy
             // right on, and the weaker of the two would be the one that counts.
             .r#type(aws_sdk_ssm::types::ParameterType::String)
-            // A parameter that already exists means a previous first boot of
-            // this release got this far. Overwriting would strand whatever
-            // pointer it belonged to.
+            // Named after its own ciphertext, so a parameter that already
+            // exists holds exactly this; overwriting could only strand the
+            // pointer it belongs to.
             .overwrite(false)
             .send()
             .await
@@ -621,8 +646,17 @@ mod tests {
             format!("alias/aegira-prod/{}", "cd".repeat(32))
         );
         assert_eq!(
-            config.parameter(&[0xcd; 32]),
-            format!("/aegira/prod/master-key/{}", "cd".repeat(32))
+            config.parameter(&[0xcd; 32], &[0xef; 32]),
+            format!(
+                "/aegira/prod/master-key/{}/{}",
+                "cd".repeat(32),
+                "ef".repeat(8)
+            )
+        );
+        assert_ne!(
+            config.parameter(&[0xcd; 32], &[0xef; 32]),
+            config.parameter(&[0xcd; 32], &[0xee; 32]),
+            "a retried first boot writes under a new name"
         );
         assert_ne!(config.alias(&[0xcd; 32]), config.alias(&[0xce; 32]));
     }
@@ -663,6 +697,10 @@ mod tests {
                     "KeyUsage": "ENCRYPT_DECRYPT", "KeyState": "Enabled"
                 }}),
             )
+        }
+
+        fn policy_names(names: &[&str]) -> ReplayEvent {
+            answer(200, json!({ "PolicyNames": names, "Truncated": false }))
         }
 
         fn policy(policy: serde_json::Value) -> ReplayEvent {
@@ -738,7 +776,11 @@ mod tests {
                 { "Effect": "Allow", "Principal": { "AWS": "arn:aws:iam::1:root" },
                   "Action": "kms:*", "Resource": "*" }
             ]});
-            let (source, replay, _) = source(vec![described(), policy(editable)]);
+            let (source, replay, _) = source(vec![
+                described(),
+                policy_names(&["default"]),
+                policy(editable),
+            ]);
             let err = mint_error(&source).await;
             assert!(
                 err.contains("refusing KMS key alias/k/") && err.contains("allows kms:*"),
@@ -746,7 +788,7 @@ mod tests {
             );
             assert_eq!(
                 replay.actual_requests().count(),
-                2,
+                3,
                 "GenerateDataKey was never sent"
             );
         }
@@ -755,8 +797,12 @@ mod tests {
         async fn a_key_with_grants_is_refused() {
             let (_, _, pair) = source(vec![]);
             let grant = json!({ "Grants": [{ "GrantId": "g", "KeyId": "k" }], "Truncated": false });
-            let (source, _, _) =
-                source(vec![described(), policy(locked(&pair)), answer(200, grant)]);
+            let (source, _, _) = source(vec![
+                described(),
+                policy_names(&["default"]),
+                policy(locked(&pair)),
+                answer(200, grant),
+            ]);
             let err = mint_error(&source).await;
             assert!(err.contains("it has grants"), "{err}");
         }
@@ -769,7 +815,11 @@ mod tests {
                 { "Effect": "Allow", "Principal": { "AWS": "*" },
                   "Action": "kms:PutKeyPolicy", "Resource": "*" }
             ]});
-            let (source, replay, _) = source(vec![described(), policy(editable)]);
+            let (source, replay, _) = source(vec![
+                described(),
+                policy_names(&["default"]),
+                policy(editable),
+            ]);
             let sealed = KeyPointer {
                 parameter: "/p".into(),
                 key_id: "k".into(),
@@ -783,7 +833,7 @@ mod tests {
                 Err(err) => format!("{err:#}"),
             };
             assert!(err.contains("allows kms:PutKeyPolicy"), "{err}");
-            assert_eq!(replay.actual_requests().count(), 2);
+            assert_eq!(replay.actual_requests().count(), 3);
         }
 
         /// Past the checks, the next thing asked of KMS is the key itself.
@@ -793,13 +843,29 @@ mod tests {
             let stop = json!({ "__type": "DisabledException", "message": "the test stops here" });
             let (source, replay, _) = source(vec![
                 described(),
+                policy_names(&["default"]),
                 policy(locked(&pair)),
                 answer(200, json!({ "Grants": [], "Truncated": false })),
                 answer(400, stop),
             ]);
             let err = mint_error(&source).await;
             assert!(err.contains("GenerateDataKey"), "{err}");
-            assert_eq!(replay.actual_requests().count(), 4);
+            assert_eq!(replay.actual_requests().count(), 5);
+        }
+
+        /// A key shared through AWS RAM has a second policy that KMS honours
+        /// beside `default`; it is refused before either is read.
+        #[tokio::test]
+        async fn a_key_shared_through_ram_is_refused() {
+            let (source, replay, _) =
+                source(vec![described(), policy_names(&["default", "AWS_RAM"])]);
+            let err = mint_error(&source).await;
+            assert!(err.contains("AWS_RAM"), "{err}");
+            assert_eq!(
+                replay.actual_requests().count(),
+                2,
+                "nothing read past the list"
+            );
         }
     }
 }

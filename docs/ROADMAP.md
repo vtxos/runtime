@@ -135,7 +135,7 @@ Everything except the NSM calls can be tested without hardware: the vsock
 client against a local listener, the credential refresh against MinIO, and the
 key-source abstraction with a fake that returns fixed bytes.
 
-The NSM calls themselves now have a home too. [`deploy/qemu-nitro/`](../deploy/qemu-nitro/)
+The NSM calls themselves now have a home too. [`tests/qemu/`](../tests/qemu/)
 builds an EIF and boots it on QEMU's `nitro-enclave` machine, where
 `GetRandom` against the emulated device already passes. Attestation should
 extend that harness rather than wait for hardware: `eif_build` produces genuine

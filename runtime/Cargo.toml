@@ -45,8 +45,9 @@ required-features = ["testing"]
 default = []
 # `nitro-attestation/testing` costs nothing new: it is `dep:rcgen` plus
 # `dep:time`, and rcgen is already here. It is what lets `testing::Enclave`
-# mint documents a client can actually verify.
-testing = ["dep:tempfile", "nitro-attestation/testing"]
+# mint documents a client can actually verify. `clap` is `wallet-client`'s, the
+# one command-line tool here: the runtime itself reads only its environment.
+testing = ["dep:tempfile", "dep:clap", "nitro-attestation/testing"]
 
 [dependencies]
 # The roots bucket: anchors, boot records, the registry, the guest.
@@ -137,7 +138,7 @@ getrandom   = "0.3"
 # `zfs::Disk::Directory`: the pool stand-in for tests, under `testing`.
 tempfile    = { version = "3", optional = true }
 
-clap        = { version = "4", features = ["derive", "env"] }
+clap        = { version = "4", features = ["derive", "env"], optional = true }
 anyhow      = { workspace = true }
 async-trait = { workspace = true }
 bytes       = { workspace = true }

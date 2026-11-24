@@ -207,23 +207,23 @@ impl DeviceRegistry {
         }
     }
 
-    /// Load a tenant's devices, trimmed to what the caps allow.
+    /// Load a tenant's devices, trimmed to the per-tenant cap.
     ///
-    /// Over a cap, drop the oldest rather than refuse. A device record is a
+    /// Over that cap, drop the oldest rather than refuse. A device record is a
     /// cache of where somebody can be reached, not work that must not be lost
     /// — so unlike a task record, the right answer to too many is to keep the
     /// newest and serve. A store can be over-full legitimately: a lowered cap
     /// in a new image, or records written before the cap was enforced.
+    ///
+    /// The global cap is not applied here. It is about other tenants, so
+    /// trimming against it would delete this tenant's records for devices
+    /// someone else enrolled; it is enforced where a device enrols instead.
     async fn load(&self, devices: &mut Devices, tenant: [u8; 16]) -> Result<()> {
         if devices.loaded.contains(&tenant) {
             return Ok(());
         }
         let mut list = self.scan(tenant).await?;
-        let room = self
-            .limits
-            .max_devices
-            .saturating_sub(devices.total())
-            .min(self.limits.per_tenant);
+        let room = self.limits.per_tenant;
         if list.len() > room {
             let excess = list.len() - room;
             tracing::warn!(
@@ -506,8 +506,8 @@ mod tests {
         let tight = DeviceRegistry::open_with_limits(
             fs,
             DeviceLimits {
-                max_devices: 2,
-                per_tenant: 8,
+                max_devices: 8,
+                per_tenant: 2,
             },
         )
         .await
@@ -519,6 +519,46 @@ mod tests {
             vec![1004, 1005],
             "trimming kept the wrong records"
         );
+    }
+
+    /// The global cap counts every tenant's devices. Applied when a tenant
+    /// loads, it deleted that tenant's records because others had enrolled.
+    #[tokio::test]
+    async fn loading_a_tenant_never_deletes_its_devices_for_another_tenant_s() {
+        let fs = memory().await;
+        let roomy = DeviceRegistry::open_with_limits(
+            fs.clone(),
+            DeviceLimits {
+                max_devices: 8,
+                per_tenant: 8,
+            },
+        )
+        .await
+        .unwrap();
+        roomy.register(ALICE, &token("a0"), 1).await.unwrap();
+        roomy.register(ALICE, &token("a1"), 2).await.unwrap();
+        roomy.register(BOB, &token("b0"), 3).await.unwrap();
+        drop(roomy);
+
+        let full = DeviceRegistry::open_with_limits(
+            fs.clone(),
+            DeviceLimits {
+                max_devices: 2,
+                per_tenant: 8,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(full.count(ALICE).await, 2);
+        assert_eq!(full.count(BOB).await, 1, "Bob lost a device to Alice's");
+        assert!(
+            full.register(BOB, &token("b1"), 4).await.is_err(),
+            "the global cap still refuses a new enrolment"
+        );
+        drop(full);
+
+        let reopened = DeviceRegistry::open(fs).await.unwrap();
+        assert_eq!(reopened.count(BOB).await, 1, "Bob's record was deleted");
     }
 
     #[tokio::test]

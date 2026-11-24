@@ -37,7 +37,7 @@ sudo modprobe vsock_loopback
 Once ever:
 
 ```bash
-docker build -t enclave-qemu-nitro:latest deploy/qemu-nitro
+docker build -t enclave-qemu-nitro:latest tests/qemu
 cargo install vhost-device-vsock --root target/qemu-nitro/tools
 ```
 
@@ -45,7 +45,7 @@ Then, with your component:
 
 ```bash
 cargo build --release --target wasm32-wasip2   # in your guest's crate
-deploy/qemu-nitro/dev-enclave.sh --guest target/wasm32-wasip2/release/<your-guest>.wasm
+tests/qemu/dev-enclave.sh --guest target/wasm32-wasip2/release/<your-guest>.wasm
 ```
 
 The script:

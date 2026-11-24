@@ -156,6 +156,7 @@ impl GuestEnvironment {
         let random = GuestRandom::new(self.entropy.clone());
         wasi.insecure_random_seed(random.insecure_seed()?);
         wasi.secure_random(random);
+        wasi.max_random_size(crate::random::MAX_RANDOM_REQUEST);
 
         Ok(State::new(wasi.build()))
     }

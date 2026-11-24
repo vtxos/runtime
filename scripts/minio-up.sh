@@ -7,7 +7,7 @@
 # is what tests want. With one it lives in that host directory and outlives the
 # container, so a later start with the same directory serves the same store.
 #
-# The SQLite CI job and deploy/qemu-nitro/run-e2e.sh each carried their own copy
+# The SQLite CI job and tests/qemu/run-e2e.sh each carried their own copy
 # of this. Two recipes that have to agree, with nothing making them agree, is
 # how the harness and CI end up testing subtly different stores.
 #
@@ -26,7 +26,7 @@ data_dir="${4:-}"
 image="$("$(dirname "${BASH_SOURCE[0]}")/minio-image.sh")"
 
 # Optional, and applied to every container this starts. A caller that cleans up
-# by label — deploy/qemu-nitro/lib.sh does, so that the list of containers to
+# by label — tests/qemu/lib.sh does, so that the list of containers to
 # remove cannot fall out of step with the list it starts — otherwise leaves this
 # one running, because it is the one container it did not start itself.
 label=()
