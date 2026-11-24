@@ -205,7 +205,7 @@ pub fn open_key_source(
         MasterKeySourceKind::Static => {
             if config.kms_key_alias.is_some() || config.parameter.is_some() {
                 bail!(
-                    "--master-key-source=static was given alongside KMS settings. One of the \
+                    "ENCLAVE_MASTER_KEY_SOURCE=static was given alongside KMS settings. One of the \
                      two is not what was meant, and guessing which would mean an enclave \
                      silently taking its key from configuration."
                 );
@@ -213,13 +213,13 @@ pub fn open_key_source(
             let hex = config
                 .master_key
                 .as_deref()
-                .context("--master-key-source=static needs --master-key (ENCLAVE_MASTER_KEY)")?;
+                .context("ENCLAVE_MASTER_KEY_SOURCE=static needs ENCLAVE_MASTER_KEY")?;
             Ok(Box::new(StaticKey::from_hex(hex)?))
         }
         MasterKeySourceKind::Kms => {
             if config.master_key.is_some() {
                 bail!(
-                    "--master-key was given alongside --master-key-source=kms. A key from \
+                    "ENCLAVE_MASTER_KEY was given alongside ENCLAVE_MASTER_KEY_SOURCE=kms. A key from \
                      configuration is a key the parent instance holds, which is exactly what \
                      KMS release exists to prevent — so this is refused, not ignored."
                 );
@@ -227,10 +227,11 @@ pub fn open_key_source(
             let key_alias = config
                 .kms_key_alias
                 .as_deref()
-                .context("KMS release needs --kms-key-alias (ENCLAVE_KMS_KEY_ALIAS)")?;
-            let parameter = config.parameter.as_deref().context(
-                "KMS release needs --master-key-parameter (ENCLAVE_MASTER_KEY_PARAMETER)",
-            )?;
+                .context("KMS release needs the deployment's key alias")?;
+            let parameter = config
+                .parameter
+                .as_deref()
+                .context("KMS release needs the deployment's master key parameter")?;
 
             Ok(Box::new(KmsAttestedKey::new(
                 nsm,
@@ -253,7 +254,7 @@ pub fn open_key_source(
 pub fn open_operator_master(config: &MasterKeyConfig) -> Result<Option<OperatorMaster>> {
     match (&config.operator_master_parameter, &config.operator_master) {
         (Some(_), Some(_)) => bail!(
-            "--operator-master was given alongside --operator-master-parameter. One of the \
+            "ENCLAVE_OPERATOR_MASTER was given alongside an operator master parameter. One of the \
              two is not what was meant, and guessing which would mean deriving every wallet \
              key from the wrong master."
         ),
@@ -264,7 +265,7 @@ pub fn open_operator_master(config: &MasterKeyConfig) -> Result<Option<OperatorM
         #[cfg(any(test, feature = "testing"))]
         (None, Some(hex)) => Ok(Some(OperatorMaster::fixed(*operator::parse(hex)?))),
         #[cfg(not(any(test, feature = "testing")))]
-        (None, Some(_)) => bail!("--operator-master is a testing setting"),
+        (None, Some(_)) => bail!("ENCLAVE_OPERATOR_MASTER is a testing setting"),
         (None, None) => Ok(None),
     }
 }

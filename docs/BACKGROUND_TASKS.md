@@ -25,18 +25,19 @@ exports already are the decision. A guest that exports it needs authentication
 Where tasks are scheduled comes from four image settings, measured into PCR0
 like every other setting:
 
-| Setting | What it names |
+| Setting | What it says |
 |---|---|
-| `ENCLAVE_TASK_TABLE` | The DynamoDB table tasks are recorded in |
-| `ENCLAVE_TASK_QUEUE_URL` | The SQS queue due tasks are delivered on |
-| `ENCLAVE_TASK_SCHEDULE_GROUP` | The EventBridge Scheduler group tasks are scheduled in |
-| `ENCLAVE_TASK_SCHEDULER_ROLE_ARN` | The role EventBridge Scheduler takes to send to the queue |
+| `ENCLAVE_TASKS` | Background tasks are on |
+| `ENCLAVE_ACCOUNT_ID` | The account the queue and the scheduler's role are in |
 
-They come from `taskTable`, `taskQueueUrl`, `taskScheduleGroup` and
-`taskSchedulerRoleArn` in [`deploy/nix/deployment.nix`](../deploy/nix/deployment.nix).
-[`deploy/tofu`](../deploy/tofu/main.tf) creates the resources, prints the four
-values as its `task_*` outputs, and grants the instance role exactly what the
-runtime calls.
+The resources are named after the deployment (`ENCLAVE_NAME`): the DynamoDB
+table, the SQS queue and the EventBridge Scheduler group are all
+`<name>-tasks`, and the role the scheduler takes to send to the queue is
+`<name>-scheduler`. They come from `tasks` and `accountId` in the deployment's
+file (the e2e's is [`tests/qemu/deployment.nix`](../tests/qemu/deployment.nix)).
+The deployment creates them under those names, in the shape
+[`tasks_aws.rs`](../runtime/tests/tasks_aws.rs) creates them against LocalEmu,
+and grants the instance role exactly what the runtime calls.
 
 Set all four, or none. With none, a production enclave runs no background
 tasks. The `testing` build, which the emulator image uses, keeps them in memory
@@ -149,6 +150,7 @@ them.
 | Forge a task, or change one | Refused: it is not signed with the tenant's task key, derived from the tenant's key ([`runtime/src/tenant.rs`](../runtime/src/tenant.rs)) |
 | Read a payload or a result | It cannot: both are sealed to the tenant's key. Only the metadata is in the clear: the id, the times, the state, the attempts and the error |
 | Run a task early | Refused: a delivery is checked against the enclave's own clock |
+| Run a recurring task more often than its interval | Refused: an occurrence sooner than one signed interval after the latest is dropped |
 | Replay an occurrence that finished | Its record absorbs it. If the host rolls the table back too, the task runs again |
 | Revive a cancelled task by rolling the table back | The same as a replay |
 | Delete or delay a schedule, a message or a record | Denial of service, which it can always do. The alarms and the table show it |
@@ -296,6 +298,6 @@ LocalEmu fires a schedule with its input unchanged, as AWS does, but leaves
 the tests check that a firing arrives with the task's message, and drive the
 consumer with the occurrence as AWS delivers it.
 
-Inside the emulator, step `6/8` of [`deploy/qemu-nitro/run-e2e.sh`](../deploy/qemu-nitro/run-e2e.sh)
+Inside the emulator, step `6/8` of [`tests/qemu/run-e2e.sh`](../tests/qemu/run-e2e.sh)
 schedules work through the real wallet client and waits for it to finish, with
 the in-memory backend.

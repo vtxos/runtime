@@ -12,7 +12,7 @@ harness reads back:
     GET  /v1/apps/<app>/channels/gcm   -> an enabled channel, on token auth (the boot probe)
     POST /v1/apps/<app>/messages       -> recorded, then each address reported delivered
 
-Plaintext HTTP, which the runtime allows only because `--push-endpoint` was pointed here — a
+Plaintext HTTP, which the runtime allows only because `ENCLAVE_PUSH_ENDPOINT` was pointed here — a
 setting only a `testing` build has; PCR0 records that the emulator image was built that way. A
 production image talks to AWS over TLS it validates against roots compiled into the binary.
 """

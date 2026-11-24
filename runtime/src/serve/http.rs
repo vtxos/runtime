@@ -142,6 +142,23 @@ const SILENT_TICKS_BEFORE_TRAP: u32 = 8;
 /// Default ceiling on producing a response head.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a client has to finish the TLS handshake. Nothing else bounds a
+/// connection before its first request, so without this a peer that opens
+/// connections and says nothing holds a descriptor each, indefinitely.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long an HTTP/1 client has to send a request's headers.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an `/auth/*` body may take to arrive. It is at most 16 KiB, and
+/// these routes are open to anyone: a client that trickles one is holding a
+/// connection, not signing in.
+const AUTH_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The pause after a failed `accept`. The listener is still good (the usual
+/// cause is running out of descriptors), so serving goes on after it.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
 /// How long an interaction may run once it has produced a head.
 ///
 /// Minutes rather than seconds, because a signing session legitimately takes
@@ -662,7 +679,7 @@ impl ServeHandle {
                     Err(_) => notify.drop_staged(tenant_id),
                 }
             }
-            let _ = anchored_tx.send(anchored);
+            let _ = anchored_tx.send(body_outcome(&result, anchored));
             result
         });
 
@@ -804,7 +821,8 @@ impl ServeHandle {
             let _anonymous = anonymous;
             let mut store = store;
             let result = call.run(&mut store).await;
-            let _ = anchored_tx.send(zfs.anchor_tenant(ANONYMOUS).await);
+            let anchored = zfs.anchor_tenant(ANONYMOUS).await;
+            let _ = anchored_tx.send(body_outcome(&result, anchored));
             result
         });
 
@@ -1064,8 +1082,24 @@ async fn after_anchor(
     Ok(hyper::Response::from_parts(parts, full(body)))
 }
 
-/// A streamed body whose end waits for the anchor. Anchoring that fails
-/// aborts the stream rather than ending it, so no client sees a clean finish.
+/// How a response body may end, once the call is over and its writes are anchored.
+///
+/// A guest that traps mid-body leaves a body that ends exactly like a finished one
+/// (`wasmtime-wasi-http` reads a dropped `outgoing-body` as its end), so the call's
+/// own result is the only thing that tells a truncated body from a complete one.
+/// The writes are anchored either way; only the response is refused.
+fn body_outcome<T, E>(call: &std::result::Result<T, E>, anchored: Result<()>) -> Result<()> {
+    match call {
+        Ok(_) => anchored,
+        Err(_) => Err(anyhow::anyhow!(
+            "the guest stopped before its response was complete"
+        )),
+    }
+}
+
+/// A streamed body whose end waits for the call's outcome ([`body_outcome`]).
+/// A call that failed, or writes that were not anchored, abort the stream
+/// rather than end it, so no client sees a clean finish.
 struct AnchoredBody {
     inner: HyperOutgoingBody,
     anchored: tokio::sync::oneshot::Receiver<Result<()>>,
@@ -1111,10 +1145,8 @@ impl hyper::body::Body for AnchoredBody {
                     return Poll::Ready(match outcome {
                         Ok(trailers) => trailers.map(Ok),
                         Err(why) => {
-                            tracing::error!(error = %why, "a response's writes were not anchored; aborting it");
-                            Some(Err(Self::Error::InternalError(Some(
-                                "the response's writes could not be made durable".into(),
-                            ))))
+                            tracing::error!(error = %why, "aborting a response that did not end cleanly");
+                            Some(Err(Self::Error::InternalError(Some(why))))
                         }
                     });
                 }
@@ -1294,7 +1326,13 @@ where
 
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    builder.http1().keep_alive(true);
+    // hyper only enforces its header-read timeout once it has a timer: without
+    // one, a peer could hold a connection open by never finishing its headers.
+    builder
+        .http1()
+        .keep_alive(true)
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
     // A stream carrying nothing is indistinguishable from a peer that has gone
     // away, and a peer that has gone away is still holding its tenant's slot.
     // PING is the only thing at this layer that can tell them apart.
@@ -1329,11 +1367,45 @@ async fn route(
             // as having none.
             if let Some(auth) = &auth {
                 if path.starts_with(crate::auth::AUTH_PREFIX) {
-                    // `/auth/*` bodies are small and bounded by the endpoints
-                    // themselves; they are read here because the routes take
-                    // bytes rather than a stream.
-                    let body = match http_body_util::BodyExt::collect(req.into_body()).await {
+                    // The routes take bytes rather than a stream, so the body is
+                    // read here, bounded in size while it is read and in time
+                    // overall: these routes are open to anyone who can connect.
+                    // A body that says up front it is too large is refused
+                    // before any of it is read.
+                    let too_large = || {
+                        Ok((
+                            refused(
+                                hyper::StatusCode::PAYLOAD_TOO_LARGE,
+                                "request body too large",
+                            ),
+                            false,
+                        ))
+                    };
+                    if hyper::body::Body::size_hint(req.body()).lower()
+                        > crate::auth::routes::MAX_BODY as u64
+                    {
+                        return too_large();
+                    }
+                    let limited = http_body_util::Limited::new(
+                        req.into_body(),
+                        crate::auth::routes::MAX_BODY,
+                    );
+                    let read = tokio::time::timeout(
+                        AUTH_BODY_TIMEOUT,
+                        http_body_util::BodyExt::collect(limited),
+                    )
+                    .await;
+                    let Ok(read) = read else {
+                        return Ok((
+                            refused(hyper::StatusCode::REQUEST_TIMEOUT, "request body too slow"),
+                            false,
+                        ));
+                    };
+                    let body = match read {
                         Ok(collected) => collected.to_bytes(),
+                        Err(e) if e.is::<http_body_util::LengthLimitError>() => {
+                            return too_large();
+                        }
                         Err(e) => {
                             tracing::debug!(error = %e, "reading an auth request body");
                             return Ok((
@@ -1490,7 +1562,16 @@ impl Server {
 
         loop {
             let (client, peer) = tokio::select! {
-                accepted = listener.accept() => accepted.context("accepting connection")?,
+                accepted = listener.accept() => match accepted {
+                    Ok(connection) => connection,
+                    // One failed accept is one connection lost, not the listener:
+                    // stopping here would take every tenant down with it.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accepting a connection failed");
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        continue;
+                    }
+                },
                 ended = scheduler.join_next(), if !scheduler.is_empty() => {
                     ended.context("scheduler disappeared")???;
                     anyhow::bail!("scheduler unexpectedly stopped");
@@ -1517,7 +1598,13 @@ impl Server {
                         // Every connection is served the one certificate this
                         // boot made, and is told about exactly that one.
                         let acceptor = tokio_rustls::TlsAcceptor::from(identity.config.clone());
-                        match acceptor.accept(client).await {
+                        let handshake =
+                            tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(client));
+                        let Ok(handshake) = handshake.await else {
+                            tracing::debug!(%peer, "TLS handshake timed out");
+                            return;
+                        };
+                        match handshake {
                             Ok(stream) => {
                                 if resumed(&stream, peer) {
                                     return;
@@ -1656,8 +1743,8 @@ pub async fn serve_component(
         Some((auth, gate)) => server = server.with_authentication(auth, gate),
         None => tracing::warn!(
             "serving with NO authentication: every request reaches the guest without a \
-             signed approval. Set --operator-master-parameter for anything that is not a \
-             development run."
+             signed approval. Only a testing build without ENCLAVE_OPERATOR_MASTER serves like \
+             this: a production build always signs in through its operator master."
         ),
     }
 

@@ -105,26 +105,20 @@ seconds.
 
 ## Turning it on
 
-In the image, [`deploy/nix/deployment.nix`](../deploy/nix/deployment.nix):
+In the deployment's file (the shape of [`tests/qemu/deployment.nix`](../tests/qemu/deployment.nix)):
 
 ```nix
-xray = true;                       # each invocation as an X-Ray trace
-metricsNamespace = "Merlin/Guest"; # or "" for no metrics; never under AWS/
+xray = true;    # each invocation as an X-Ray trace
+metrics = true; # guest metrics under the deployment's name as their namespace
 ```
 
-The parent's role needs the grants. In [`deploy/tofu`](../deploy/tofu):
-
-```hcl
-telemetry = { xray = true, metrics_namespace = "Merlin/Guest" }
-```
-
-That allows `xray:PutTraceSegments`, which X-Ray cannot scope to a resource, and
-`cloudwatch:PutMetricData` for that namespace only. Without the grants the
+The parent's role needs the grants: `xray:PutTraceSegments`, which X-Ray
+cannot scope to a resource, and `cloudwatch:PutMetricData` held by condition to
+the deployment's namespace. Without the grants the
 runtime still serves, and logs at most once a minute that X-Ray or CloudWatch
 refused it.
 
-The flags behind these are `ENCLAVE_XRAY` and `ENCLAVE_METRICS_NAMESPACE`. A
-malformed namespace stops the boot. A client that cannot be built at startup
+The settings behind these are `ENCLAVE_XRAY` and `ENCLAVE_METRICS`. A client that cannot be built at startup
 does not: that half of telemetry stays on the console. For an emulator,
 `ENCLAVE_XRAY_ENDPOINT` and `ENCLAVE_METRICS_ENDPOINT` point the clients at a
 stand-in such as LocalStack.

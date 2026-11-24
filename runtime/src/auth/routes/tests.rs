@@ -72,9 +72,9 @@ async fn post(endpoints: &AuthEndpoints, path: &str, body: &Value) -> (u16, Valu
 /// and the client with the key its own partial derived, when it worked.
 async fn register_with(
     endpoints: &AuthEndpoints,
+    registering: Registering,
     edit: impl FnOnce(&mut Value),
 ) -> (u16, Value, Option<(Client, [u8; 32])>) {
-    let registering = Registering::new();
     let (status, options, attested) = post(
         endpoints,
         "/auth/register/options",
@@ -95,9 +95,18 @@ async fn register_with(
 }
 
 async fn register(endpoints: &AuthEndpoints) -> (Client, [u8; 32]) {
-    let (status, answer, finished) = register_with(endpoints, |_| {}).await;
+    register_as(endpoints, Registering::new()).await
+}
+
+async fn register_as(endpoints: &AuthEndpoints, wallet: Registering) -> (Client, [u8; 32]) {
+    let (status, answer, finished) = register_with(endpoints, wallet, |_| {}).await;
     assert_eq!(status, 200, "{answer}");
     finished.unwrap()
+}
+
+/// One wallet, the same every time: a passkey's PRF, on any phone.
+fn the_wallet() -> Registering {
+    Registering::from_coefficients(&[3; 32], &[4; 32]).unwrap()
 }
 
 /// A challenge for `POST /sign`, as `request/options` issues it.
@@ -179,7 +188,7 @@ async fn a_registration_that_does_not_verify_keeps_nothing() {
         },
     ] {
         let (endpoints, fs) = fresh().await;
-        let (status, answer, _) = register_with(&endpoints, edit).await;
+        let (status, answer, _) = register_with(&endpoints, Registering::new(), edit).await;
         assert_eq!(status, 401, "{answer}");
         assert!(fs.attached_tenants().is_empty());
     }
@@ -189,7 +198,7 @@ async fn a_registration_that_does_not_verify_keeps_nothing() {
 #[tokio::test]
 async fn a_dealt_share_off_the_wallets_commitment_is_refused() {
     let (endpoints, fs) = fresh().await;
-    let (status, _, _) = register_with(&endpoints, |b| {
+    let (status, _, _) = register_with(&endpoints, Registering::new(), |b| {
         let mut package: Value =
             serde_json::from_str(b["dkg"]["round2_package"].as_str().unwrap()).unwrap();
         let share = package["secretShare"].as_str().unwrap().to_string();
@@ -216,6 +225,71 @@ async fn a_registration_id_is_good_once() {
     let (first, _, _) = post(&endpoints, "/auth/register/verify", &body).await;
     let (second, _, _) = post(&endpoints, "/auth/register/verify", &body).await;
     assert_eq!((first, second), (200, 403));
+}
+
+/// Registering again is recovering: the same wallet gets the same key, the same `k`, the same
+/// pool, and no second region.
+#[tokio::test]
+async fn registering_again_is_recovering() {
+    let (endpoints, fs) = fresh().await;
+    let (client, k) = register_as(&endpoints, the_wallet()).await;
+    let (again, k_again) = register_as(&endpoints, the_wallet()).await;
+    assert_eq!((again.save(), k_again), (client.save(), k));
+    // One region claimed, the tenant's: the next claim is the second.
+    assert_eq!(fs.registry().claim_place([9; 16]).await.unwrap().region, 1);
+    let (status, answer, _, k_signed_in) = sign_in_with(&endpoints, &client, |_| {}).await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(k_signed_in.unwrap(), k);
+}
+
+/// As on a new phone after a restart: a fresh boot on the same disk and bucket.
+#[tokio::test]
+async fn after_a_restart_registering_again_opens_the_same_pool() {
+    let disk = Disk::scratch().unwrap();
+    let roots: Arc<dyn Backend> = Arc::new(crate::store::backend::memory::MemoryBackend::new());
+    let (first, _) = boot(&disk, roots.clone()).await;
+    let (client, k) = register_as(&first, the_wallet()).await;
+    drop(first);
+
+    let (second, fs) = boot(&disk, roots).await;
+    let (again, k_again) = register_as(&second, the_wallet()).await;
+    assert_eq!((again.save(), k_again), (client.save(), k));
+    assert!(fs.is_attached(client.tenant()));
+}
+
+/// Revocation is for good: the wallet registering again is refused, and claims nothing.
+#[tokio::test]
+async fn a_revoked_wallet_cannot_register_again() {
+    let (endpoints, fs) = fresh().await;
+    let (client, _) = register_as(&endpoints, the_wallet()).await;
+    fs.registry().revoke(client.tenant()).await.unwrap();
+    let (status, answer, finished) = register_with(&endpoints, the_wallet(), |_| {}).await;
+    assert_eq!(status, 401, "{answer}");
+    assert!(finished.is_none());
+    assert_eq!(fs.registry().claim_place([9; 16]).await.unwrap().region, 1);
+}
+
+/// The same `a0` with another slope makes the same tenant with other shares: refused, with no
+/// partial for the tenant's `k`.
+#[tokio::test]
+async fn another_key_for_a_tenant_on_record_is_refused() {
+    let (endpoints, _) = fresh().await;
+    register_as(&endpoints, the_wallet()).await;
+    let other = Registering::from_coefficients(&[3; 32], &[5; 32]).unwrap();
+    let (status, answer, finished) = register_with(&endpoints, other, |_| {}).await;
+    assert_eq!(status, 409, "{answer}");
+    assert!(finished.is_none());
+}
+
+/// The same wallet registering twice at once is one tenant.
+#[tokio::test]
+async fn one_wallet_registering_twice_at_once_is_one_tenant() {
+    let (endpoints, _) = fresh().await;
+    let ((a, k_a), (b, k_b)) = tokio::join!(
+        register_as(&endpoints, the_wallet()),
+        register_as(&endpoints, the_wallet())
+    );
+    assert_eq!((a.save(), k_a), (b.save(), k_b));
 }
 
 /// A body the route does not know — here the old `display_name` — is refused, with no document.

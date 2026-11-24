@@ -2,8 +2,16 @@
 //!
 //! A wallet key is a 2-of-2 FROST key between the owner's wallet and the signer, made by a
 //! Pedersen DKG. The signer's polynomial is not random: it is derived from the operator master
-//! and a handle the registration mints, so it is never stored, only its handle. The master alone
-//! signs nothing: the signer's share is `f_c(id_c) + f_w(id_c)`, and `f_w` is the wallet's.
+//! and a [`handle`] derived from the wallet, so it is never stored, only its handle. The master
+//! alone signs nothing: the signer's share is `f_c(id_c) + f_w(id_c)`, and `f_w` is the wallet's.
+//!
+//! **Registering again is recovering.** The same wallet gets the same handle, so the same
+//! polynomial, the same `id_c`, the same key and the same tenant: a wallet that registers again
+//! — a retry, a new phone with nothing but its passkey — lands on the tenant it made. It also
+//! means the signer only ever sees the wallet's line at one point, `f_w(id_c)`; a fresh handle
+//! per registration gave it a second point on the same line whenever one passkey registered
+//! twice, and two points are the line. Records made before keep the random handles they were
+//! made with.
 //!
 //! The ceremony is two messages, and the wallet commits first:
 //!
@@ -15,7 +23,11 @@
 //!   finished, so registration ends with the tenant's pool created.
 //!
 //! The signer reveals its commitment only after the wallet has committed to its own, and its
-//! polynomial is derived inside attested code from a fresh handle: it cannot steer the key.
+//! polynomial is derived inside attested code from the master and the wallet's identifier, the
+//! master fixed before any wallet: it cannot steer the key.
+//!
+//! The derivation is part of every wallet's identity: changing it would give every wallet a new
+//! key. [`HANDLE_TAG`] and [`SALT`] are frozen; a test pins the handle.
 
 use std::collections::BTreeMap;
 
@@ -24,7 +36,7 @@ use hkdf::Hkdf;
 use k256::elliptic_curve::bigint::U512;
 use k256::elliptic_curve::ops::Reduce;
 use k256::Scalar;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use threshold::dkg::{
@@ -38,6 +50,27 @@ use super::key::WalletKey;
 
 /// The HKDF salt for the signer's polynomial.
 pub const SALT: &[u8] = b"aegira/cosigner-dkg/v1";
+
+/// What a wallet's [`handle`] is hashed under.
+pub const HANDLE_TAG: &[u8] = b"aegira/cosigner-dkg/handle/v1";
+
+/// The wallet's FROST identifier, `SHA-256(a0·G) mod n`, as its `dkg_part1` derived it: from the
+/// first point of its commitment, which its proof of knowledge is checked against. Not from the
+/// package's own `verifying_key`, which nothing checks.
+pub fn wallet_id(wallet: &Round1Package) -> Result<Identifier, String> {
+    Identifier::derive(&wallet.commitment.to_verifying_key().serialize())
+        .map_err(|e| format!("the wallet's identifier: {e}"))
+}
+
+/// The handle the signer's polynomial for one wallet is derived from:
+/// `SHA-256(HANDLE_TAG ‖ id_w)`, its first 16 bytes. The same wallet always gets the same one.
+pub fn handle(wallet: &Identifier) -> [u8; 16] {
+    let digest = Sha256::new()
+        .chain_update(HANDLE_TAG)
+        .chain_update(wallet.serialize())
+        .finalize();
+    digest[..16].try_into().expect("16 of SHA-256's 32 bytes")
+}
 
 /// What [`deal`] answers the wallet's round one with.
 pub struct Deal {
@@ -162,8 +195,7 @@ impl Dealer {
     fn new(master: &[u8; 32], handle: &[u8; 16], wallet: &Round1Package) -> Result<Self, String> {
         // What the wallet's `dkg_part1` derived its identifier from, and what `dkg_part2` checks
         // its proof of knowledge against.
-        let id = Identifier::derive(&wallet.commitment.to_verifying_key().serialize())
-            .map_err(|e| format!("the wallet's identifier: {e}"))?;
+        let id = wallet_id(wallet)?;
         let a = coefficients(master, handle, &id)?;
         // Derives `id_c` from `a0_c·G`.
         let (round1, package) = dkg::dkg_part1(2, 2, &a[0], &a[1..], &mut Rng)
@@ -202,6 +234,7 @@ mod tests {
 
     const MASTER: [u8; 32] = [7; 32];
     const HANDLE: [u8; 16] = [9; 16];
+    const PINNED_HANDLE: &str = "a0a88985c95e54b59f07b18af27aa109";
 
     /// What `register/options` answers with is what `register/verify` finishes: the polynomial
     /// is derived again, not kept.
@@ -277,6 +310,44 @@ mod tests {
         let (mut forged, _, _) = w.respond(&d.package, &d.dealt).unwrap();
         forged.secret_share += Scalar::ONE;
         assert!(register(&MASTER, &HANDLE, &w.package, &forged).is_err());
+    }
+
+    /// The handle is part of every wallet's identity: a changed derivation would give every
+    /// wallet a new key, and lose it its tenant.
+    #[test]
+    fn the_handle_derivation_is_pinned() {
+        let id = Identifier::derive(b"a pinned wallet").unwrap();
+        assert_eq!(hex::encode(handle(&id)), PINNED_HANDLE);
+    }
+
+    /// Registering again is recovering: the same wallet's round one, dealt to twice, gets the
+    /// same signer, so the same key.
+    #[test]
+    fn the_same_wallet_is_dealt_the_same_signer() {
+        let w = Wallet::random();
+        let h = handle(&wallet_id(&w.package).unwrap());
+        let (first, again) = (
+            deal(&MASTER, &h, &w.package).unwrap(),
+            deal(&MASTER, &h, &w.package).unwrap(),
+        );
+        assert_eq!(
+            first.package.commitment.to_verifying_key().serialize(),
+            again.package.commitment.to_verifying_key().serialize()
+        );
+        assert_eq!(first.dealt.secret_share, again.dealt.secret_share);
+
+        let other = Wallet::random();
+        assert_ne!(h, handle(&wallet_id(&other.package).unwrap()));
+    }
+
+    /// The identifier comes from the commitment the proof of knowledge is checked against, not
+    /// the package's own `verifying_key`, which a sender could set to anything.
+    #[test]
+    fn the_handle_ignores_the_packages_unchecked_key() {
+        let mut w = Wallet::random();
+        let before = wallet_id(&w.package).unwrap();
+        w.package.verifying_key = Wallet::random().package.verifying_key;
+        assert_eq!(wallet_id(&w.package).unwrap(), before);
     }
 
     #[test]

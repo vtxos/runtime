@@ -429,7 +429,10 @@ async fn post_json(
 
 /// Register a wallet and return it, ready to sign for requests.
 async fn enrol(h: &Harness) -> Client {
-    let registering = Registering::new();
+    enrol_as(h, Registering::new()).await
+}
+
+async fn enrol_as(h: &Harness, registering: Registering) -> Client {
     let (status, options) =
         post_json(h.addr, "/auth/register/options", registering.options_body()).await;
     assert_eq!(status, 200, "{options}");
@@ -616,6 +619,22 @@ async fn two_wallets_are_two_tenants() {
     assert_eq!(seen_by_bob, "bob's", "one tenant read another's file");
 }
 
+/// Registering again is recovering: the same wallet registered again, as a new phone does from
+/// its passkey alone, reads what it wrote.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn registering_again_reads_what_the_wallet_wrote() {
+    let h = start().await;
+    let wallet = || Registering::from_coefficients(&[3; 32], &[4; 32]).unwrap();
+    let phone = enrol_as(&h, wallet()).await;
+    let (status, _) = signed(&h, &phone, "POST", "/files/kept.txt", "kept").await;
+    assert_eq!(status, 201);
+
+    let new_phone = enrol_as(&h, wallet()).await;
+    let (status, kept) = signed(&h, &new_phone, "GET", "/files/kept.txt", "").await;
+    assert_eq!((status, kept.as_str()), (200, "kept"));
+}
+
 /// `/auth/*` answers without a token — it has to, or nobody could ever get
 /// one — and it performs no cosigner action.
 #[tokio::test(flavor = "multi_thread")]
@@ -634,6 +653,68 @@ async fn auth_routes_answer_without_a_token() {
 
     let (status, _) = post_json(h.addr, "/auth/nonsense", serde_json::json!({})).await;
     assert_eq!(status, 404);
+}
+
+/// These routes are open to anyone. A body declared larger than they accept
+/// is refused before any of it is read, and one that trickles in is cut off:
+/// both used to be read in full, or waited for, with no bound but memory.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn an_auth_body_is_bounded_in_size_and_time() {
+    let h = start().await;
+    let config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AcceptAny))
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let open = || async {
+        let socket = tokio::net::TcpStream::connect(h.addr)
+            .await
+            .expect("connect");
+        let name = rustls::pki_types::ServerName::try_from(DOMAIN).unwrap();
+        connector.connect(name, socket).await.expect("handshake")
+    };
+    let status = |raw: &[u8]| {
+        String::from_utf8_lossy(raw)
+            .split(' ')
+            .nth(1)
+            .map(str::to_string)
+    };
+
+    // A gigabyte declared, a little sent: refused at once, not waited for.
+    let mut stream = open().await;
+    stream
+        .write_all(
+            b"POST /auth/request/verify HTTP/1.1\r\nHost: enclave.test\r\n\
+              Content-Length: 1073741824\r\n\r\n{\"partial\":",
+        )
+        .await
+        .unwrap();
+    let mut raw = vec![0u8; 512];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut raw))
+        .await
+        .expect("an oversized body was waited for")
+        .unwrap();
+    assert_eq!(status(&raw[..n]).as_deref(), Some("413"));
+
+    // A body within the limit that never finishes arriving: cut off.
+    let mut stream = open().await;
+    stream
+        .write_all(
+            b"POST /auth/request/verify HTTP/1.1\r\nHost: enclave.test\r\n\
+              Content-Length: 100\r\n\r\n{",
+        )
+        .await
+        .unwrap();
+    let n = tokio::time::timeout(std::time::Duration::from_secs(30), stream.read(&mut raw))
+        .await
+        .expect("a trickled body was waited for without end")
+        .unwrap();
+    assert_eq!(status(&raw[..n]).as_deref(), Some("408"));
 }
 
 #[derive(Debug)]

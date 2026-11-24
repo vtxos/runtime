@@ -110,6 +110,20 @@ impl Registering {
     }
 }
 
+/// `id_c`, the runtime's FROST identifier, from a `register/options` answer: `SHA256(a0_c·G) mod
+/// n`, as its `dkg_part1` derived it. What a wallet whose slope depends on the runtime reads
+/// before it commits to that slope.
+pub fn runtime_identifier(options: &RegisterOptionsResponse) -> Result<Identifier, String> {
+    let runtime = Round1Package::from_json(&options.dkg.round1_package)
+        .map_err(|e| format!("the runtime's round one: {e}"))?;
+    identifier_of(&runtime)
+}
+
+fn identifier_of(runtime: &Round1Package) -> Result<Identifier, String> {
+    Identifier::derive(&runtime.commitment.to_verifying_key().serialize())
+        .map_err(|e| e.to_string())
+}
+
 /// The wallet's DKG parts two and three, against the runtime's round one, its proof checked, and
 /// the share it dealt. Returns the share for the runtime, which `register/verify` carries, the
 /// wallet's own key package, and the key's public package.
@@ -121,8 +135,7 @@ pub fn finish_dkg(
     if runtime.commitment.coeffs.len() != 2 {
         return Err("the runtime's round one is not of a 2-of-2".into());
     }
-    let id = Identifier::derive(&runtime.commitment.to_verifying_key().serialize())
-        .map_err(|e| e.to_string())?;
+    let id = identifier_of(runtime)?;
     let theirs = BTreeMap::from([(id.clone(), runtime.clone())]);
     let (round2, mut out) = dkg::dkg_part2(round1, &theirs, &[]).map_err(|e| e.to_string())?;
     let to_runtime = out.remove(&id).ok_or("no share for the runtime")?;

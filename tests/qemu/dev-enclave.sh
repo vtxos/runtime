@@ -6,7 +6,7 @@
 # brings this up to assert against it and then tears it down; this brings it up
 # and gets out of the way.
 #
-#   deploy/qemu-nitro/dev-enclave.sh --guest path/to/component.wasm
+#   tests/qemu/dev-enclave.sh --guest path/to/component.wasm
 #
 # It prints what a client needs to talk to it, and then waits. Ctrl-C stops
 # everything it started.
@@ -279,7 +279,7 @@ component. $store_note PCR16 changes either way, and the trust root and the
 certificate are new every boot — a client still pinning the old ones will refuse
 this enclave, which is the point.
 
-  $REPO/deploy/qemu-nitro/dev-enclave.sh --guest <new.wasm>${KEEP_STORE:+ --keep-store}
+  $REPO/tests/qemu/dev-enclave.sh --guest <new.wasm>${KEEP_STORE:+ --keep-store}
 
 Ctrl-C to stop everything.
 EOF

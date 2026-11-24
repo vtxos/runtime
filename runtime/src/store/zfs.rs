@@ -536,6 +536,9 @@ impl Disk {
     }
 }
 
+/// Held by [`Pool::open`] from clearing the debug log to mounting the pool.
+static IMPORTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// One ZFS pool: its device, its anchor chain, its last-anchor lock.
 struct Pool {
     /// Held so a [`Disk::Directory`] lives as long as the pool on it.
@@ -693,6 +696,11 @@ impl Pool {
     /// (see [`admit`]).
     async fn open(mut self, tip: Anchor) -> Result<Pool> {
         if self.pool {
+            // One import at a time, through to its mount. The debug log is the
+            // kernel's, shared by every pool: an import beside this one could
+            // empty it between this import and its reading, and `zfs mount -a`
+            // would mount a pool still waiting to be admitted.
+            let _one_at_a_time = IMPORTS.lock().await;
             // The newest state on the disk, not `-T` the anchored txg: that
             // takes the newest uberblock at or below it with no exact match,
             // and falls back further when one fails to load. Which txg it got
@@ -804,7 +812,11 @@ impl Pool {
         let start = Instant::now();
         let synced = if self.pool {
             run("zpool", &["sync", &self.name]).await?;
-            let synced = synced_txg(&self.name).await?;
+            // Each sync adds rows to the txg history, read-only ones too, and
+            // the history keeps the newest 4096. With no write left in it,
+            // nothing has reached the disk for as long as it reaches back:
+            // the last write is the one `prev` anchored.
+            let synced = written_txg(&self.name).await?.unwrap_or(prev.txg);
             if synced == prev.txg && !force {
                 return Ok(()); // nothing has reached the disk since
             }
@@ -1006,8 +1018,9 @@ struct Attached {
     pool: Arc<Pool>,
     key: TenantKey,
     place: Place,
-    /// Whether the loaders have run for this attach.
-    loaded: std::sync::atomic::AtomicBool,
+    /// Set once the loaders have all succeeded. Empty after a failure, so the
+    /// next attach runs them again; a caller arriving while they run waits.
+    loaded: tokio::sync::OnceCell<()>,
 }
 
 /// A tenant's pool, attached once per boot behind its slot.
@@ -1171,50 +1184,51 @@ impl Zfs {
         key: &TenantKey,
     ) -> std::result::Result<Arrival, AttachError> {
         let cell = self.slot(tenant)?;
-        if let Some(attached) = cell.get() {
-            return if attached.key.ct_eq(key) && attached.place == place {
-                Ok(Arrival::Returning)
-            } else {
-                Err(AttachError::WrongKey)
-            };
-        }
-        let zfs = self.clone();
-        let key = key.clone();
-        let (attached, arrival) = tokio::spawn(async move {
-            let mut arrival = Arrival::Returning;
-            let attached = cell
-                .get_or_try_init(|| async {
-                    let (pool, fresh) = zfs.open_tenant(tenant, place, &key).await?;
-                    if fresh {
-                        arrival = Arrival::New;
-                    }
-                    Ok::<_, AttachError>(Arc::new(Attached {
-                        pool,
-                        key: key.clone(),
-                        place,
-                        loaded: std::sync::atomic::AtomicBool::new(false),
-                    }))
+        let (attached, arrival) = match cell.get() {
+            Some(attached) => (attached.clone(), Arrival::Returning),
+            None => {
+                let zfs = self.clone();
+                let key = key.clone();
+                tokio::spawn(async move {
+                    let mut arrival = Arrival::Returning;
+                    let attached = cell
+                        .get_or_try_init(|| async {
+                            let (pool, fresh) = zfs.open_tenant(tenant, place, &key).await?;
+                            if fresh {
+                                arrival = Arrival::New;
+                            }
+                            Ok::<_, AttachError>(Arc::new(Attached {
+                                pool,
+                                key: key.clone(),
+                                place,
+                                loaded: tokio::sync::OnceCell::new(),
+                            }))
+                        })
+                        .await?
+                        .clone();
+                    Ok::<_, AttachError>((attached, arrival))
                 })
-                .await?
-                .clone();
-            if !attached.key.ct_eq(&key) || attached.place != place {
-                return Err(AttachError::WrongKey);
+                .await
+                .map_err(|e| AttachError::Other(anyhow!("the attach's task died: {e}")))??
             }
-            Ok((attached, arrival))
-        })
-        .await
-        .map_err(|e| AttachError::Other(anyhow!("the attach's task died: {e}")))??;
+        };
+        if !attached.key.ct_eq(key) || attached.place != place {
+            return Err(AttachError::WrongKey);
+        }
 
         self.tenant_roots
             .lock()
             .expect("tenant_roots mutex")
             .insert(tenant, attached.pool.data_dir());
-        if !attached
+        // The tenant's records — its devices, its tasks' catch-up, whether its key is kept for
+        // background work — on every attach until they have all loaded once. A failure fails this
+        // attach and leaves them unloaded, so the next one runs them again, rather than finding
+        // the tenant marked loaded with half of it missing until the process restarts. A caller
+        // that arrives while they run waits for them.
+        attached
             .loaded
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            self.run_loaders(tenant).await?;
-        }
+            .get_or_try_init(|| self.run_loaders(tenant))
+            .await?;
         Ok(arrival)
     }
 
@@ -1315,18 +1329,41 @@ impl Zfs {
         .await?;
 
         let mapped = Mapped::new(self, &place, key).await?;
-        let (pool, fresh) = match tip {
-            Some(tip) => {
-                let older = tip.release != self.release;
-                let pool = Arc::new(pool.open(tip).await?);
-                if older {
-                    // Last written by an older release: say so in the bucket
-                    // now, so that release can no longer open it.
+        let name = pool.name.clone();
+        let attached: Result<(Arc<Pool>, bool)> = async {
+            Ok(match tip {
+                Some(tip) => {
+                    let pool = Arc::new(pool.open(tip).await?);
+                    // A publish of its own before anything is served: the
+                    // barrier between this attach and the generation before it.
+                    // The tip was read before this generation was claimed, so
+                    // the enclave it supersedes may have published past it
+                    // since — and the parent could then have served this one
+                    // the disk as of that older tip. Publishing the next anchor
+                    // settles it: if the other got there first, this put loses
+                    // and the attach is refused; if this one wins, the other's
+                    // publish fails and none of its later writes is
+                    // acknowledged. It also says in the bucket which release
+                    // this is, so an older release can no longer open the pool.
                     pool.stamp().await?;
+                    (pool, false)
                 }
-                (pool, false)
+                None => (Arc::new(pool.create().await?), true),
+            })
+        }
+        .await;
+        let (pool, fresh) = match attached {
+            Ok(attached) => attached,
+            Err(e) => {
+                // Imported or created, then failed: left imported, its device
+                // could not be removed, and every later attach of this tenant
+                // would fail until the enclave restarts. Not imported, this
+                // fails and changes nothing.
+                if self.is_pool {
+                    let _ = run("zpool", &["export", "-f", &name]).await;
+                }
+                return Err(e.into());
             }
-            None => (Arc::new(pool.create().await?), true),
         };
         mapped.keep();
         tracing::info!(
@@ -1686,9 +1723,19 @@ fn witness(kstat: &str) -> Option<u64> {
         .max()
 }
 
-async fn synced_txg(pool: &str) -> Result<u64> {
+/// The newest txg that reached the disk, while the txg history still reaches
+/// back to it.
+async fn written_txg(pool: &str) -> Result<Option<u64>> {
     let kstat = tokio::fs::read_to_string(format!("/proc/spl/kstat/zfs/{pool}/txgs")).await?;
-    witness(&kstat).context("the pool's txg history shows nothing written")
+    Ok(witness(&kstat))
+}
+
+/// The newest txg that reached the disk, right after a write: always in the
+/// history then.
+async fn synced_txg(pool: &str) -> Result<u64> {
+    written_txg(pool)
+        .await?
+        .context("the pool's txg history shows nothing written")
 }
 
 /// Testing only: what the kernel says it loaded, as evidence for the rollback
@@ -1710,7 +1757,7 @@ async fn log_loaded_state(pool: &str) {
     }
 }
 
-/// Testing only: the vsock port `deploy/qemu-nitro/test-hooks.py` answers on.
+/// Testing only: the vsock port `tests/qemu/test-hooks.py` answers on.
 #[cfg(feature = "testing")]
 const TEST_HOOK_PORT: u32 = 9101;
 
@@ -2107,6 +2154,37 @@ timestamp    message
             o0 + l0,
             region_bounds(1, region, disk).unwrap().0,
             "abut, not overlap"
+        );
+    }
+
+    /// A loader that fails fails its attach, and the next attach runs it
+    /// again. It used to be marked loaded first, so the retry found the tenant
+    /// attached and loaded, with its records missing until a restart.
+    #[tokio::test]
+    async fn a_loader_that_failed_runs_again_on_the_next_attach() {
+        struct Flaky(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl TenantLoader for Flaky {
+            async fn load_tenant(&self, _tenant: [u8; 16]) -> Result<bool> {
+                let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ensure!(n > 0, "the first load fails");
+                Ok(false)
+            }
+        }
+        let fs = Zfs::scratch().await;
+        let flaky = Arc::new(Flaky(std::sync::atomic::AtomicUsize::new(0)));
+        let loader: Arc<dyn TenantLoader> = flaky.clone();
+        fs.register_loader(Arc::downgrade(&loader)).await.unwrap();
+        assert!(
+            fs.tenant_dir([1; 16]).await.is_err(),
+            "a failed load passed"
+        );
+        fs.tenant_dir([1; 16]).await.unwrap();
+        fs.tenant_dir([1; 16]).await.unwrap();
+        assert_eq!(
+            flaky.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "run again after its failure, and not again after its success"
         );
     }
 

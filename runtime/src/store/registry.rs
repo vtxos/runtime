@@ -311,17 +311,18 @@ impl Registry {
         };
         let mut body = Vec::new();
         ciborium::into_writer(&record, &mut body).context("encoding a tenant record")?;
-        match self.write_once(&self.tenant_key(&tenant), body).await? {
-            Once::Won => {}
-            Once::Lost => bail!(
-                "tenant {} was registered first by another writer",
-                hex::encode(tenant)
-            ),
-        }
+        let won = self.write_once(&self.tenant_key(&tenant), body).await?;
+        // Won or lost, the tenant is on record now: the next read must go and see.
         self.absent
             .lock()
             .expect("registry poisoned")
             .remove(&tenant);
+        if let Once::Lost = won {
+            bail!(
+                "tenant {} was registered first by another writer",
+                hex::encode(tenant)
+            );
+        }
         self.tenants
             .lock()
             .expect("registry poisoned")
@@ -792,6 +793,25 @@ mod tests {
         assert_eq!(back.key, key);
         assert_eq!(back.place, registered.place);
         assert!(c.register(tenant, key).await.is_err(), "registered twice");
+    }
+
+    /// Two enclaves register the same wallet at once: the one that loses the write sees the
+    /// winner's record at once, not "absent" from its own read a moment before.
+    #[tokio::test]
+    async fn the_loser_of_a_registration_sees_the_winners_record() {
+        let r = roots();
+        let (winner, loser) = (registry_on(r.clone(), 1, 4), registry_on(r, 1, 4));
+        let (tenant, key) = wallet_record();
+        assert!(loser.tenant(tenant).await.unwrap().is_none());
+        let won = winner.register(tenant, key.clone()).await.unwrap();
+
+        // The loser read "absent" before the winner wrote, so it claims a place and loses.
+        loser.absent.lock().unwrap().insert(tenant, Instant::now());
+        assert!(loser.register(tenant, key).await.is_err());
+        assert_eq!(
+            loser.tenant(tenant).await.unwrap().unwrap().place,
+            won.place
+        );
     }
 
     /// A record names its tenant by its key, and its verifying shares must be shares of that

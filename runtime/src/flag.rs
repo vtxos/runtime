@@ -1,11 +1,8 @@
 //! Boolean settings that come from an environment variable.
 //!
-//! clap's default `bool` handling insists on exactly `true` or `false` when a
-//! value arrives through `env`. That is fine on a command line, where the flag
-//! is usually written bare, and wrong for a deployment configured by
-//! environment: `ENCLAVE_FORCE_PATH_STYLE=1` is the obvious thing to put in an
-//! image's environment, and it fails at startup with a message about possible
-//! values.
+//! A deployment is configured by environment, and `ENCLAVE_FORCE_PATH_STYLE=1`
+//! is the obvious thing to put in an image's environment, so a boolean accepts
+//! what a person writing one would write, not only `true` or `false`.
 //!
 //! Inside an enclave that failure is expensive to diagnose — there is no shell
 //! to go and check, and the only symptom is an enclave that will not start.

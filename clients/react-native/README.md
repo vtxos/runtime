@@ -28,7 +28,7 @@ const enclave = new Enclave(enclaveUrl, {
 
 // The passkey's PRF output, evaluated at prfSalt(), makes the key.
 const record = await enclave.register(prfOutput);
-await storage.save(encodeRecord(record)); // not secret without the passkey; back it up
+await storage.save(encodeRecord(record)); // a cache: registering again with the passkey returns it
 
 const session = enclave.open(decodeRecord(stored), prfOutput);
 

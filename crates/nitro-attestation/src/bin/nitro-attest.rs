@@ -599,7 +599,7 @@ mod danger {
     use rustls::{DigitallySignedStruct, Error, SignatureScheme};
     use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
-    /// Accepts any server certificate.
+    /// Accepts any server certificate, but only from the holder of its key.
     ///
     /// Not an oversight and not a shortcut. Trust here comes from the
     /// attestation document, which binds this certificate's hash to a specific
@@ -607,7 +607,12 @@ mod danger {
     /// one that holds even for a self-signed certificate. The caller checks
     /// that binding; if it does not hold, the connection is rejected there.
     ///
-    /// This is safe *only* because that check is not optional in this tool.
+    /// The handshake signatures are what make that binding mean anything: a
+    /// certificate is public, so without them anyone relaying a copy of the
+    /// enclave's would pass as the enclave.
+    ///
+    /// This is safe *only* because the attestation check is not optional in
+    /// this tool.
     #[derive(Debug)]
     pub struct AcceptAnyServerCert;
 
@@ -625,26 +630,28 @@ mod danger {
 
         fn verify_tls12_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, Error> {
-            Ok(HandshakeSignatureValid::assertion())
+            rustls::crypto::verify_tls12_signature(message, cert, dss, &algorithms())
         }
 
         fn verify_tls13_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, Error> {
-            Ok(HandshakeSignatureValid::assertion())
+            rustls::crypto::verify_tls13_signature(message, cert, dss, &algorithms())
         }
 
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            rustls::crypto::aws_lc_rs::default_provider()
-                .signature_verification_algorithms
-                .supported_schemes()
+            algorithms().supported_schemes()
         }
+    }
+
+    fn algorithms() -> rustls::crypto::WebPkiSupportedAlgorithms {
+        rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms
     }
 }

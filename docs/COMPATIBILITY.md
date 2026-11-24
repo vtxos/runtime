@@ -52,4 +52,4 @@ The runtime's in-process suites run guests over a plain directory standing in fo
 - background tasks, against an in-memory table, scheduler and queue, and devices;
 - streaming responses over HTTP/1.1, HTTP/2 and gRPC.
 
-ZFS itself (the anchor, crash recovery, rollback and fork refusal) is exercised in the QEMU emulator by [`run-zfs-spike.sh`](../deploy/qemu-nitro/run-zfs-spike.sh) and the end-to-end suite.
+ZFS itself (the anchor, crash recovery, rollback and fork refusal) is exercised in the QEMU emulator by [`run-zfs-spike.sh`](../tests/qemu/run-zfs-spike.sh) and the end-to-end suite.

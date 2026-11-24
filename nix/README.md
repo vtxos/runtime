@@ -14,7 +14,7 @@ the image and get the same one. The Dockerfile this replaced ran `apt-get
 update` over `debian:bookworm-slim`, so it produced a different PCR0 every week
 and attested to nothing anyone could reproduce.
 
-The parent instance is built with Packer instead, and that is not
+The parent instance is not built here at all, and that is not
 inconsistency. The parent is the party the enclave *excludes*: PCR0 covers what
 runs inside the enclave and says nothing about its host, so reproducing the
 host buys no security property at all.
@@ -23,7 +23,7 @@ host buys no security property at all.
 
 | | |
 |---|---|
-| `.#eif` | the production image, with `pcr.json` |
+| `.#eif` | the production binary, with the e2e's settings and `pcr.json`; a deployment builds its own with `lib.mkEif` |
 | `.#eif-qemu` | the same code configured for the emulator — different config, therefore a different PCR0 |
 | `.#eif-selftest` | the tiny NSM entropy check |
 | `.#enclave-runtime`, `.#guest-http`, `.#nitro-attest` | the binaries |

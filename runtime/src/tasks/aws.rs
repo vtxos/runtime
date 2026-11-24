@@ -480,10 +480,10 @@ pub struct EventBridgeSchedules {
 }
 
 /// `at(2026-11-01T12:00:00)`: whole seconds, rounded up so it never fires early.
-fn at_expression(ms: u64) -> String {
+fn at_expression(ms: u64) -> Result<String> {
     let secs = ms.div_ceil(1000);
-    let time = super::schedules::format_time(secs * 1000);
-    format!("at({})", time.trim_end_matches('Z'))
+    let time = super::schedules::format_time(secs.saturating_mul(1000))?;
+    Ok(format!("at({})", time.trim_end_matches('Z')))
 }
 
 /// `rate(30 minutes)`. The queue only accepts whole minutes, the smallest rate EventBridge has.
@@ -528,7 +528,7 @@ impl Schedules for EventBridgeSchedules {
             .target(target);
         create = match schedule.when {
             When::At(at) => create
-                .schedule_expression(at_expression(at))
+                .schedule_expression(at_expression(at)?)
                 .action_after_completion(ActionAfterCompletion::Delete),
             When::Every { interval_ms, from } => {
                 let create = create.schedule_expression(rate_expression(interval_ms));
@@ -691,9 +691,12 @@ mod tests {
 
     #[test]
     fn expressions_are_what_eventbridge_takes() {
-        assert_eq!(at_expression(1_793_534_400_000), "at(2026-11-01T12:00:00)");
         assert_eq!(
-            at_expression(1_793_534_400_001),
+            at_expression(1_793_534_400_000).unwrap(),
+            "at(2026-11-01T12:00:00)"
+        );
+        assert_eq!(
+            at_expression(1_793_534_400_001).unwrap(),
             "at(2026-11-01T12:00:01)",
             "never early"
         );

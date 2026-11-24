@@ -13,10 +13,13 @@
 //! aws-lc's key generation and TLS handshakes, including the serving
 //! certificate's key.
 //!
-//! Bytes come **straight from the device on every call**. There is no DRBG in
-//! between, so the trust argument is "the NSM produced these" with nothing
-//! else to reason about. The cost is real: the device answers 256 bytes per
-//! ioctl, so a large request is a loop of them.
+//! Every byte comes **straight from the device** and is handed out once.
+//! There is no DRBG in between, so the trust argument is "the NSM produced
+//! these" with nothing else to reason about. The cost is real: the device
+//! answers 256 bytes per ioctl, so a large request is a loop of them. Word-sized
+//! draws — `wasmtime-wasi` builds `get-random-bytes` from one per byte — are
+//! served from the unused rest of one such read rather than an ioctl each, and
+//! a guest's request is capped at [`MAX_RANDOM_REQUEST`].
 //!
 //! ## Why this panics where the clock does not
 //!
@@ -209,14 +212,50 @@ impl rand_core::RngCore for Rng {
 
 impl rand_core::CryptoRng for Rng {}
 
+/// What one NSM request answers.
+const NSM_DRAW: usize = 256;
+
+/// The most a guest may ask `get-random-bytes` for in one call.
+///
+/// `wasmtime-wasi` builds that call a word at a time (`next_u32` per byte),
+/// synchronously on a worker thread no deadline can interrupt, and its own
+/// limit is 64 MiB. This keeps one call to about a thousand device reads.
+pub const MAX_RANDOM_REQUEST: u64 = 64 * 1024;
+
 /// Serves `wasi:random/random` from an entropy source.
 pub struct GuestRandom {
     source: Arc<dyn Nsm>,
+    /// The rest of the last device read, for word-sized draws: without it
+    /// every byte of `get-random-bytes` would be a device request of its own.
+    /// Each byte is handed out once, then wiped.
+    spare: [u8; NSM_DRAW],
+    /// How much of `spare` is already handed out.
+    used: usize,
 }
 
 impl GuestRandom {
     pub fn new(source: Arc<dyn Nsm>) -> Self {
-        GuestRandom { source }
+        GuestRandom {
+            source,
+            spare: [0; NSM_DRAW],
+            used: NSM_DRAW,
+        }
+    }
+
+    /// The next `N` unused bytes of a device read, reading again when they run out.
+    fn take<const N: usize>(&mut self) -> [u8; N] {
+        if self.used + N > NSM_DRAW {
+            let mut fresh = [0u8; NSM_DRAW];
+            cap_rand::RngCore::fill_bytes(self, &mut fresh);
+            self.spare = fresh;
+            self.used = 0;
+        }
+        let taken = &mut self.spare[self.used..self.used + N];
+        let mut out = [0u8; N];
+        out.copy_from_slice(taken);
+        taken.fill(0);
+        self.used += N;
+        out
     }
 
     /// A seed for `wasi:random/insecure-seed`, drawn once at startup. That
@@ -238,15 +277,11 @@ impl fmt::Debug for GuestRandom {
 
 impl cap_rand::RngCore for GuestRandom {
     fn next_u32(&mut self) -> u32 {
-        let mut b = [0u8; 4];
-        self.fill_bytes(&mut b);
-        u32::from_le_bytes(b)
+        u32::from_le_bytes(self.take())
     }
 
     fn next_u64(&mut self) -> u64 {
-        let mut b = [0u8; 8];
-        self.fill_bytes(&mut b);
-        u64::from_le_bytes(b)
+        u64::from_le_bytes(self.take())
     }
 
     fn fill_bytes(&mut self, dest: &mut [u8]) {
@@ -309,16 +344,21 @@ mod tests {
         );
     }
 
-    /// Every draw must hit the device: that is the whole point of choosing
-    /// direct-from-NSM over a seeded generator.
+    /// Every byte comes from the device, once. Word-sized draws share a read
+    /// until it is used up: `get-random-bytes` arrives as one `next_u32` per
+    /// byte, and an ioctl per byte pinned a worker for minutes on a large one.
     #[test]
-    fn every_draw_consults_the_device() {
+    fn word_draws_share_a_device_read_and_never_repeat_a_byte() {
         let nsm = fake();
         let mut rng = GuestRandom::new(nsm.clone());
-        for _ in 0..5 {
-            let _ = rng.next_u64();
-        }
-        assert_eq!(nsm.calls.load(Ordering::SeqCst), 5);
+        let words: Vec<u64> = (0..64).map(|_| rng.next_u64()).collect();
+        assert_eq!(
+            nsm.calls.load(Ordering::SeqCst),
+            2,
+            "512 bytes is two 256-byte reads"
+        );
+        let distinct: std::collections::BTreeSet<u64> = words.iter().copied().collect();
+        assert_eq!(distinct.len(), words.len(), "a draw was handed out twice");
     }
 
     #[test]

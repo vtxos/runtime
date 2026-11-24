@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The whole stack, in an emulated enclave.
 #
-# deploy/qemu-nitro/run-e2e.sh is the harness and asserts its own preconditions;
+# tests/qemu/run-e2e.sh is the harness and asserts its own preconditions;
 # this script is what puts them in place on a machine that has none of them. On
 # a workstation that already boots enclaves, everything below is a no-op and the
 # harness runs directly.
@@ -30,4 +30,4 @@ cd "$REPO"
 # KVM, vsock, the QEMU image and vhost-device-vsock — see scripts/lib.sh.
 prepare_enclave_host
 
-exec deploy/qemu-nitro/run-e2e.sh
+exec tests/qemu/run-e2e.sh

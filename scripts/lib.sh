@@ -17,7 +17,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 export REPO
 
-# The same shape deploy/qemu-nitro/run-e2e.sh prints, so a run that spans both
+# The same shape tests/qemu/run-e2e.sh prints, so a run that spans both
 # reads as one log rather than two conventions meeting in the middle.
 say() { printf '\n== %s ==\n' "$*"; }
 
@@ -26,7 +26,7 @@ fail() {
     exit 1
 }
 
-# Put in place what deploy/qemu-nitro needs and asserts: KVM the runner user can
+# Put in place what tests/qemu needs and asserts: KVM the runner user can
 # open, the vsock loopback transport, the QEMU image, and vhost-device-vsock.
 # On a workstation that already boots enclaves every step is a no-op.
 #
@@ -61,7 +61,7 @@ prepare_enclave_host() {
 
     if ! docker image inspect "$image" >/dev/null 2>&1; then
         say "building the QEMU image"
-        docker build -t "$image" "$REPO/deploy/qemu-nitro"
+        docker build -t "$image" "$REPO/tests/qemu"
     fi
 
     # Idempotent, and cached in CI by the directory it installs into.

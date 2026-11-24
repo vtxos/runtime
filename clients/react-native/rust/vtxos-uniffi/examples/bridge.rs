@@ -13,7 +13,7 @@
 //! ```
 //!
 //! Or over an enclave that is already up, by its address and pins: a dev enclave in QEMU
-//! (`deploy/qemu-nitro/dev-enclave.sh`), which prints all four.
+//! (`tests/qemu/dev-enclave.sh`), which prints all four.
 //!
 //! ```console
 //! $ ENCLAVE_URL=https://127.0.0.1:8443 ENCLAVE_TRUST_ROOT=<trust-root.der> \

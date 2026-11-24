@@ -35,8 +35,15 @@ impl VssCommitment {
     }
 
     /// Deserialize from JSON: a list of hex-encoded 33-byte compressed points.
+    ///
+    /// At least one: every commitment has a constant term, and
+    /// [`Self::to_verifying_key`] reads it. Untrusted commitments are parsed
+    /// here, so an empty one is refused before anything indexes it.
     pub fn from_json_value(v: &serde_json::Value) -> Result<Self, Error> {
         let arr = v.as_array().ok_or(Error::SerializationError)?;
+        if arr.is_empty() {
+            return Err(Error::SerializationError);
+        }
         let mut coeffs = Vec::with_capacity(arr.len());
         for item in arr {
             let hex_str = item.as_str().ok_or(Error::SerializationError)?;
@@ -85,4 +92,15 @@ pub fn sum_commitments(commitments: &[VssCommitment]) -> Result<VssCommitment, E
     }
 
     Ok(VssCommitment { coeffs: group })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Indexed for its constant term as soon as it is parsed.
+    #[test]
+    fn an_empty_commitment_is_refused() {
+        assert!(VssCommitment::from_json_value(&serde_json::json!([])).is_err());
+    }
 }

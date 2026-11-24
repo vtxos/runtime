@@ -80,7 +80,7 @@ const REGISTRATION_TTL: Duration = Duration::from_secs(300);
 /// Half-finished registrations allowed at once.
 const MAX_REGISTRATIONS: usize = 64;
 /// Ceiling on an `/auth/*` request body.
-const MAX_BODY: usize = 16 * 1024;
+pub const MAX_BODY: usize = 16 * 1024;
 
 type Body = wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
@@ -201,8 +201,12 @@ impl AuthEndpoints {
             Ok(master) => master,
             Err((status, message)) => return refuse(status, message),
         };
-        let Ok(handle) = self.random_id() else {
-            return refuse(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+        // Derived from the wallet, so the same wallet is dealt the same polynomial: registering
+        // again is recovering. Nothing is read here, so this answer says nothing about which
+        // wallets are tenants.
+        let handle = match crate::signer::dkg::wallet_id(&wallet) {
+            Ok(id) => crate::signer::dkg::handle(&id),
+            Err(_) => return refuse(hyper::StatusCode::BAD_REQUEST, "malformed DKG package"),
         };
         // The wallet has committed; the runtime answers with its commitment and the share it
         // deals, and keeps nothing secret: `register/verify` derives the same polynomial again.
@@ -316,27 +320,59 @@ impl AuthEndpoints {
             Err(_) => return self.denied(Denied::Proof),
         };
 
-        // Everything verified. Kept now, in this order: the record with the sealed share and its
-        // region, then the pool under `k`.
-        let sealed = match seal_share(master, &tenant, key.secret_share()) {
-            Ok(sealed) => sealed,
+        // Everything verified, so only the wallet's holder learns what follows. Revocation is for
+        // good: the same wallet makes the same tenant, so it cannot register its way back.
+        let registry = self.zfs.registry();
+        match registry.revoked(tenant).await {
+            Ok(false) => {}
+            Ok(true) => return self.denied(Denied::UnknownTenant),
             Err(e) => {
-                tracing::error!(error = format!("{e:#}"), "sealing a wallet key");
+                tracing::error!(error = format!("{e:#}"), "reading a revocation");
+                return refuse(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+            }
+        }
+
+        // Registering again is recovering: the same wallet makes the same key, so a tenant on
+        // record is this one, and its pool opens where it is. Otherwise kept now, in this order:
+        // the record with the sealed share and its region, then the pool under `k`.
+        let on_record = match registry.tenant(tenant).await {
+            Ok(record) => record,
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "reading a tenant record");
                 return refuse(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
             }
         };
-        let record = match self
-            .zfs
-            .registry()
-            .register(tenant, key.record(sealed))
-            .await
-        {
-            Ok(record) => record,
-            Err(e) => {
-                tracing::error!(error = format!("{e:#}"), "registering a tenant");
-                return refuse(hyper::StatusCode::CONFLICT, "could not register");
+        let record = match on_record {
+            Some(record) => record,
+            None => {
+                let sealed = match seal_share(master, &tenant, key.secret_share()) {
+                    Ok(sealed) => sealed,
+                    Err(e) => {
+                        tracing::error!(error = format!("{e:#}"), "sealing a wallet key");
+                        return refuse(hyper::StatusCode::INTERNAL_SERVER_ERROR, "unavailable");
+                    }
+                };
+                match registry.register(tenant, key.record(sealed)).await {
+                    Ok(record) => record,
+                    // The same wallet registering at once elsewhere may have written it first.
+                    Err(e) => match registry.tenant(tenant).await {
+                        Ok(Some(record)) => record,
+                        _ => {
+                            tracing::error!(error = format!("{e:#}"), "registering a tenant");
+                            return refuse(hyper::StatusCode::CONFLICT, "could not register");
+                        }
+                    },
+                }
             }
         };
+        // The sealed share's nonce is random, so the record's own is kept; the rest is the key.
+        if key.record(record.key.share) != record.key {
+            tracing::warn!(
+                tenant = %hex::encode(tenant),
+                "a registration made a different key for a tenant on record"
+            );
+            return refuse(hyper::StatusCode::CONFLICT, "could not register");
+        }
         if let Err((status, message)) = self.attach(tenant, record.place, &tenant_key).await {
             return refuse(status, message);
         }

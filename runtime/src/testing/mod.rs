@@ -40,7 +40,7 @@
 //! **PCR0 is a constant**, not a measurement of a real image, and the master
 //! key is static rather than released by KMS against an attestation. Those two
 //! are the whole of what an enclave buys, and neither is exercised here — the
-//! QEMU harness in `deploy/qemu-nitro/` covers as much of them as an emulator
+//! QEMU harness in `tests/qemu/` covers as much of them as an emulator
 //! can, and real hardware covers the rest.
 //!
 //! Behind the `testing` feature, like [`crate::auth::client`], because it signs

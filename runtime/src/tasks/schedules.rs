@@ -80,8 +80,13 @@ impl Message {
     }
 
     /// The message for an occurrence due at `scheduled`.
-    pub fn due(tenant: [u8; 16], id: &str, generation: [u8; 16], scheduled: u64) -> String {
-        Self::encode(tenant, id, generation, format_time(scheduled))
+    pub fn due(tenant: [u8; 16], id: &str, generation: [u8; 16], scheduled: u64) -> Result<String> {
+        Ok(Self::encode(
+            tenant,
+            id,
+            generation,
+            format_time(scheduled)?,
+        ))
     }
 
     fn encode(tenant: [u8; 16], id: &str, generation: [u8; 16], scheduled: String) -> String {
@@ -115,10 +120,15 @@ impl Message {
 }
 
 /// `2026-11-01T12:00:00Z`, as the scheduler writes a scheduled time.
-pub fn format_time(ms: u64) -> String {
-    DateTime::from_millis(ms as i64)
+///
+/// RFC 3339 stops at the year 9999, so a later time is an error rather than a
+/// panic: a stored task past it must not take the task consumer down with it.
+/// New tasks are kept short of it by [`super::LATEST_RUN_AT`].
+pub fn format_time(ms: u64) -> Result<String> {
+    let ms = i64::try_from(ms).context("a task time past what can be written")?;
+    DateTime::from_millis(ms)
         .fmt(Format::DateTime)
-        .expect("a time in range formats")
+        .context("a task time past what can be written")
 }
 
 fn parse_time(s: &str) -> Result<u64> {
@@ -180,7 +190,8 @@ impl MemorySchedules {
             due
         };
         for (message, at) in &due {
-            let body = message.replace(SCHEDULED_TIME, &format_time(*at));
+            let time = format_time(*at).expect("enqueue keeps task times writable");
+            let body = message.replace(SCHEDULED_TIME, &time);
             self.deliveries
                 .send(&body, std::time::Duration::ZERO)
                 .await
@@ -243,9 +254,20 @@ mod tests {
         assert_eq!(message.generation, [2; 16]);
         assert_eq!(message.scheduled, 1_793_534_400_000);
         assert_eq!(
-            Message::parse(&Message::due([1; 16], "job", [2; 16], 1_793_534_400_000)).unwrap(),
+            Message::parse(&Message::due([1; 16], "job", [2; 16], 1_793_534_400_000).unwrap())
+                .unwrap(),
             message
         );
+    }
+
+    #[test]
+    fn a_time_past_the_year_9999_is_an_error_not_a_panic() {
+        assert_eq!(
+            format_time(super::super::LATEST_RUN_AT).unwrap(),
+            "9999-12-31T23:59:59Z"
+        );
+        assert!(format_time(super::super::LATEST_RUN_AT + 1_000).is_err());
+        assert!(format_time(u64::MAX).is_err());
     }
 
     #[test]
