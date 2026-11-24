@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795337981167,
+  "lastUpdate": 1795529021998,
   "repoUrl": "https://github.com/vtxos/runtime",
   "entries": {
     "Benchmark": [
@@ -491,6 +491,48 @@ window.BENCHMARK_DATA = {
             "name": "guest/dispatch/committing",
             "value": 1539914,
             "range": "± 1319742",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "joshuaaruokhaitech@gmail.com",
+            "name": "Aruokhai Joshua",
+            "username": "aruokhai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "94e16e42679ee43a54e3999350865774de1c2302",
+          "message": "Merge pull request #13 from vtxos/fix/review-findings\n\nReview fixes, and registering again is recovering",
+          "timestamp": "2026-11-24T15:57:49+02:00",
+          "tree_id": "cc21d1a0460f09672b49d656786ce3214800c110",
+          "url": "https://github.com/vtxos/runtime/commit/94e16e42679ee43a54e3999350865774de1c2302"
+        },
+        "date": 1795529021352,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "guest/instantiate",
+            "value": 24388,
+            "range": "± 2215",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/trivial",
+            "value": 158440,
+            "range": "± 16248",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/committing",
+            "value": 1425166,
+            "range": "± 1055874",
             "unit": "ns/iter"
           }
         ]
