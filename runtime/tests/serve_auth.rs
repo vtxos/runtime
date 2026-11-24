@@ -429,7 +429,10 @@ async fn post_json(
 
 /// Register a wallet and return it, ready to sign for requests.
 async fn enrol(h: &Harness) -> Client {
-    let registering = Registering::new();
+    enrol_as(h, Registering::new()).await
+}
+
+async fn enrol_as(h: &Harness, registering: Registering) -> Client {
     let (status, options) =
         post_json(h.addr, "/auth/register/options", registering.options_body()).await;
     assert_eq!(status, 200, "{options}");
@@ -614,6 +617,22 @@ async fn two_wallets_are_two_tenants() {
     let (_, seen_by_bob) = signed(&h, &bob, "GET", "/files/secret.txt", "").await;
     assert_eq!(seen_by_alice, "alice's");
     assert_eq!(seen_by_bob, "bob's", "one tenant read another's file");
+}
+
+/// Registering again is recovering: the same wallet registered again, as a new phone does from
+/// its passkey alone, reads what it wrote.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs examples/guest-http built for wasm32-wasip2"]
+async fn registering_again_reads_what_the_wallet_wrote() {
+    let h = start().await;
+    let wallet = || Registering::from_coefficients(&[3; 32], &[4; 32]).unwrap();
+    let phone = enrol_as(&h, wallet()).await;
+    let (status, _) = signed(&h, &phone, "POST", "/files/kept.txt", "kept").await;
+    assert_eq!(status, 201);
+
+    let new_phone = enrol_as(&h, wallet()).await;
+    let (status, kept) = signed(&h, &new_phone, "GET", "/files/kept.txt", "").await;
+    assert_eq!((status, kept.as_str()), (200, "kept"));
 }
 
 /// `/auth/*` answers without a token — it has to, or nobody could ever get

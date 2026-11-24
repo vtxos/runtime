@@ -42,6 +42,22 @@ async fn a_passkey_registers_a_key_that_signs_in_to_the_guest() {
     assert!(matches!(record.open(&[0x43; 32]), Err(Error::WrongPasskey)));
 }
 
+/// Registering again is recovering: the same passkey, from a new phone's connection, gets the same
+/// record back, its slope tied to the runtime it was dealt to.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the echo guest: scripts/build-guest.sh grpc"]
+async fn the_same_passkey_registers_to_the_same_wallet() {
+    let h = harness("grpc").await;
+    let prf = [0x42; 32];
+    let register = || async {
+        let enclave = Enclave::new(&h.url(), &pins(&h)).unwrap();
+        enclave.register(&prf).await.expect("registered")
+    };
+    let (first, again) = (register().await, register().await);
+    assert_eq!(again, first);
+    first.open(&prf).expect("the passkey opens it");
+}
+
 /// An enclave running another guest is refused before anything secret goes out.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the echo guest: scripts/build-guest.sh grpc"]

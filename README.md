@@ -85,7 +85,7 @@ A read that fails mid-run returns the last good reading and logs a warning. A fe
 | Guest `wasi:random/random` | Every byte, straight from the device (256 bytes per NSM request) |
 | Guest `wasi:random/insecure-seed` | A fresh seed per instance, so no two instances share a hash seed |
 | Authentication | Registration and challenge IDs, and the 32-byte single-use tokens that admit a request |
-| The runtime's own | The wallet key's nonces, sealing nonces, registration handles, pool, task and trace IDs |
+| The runtime's own | The wallet key's nonces, sealing nonces, pool, task and trace IDs |
 
 If the device fails, `wasi:random` stops the process rather than return predictable bytes. The clock can serve a stale reading because a stale timestamp is still a real one and a caller can notice. Predictable bytes look random to the guest, and a key built from them can never be detected downstream. A production build always reads the NSM. What libraries draw inside themselves comes from the kernel pool: TLS keys and handshakes and the KMS recipient key through `aws-lc-rs`. Inside an enclave the NSM is that pool's only seed, and requiring `/dev/nsm` at boot proves the runtime is in an enclave.
 
@@ -176,7 +176,7 @@ Each tenant's wallet key is a 2-of-2 FROST key between the owner's app and the c
 
 A round has two halves. The guest calls `begin` and relays the enclave's commitments to the app; the app answers with its own half, which the [client library](#a-client-for-native-apps) makes from its share (`signRound`); the guest calls `finish` and gets BIP-340 signatures. Whether a message deserves a signature is the guest's decision, made before it calls `begin`: that check is the guest's policy. [`examples/guest-signer`](examples/guest-signer/) is the smallest guest that does this, about ninety lines, and it signs whatever it is sent.
 
-The cosigner's share is the operator's. Its DKG polynomial is derived from an operator master and a handle the registration mints, and the finished share is sealed under a key from the same master into the tenant's write-once record in the roots bucket. So every release reads it, and nothing is migrated. Neither the master nor the share signs anything alone, and neither opens the tenant's data: both need the app's share too. The master is an SSM SecureString the operator writes once the enclave is up (`ENCLAVE_OPERATOR_MASTER_PARAMETER`), read on the first registration or sign-in. It must never change or be lost, since every cosigner share is sealed under it.
+The cosigner's share is the operator's. Its DKG polynomial is derived from an operator master and a handle derived from the wallet, so the same wallet registering again gets the same key and tenant back. The finished share is sealed under a key from the same master into the tenant's write-once record in the roots bucket. So every release reads it, and nothing is migrated. Neither the master nor the share signs anything alone, and neither opens the tenant's data: both need the app's share too. The master is an SSM SecureString the operator writes once the enclave is up (`/<ENCLAVE_NAME>/operator-master`), read on the first registration or sign-in. It must never change or be lost, since every cosigner share is sealed under it.
 
 ### Who may call what
 
@@ -466,7 +466,7 @@ Reproducibility, and which inputs remain pinned AWS prebuilt artifacts, are cove
 | Upgrades | Nothing is migrated: a tenant's data opens with the key its owner's share and the cosigner's derive at sign-in, on any release the app approves. Until the owner's next sign-in, a new release runs none of that tenant's background work |
 | Delivery | Tasks, notifications and logs each have their own retry and durability contract; none gives exactly-once side effects |
 | Authorization scope | A signature approves one interaction on one route, not every payload byte or stream message. Per-message approval is not built: a guest could check the owner's signature itself, with challenges of its own |
-| Recovery | None yet. A wallet key is 2-of-2, so a tenant whose app loses its share is lost. A recovery share would derive the same tenant id and data key |
+| Recovery | By registering again: the same passkey on a new phone makes the same key, tenant and data key. Without the passkey the tenant is lost, and a revoked tenant stays revoked |
 | Capacity | Each tenant gets a fixed 64 MiB region at registration, the smallest ZFS allows: about 16,000 tenants per TiB, committed whether or not the tenant stays active. Once the disk is full, registration is refused; more room means a bigger disk |
 | Single active writer | One enclave imports the pool; no failover |
 | Parent disk on Nitro | A deployment's parent serves the pool's EBS volume with stock nbdkit; not yet proven on hardware. The emulator serves a disk image with `tests/qemu/nbd-stub.py` |

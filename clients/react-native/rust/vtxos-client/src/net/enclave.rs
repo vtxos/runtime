@@ -11,14 +11,18 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use bytes::Bytes;
-use enclave_auth::client::{Client, Registering};
-use enclave_auth::wire::{RegisterVerifyResponse, TokenResponse};
+use enclave_auth::client::{runtime_identifier, Client, Registering};
+use enclave_auth::wire::{
+    RegisterVerifyResponse, RequestOptionsRequest, RequestOptionsResponse, TokenResponse,
+};
 use http::{header, Method, Request, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http2::SendRequest;
+use k256::ProjectivePoint;
 use rand_core::{OsRng, RngCore};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use threshold::point;
 use tokio::sync::Mutex;
 
 use super::h2::Body;
@@ -115,16 +119,49 @@ impl Enclave {
         Ok(c)
     }
 
-    /// Register a new wallet whose polynomial comes from the passkey's PRF output: the DKG with
-    /// the runtime, signed with the finished share. Returns what the app keeps.
+    /// Register the wallet whose polynomial comes from the passkey's PRF output: the DKG with the
+    /// runtime, signed with the finished share. Returns what the app keeps. Registering again
+    /// with the same passkey returns the same wallet: that is how a new phone recovers it.
     pub async fn register(&self, prf: &[u8; 32]) -> Result<WalletRecord> {
-        let polynomial = Polynomial::from_prf(prf);
+        let connection = self.connection().await?;
+        // Nothing from the passkey goes out before this connection is attested: a challenge for
+        // the generator, which is nobody's key.
+        connection
+            .attested::<_, RequestOptionsResponse>(
+                "/auth/request/options",
+                &RequestOptionsRequest {
+                    group_key: hex::encode(point::serialize_compressed(
+                        &ProjectivePoint::GENERATOR,
+                    )),
+                    method: "POST".into(),
+                    path: "/".into(),
+                    query: None,
+                },
+                &self.pins,
+            )
+            .await?;
+
+        // `id_c`: the runtime derives its polynomial from `a0` alone, so the real `a0` with a
+        // throwaway slope learns it. The probe is never finished: no point of it is dealt.
+        let probe = Polynomial::probe(prf);
+        let probe = Registering::new(&probe.a0, &probe.a1, &mut OsRng).map_err(Error::Protocol)?;
+        let (options, _) = connection
+            .attested("/auth/register/options", &probe.options(), &self.pins)
+            .await?;
+        let runtime = runtime_identifier(&options).map_err(Error::Protocol)?;
+
+        // The slope for that runtime: it is only ever dealt a point at its own identifier.
+        let polynomial = Polynomial::for_runtime(prf, &runtime);
         let registering = Registering::new(&polynomial.a0, &polynomial.a1, &mut OsRng)
             .map_err(Error::Protocol)?;
-        let connection = self.connection().await?;
         let (options, certificate) = connection
             .attested("/auth/register/options", &registering.options(), &self.pins)
             .await?;
+        if runtime_identifier(&options).map_err(Error::Protocol)? != runtime {
+            return Err(Error::Protocol(
+                "the runtime's identifier changed during registration".into(),
+            ));
+        }
         let (body, pending) = registering
             .verify(&options, &certificate, &mut OsRng)
             .map_err(Error::Protocol)?;

@@ -108,8 +108,8 @@ pub struct Pins {
     pub max_age_secs: u64,
 }
 
-/// What the app keeps for a wallet: not secret without the passkey, and needed with it. Keep it
-/// backed up; losing it loses the wallet even with the passkey.
+/// What the app keeps for a wallet: not secret without the passkey, and needed with it. A cache:
+/// registering again with the same passkey returns it.
 #[derive(uniffi::Record, Clone)]
 pub struct WalletRecord {
     pub group_key: String,

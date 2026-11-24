@@ -107,8 +107,20 @@ The app has to keep:
 - its key package: `x_w`, `id_w`, `Y_w` and `X`;
 - the runtime's `id_c` and `Y_c`, to check the runtime's ECDH proofs.
 
-There is no recovery yet. If the app loses `x_w`, the tenant is lost. A recovery
-share is planned: it would derive the same `k` and keep the same tenant id.
+**Registering again is recovering.** The runtime derives its polynomial from
+`id_w` ([below](#registering)), so the same app polynomial registered again
+makes the same key and lands on the same tenant, data and all. An app that
+derives its polynomial from a passkey recovers the wallet on a new phone by
+registering. Without the polynomial the tenant is lost, and a revoked tenant
+stays revoked.
+
+**Never deal one line at two points.** `f_w(id_c)` at two runtime identifiers
+gives the app's line, and with it the app's half of the key. An app that
+registers the same `a0` more than once ties `a1` to `id_c`, as `vtxos-client`
+does: it sends `register/options` with its real `a0` and a throwaway `a1`,
+reads `id_c` from the answer and never finishes that registration, then
+registers with `a1` derived from `id_c`, and refuses an answer that names
+another `id_c`.
 
 ### Registering
 
@@ -144,7 +156,8 @@ first.
 
 **What the app sends, and when:**
 - The app's round one is public, so nothing secret goes out before the document
-  has been checked.
+  has been checked. It does name the wallet, so `vtxos-client` first attests
+  the connection with a `request/options` call for a key that is nobody's.
 - `register/verify` carries a dealt share and the ECDH partial, which together
   with the runtime's share give the tenant key. So it goes only to the
   certificate that the step 2 document bound.
@@ -167,7 +180,10 @@ share, the signature and the ECDH proof all verify. When they do, the same call:
 - claims the tenant's disk region;
 - creates the tenant's data under `k`.
 
-An abandoned or refused registration leaves nothing behind.
+An abandoned or refused registration leaves nothing behind. When the tenant is
+already on record with this same key, the same wallet registering again,
+nothing is written and the call opens its data. The same tenant with other
+shares gets 409; a revoked one gets 401.
 
 **`registration_id`** is good for one `register/verify`, within five minutes.
 That call consumes it whether or not it succeeds. After a failure, start again
@@ -179,9 +195,12 @@ HKDF-SHA256 with the operator master as input key material and
 - `a0_c` uses info `handle ‖ 0x00`;
 - `a1_c` uses info `handle ‖ id_w ‖ 0x01`.
 
-`handle` is 16 fresh NSM bytes that `register/options` mints. The polynomial is
-made inside the attested enclave after the app has committed, so it cannot be
-steered toward the app's key. The runtime stores only the handle.
+`handle` is `SHA-256("aegira/cosigner-dkg/handle/v1" ‖ id_w)[..16]`, with
+`id_w` from the app's commitment, so the same app polynomial always meets the
+same runtime polynomial. Tenants registered before keep the random handles they
+were made with. The master is fixed before any app commits and the polynomial
+is made inside the attested enclave, so it cannot be steered toward the app's
+key. The runtime stores only the handle.
 
 **Before the operator master is provisioned**, `register/options` answers 503.
 

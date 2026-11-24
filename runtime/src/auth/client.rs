@@ -30,6 +30,14 @@ impl Registering {
         Registering(auth::Registering::random(&mut Rng))
     }
 
+    /// The wallet `f_w(z) = a0 + a1·z`, big-endian: the same one every time, as a passkey's PRF
+    /// gives it on any phone.
+    pub fn from_coefficients(a0: &[u8; 32], a1: &[u8; 32]) -> Result<Self, String> {
+        let a0 = scalar_from_bytes(a0).map_err(|e| format!("a0: {e}"))?;
+        let a1 = scalar_from_bytes(a1).map_err(|e| format!("a1: {e}"))?;
+        auth::Registering::new(&a0, &a1, &mut Rng).map(Registering)
+    }
+
     /// The body of `register/options`: the wallet's round one.
     pub fn options_body(&self) -> Value {
         to_json(&self.0.options())
