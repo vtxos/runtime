@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795851692221,
+  "lastUpdate": 1795879038959,
   "repoUrl": "https://github.com/vtxos/runtime",
   "entries": {
     "Benchmark": [
@@ -575,6 +575,48 @@ window.BENCHMARK_DATA = {
             "name": "guest/dispatch/committing",
             "value": 1482030,
             "range": "± 920333",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "joshuaaruokhaitech@gmail.com",
+            "name": "Aruokhai Joshua",
+            "username": "aruokhai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0ff4504b373e1302e83cde1d479ec810c14eff09",
+          "message": "Merge pull request #15 from vtxos/feat/enclave-creates-its-key\n\nEach release's enclave creates its own KMS key at genesis",
+          "timestamp": "2026-11-28T17:10:56+02:00",
+          "tree_id": "21a0412975a15027738e63c920474c66ba8f24e2",
+          "url": "https://github.com/vtxos/runtime/commit/0ff4504b373e1302e83cde1d479ec810c14eff09"
+        },
+        "date": 1795879038285,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "guest/instantiate",
+            "value": 18848,
+            "range": "± 1282",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/trivial",
+            "value": 143875,
+            "range": "± 4961",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/committing",
+            "value": 653895,
+            "range": "± 55211",
             "unit": "ns/iter"
           }
         ]
