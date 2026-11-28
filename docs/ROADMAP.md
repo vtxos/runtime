@@ -176,8 +176,8 @@ Proposed `gc --keep-roots N`:
 1. Mark: walk the blkptr trees of the newest `N` roots, collecting live
    `(txg, slab)` pairs. Bounded by live data, not by history.
 2. Sweep: `ListObjectsV2` over `slabs/`, delete any slab in no live set.
-3. Never touch the roots bucket. It stays a complete, immutable, ten-year
-   audit log of state hashes regardless — GC trades away the ability to
+3. Never touch the roots bucket. It stays a complete, immutable audit log of
+   state hashes for as long as its retention (a week by default) regardless — GC trades away the ability to
    *replay* old states, not the record that they existed.
 
 Two things fold in naturally:
