@@ -46,13 +46,16 @@ encrypted to a key the enclave generates at boot, and that key goes there.
 **2. KMS `Decrypt` with `Recipient`.** The attestation document goes in the
 `Recipient` field; KMS returns the plaintext encrypted to the enclave's public
 key rather than in the clear, so the parent proxying the call never sees it.
-The key policy binds release to the PCRs:
+The key policy binds release to the enclave's role and the PCRs. The enclave
+creates each release's key with it, at the release's first boot:
 
 ```json
 {
   "Effect": "Allow",
+  "Principal": { "AWS": "*" },
   "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
   "Condition": {
+    "ArnEquals": { "aws:PrincipalArn": "<the instance role>" },
     "StringEqualsIgnoreCase": {
       "kms:RecipientAttestation:PCR0": "<runtime image hash>",
       "kms:RecipientAttestation:PCR16": "<guest measurement>"
@@ -64,8 +67,8 @@ The key policy binds release to the PCRs:
 PCR0 covers the runtime image, and the guest is not in it. The runtime fetches
 the guest at boot, extends PCR16 with its hash and locks the register before it
 asks for the key, so the key is still released only to exactly this code —
-runtime *and* guest — while a guest change is a policy edit rather than an
-image rebuild. Neither condition is enough alone: PCR0 alone admits any guest,
+runtime *and* guest — while a guest change is a new key, created by the new
+release's first boot, rather than an image rebuild. Neither condition is enough alone: PCR0 alone admits any guest,
 and PCR16 alone admits any runtime that writes the right value into the
 register.
 
@@ -87,11 +90,8 @@ alone (`deploy/ami/units/gvproxy.yml`; `AWS_EC2_METADATA_SERVICE_ENDPOINT` in
 the image), and no guest can reach. Nothing exercises that on hardware: the QEMU
 harness has no metadata service. The push client's probe at boot is the first
 check. gvproxy proxies rather than routes, so `http_put_response_hop_limit` 1
-(`deploy/tofu/main.tf`) is right. Still open: the S3 and KMS clients name no
-credentials provider when no static keys are set, so they cannot use the role
-yet — each needs the provider the push client already names. The failure mode
-is misleading: calls fail as though credentials were missing rather than as
-though the network were broken.
+in the parent's launch template is right. Every AWS client signs with the
+instance role when no static keys are set (`keys::credentials`).
 
 **3b. Cover the clock.** The guest's wall clock now comes from `/dev/ptp0`
 (see the README), but two things remain. The Object Lock retention deadline in

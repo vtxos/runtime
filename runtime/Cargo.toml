@@ -160,6 +160,9 @@ der = { version = "0.7", default-features = false, features = ["alloc", "oid", "
 # ciphertext, and nothing else.
 aws-sdk-kms = { version = "1.51.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
 aws-sdk-ssm = { version = "1.56.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+# Which role this enclave runs as, so the KMS key it creates at a release's genesis releases to
+# that role alone. Already in the tree under `aws-config`.
+aws-sdk-sts = { version = "1.103.0", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
 # Guest stdout and stderr, out to CloudWatch Logs from inside the enclave.
 #
 # Yes, this puts an AWS SDK inside the boundary PCR0 measures — but KMS, SSM and

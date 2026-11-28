@@ -156,7 +156,7 @@ A release is a runtime image and a guest: one PCR0 and one PCR16. Boot reads bot
 
 | Observed | Outcome |
 |---|---|
-| None | **Version genesis.** Mint the release's master secret (KMS, under the key aliased `alias/<ENCLAVE_NAME>/<vid>`) and write its sealed form once. That write is the release's lease: of two first boots, one wins. |
+| None | **Version genesis.** Create the release's KMS key, with its final policy, mint the release's master secret under it, and write its sealed form once. That write is the release's lease: of two first boots, one wins. |
 | Present | **Version resume.** Open it; KMS releases it only to this pair. |
 
 Then the disk is brought up and the tenants whose keys this release kept are attached. No other pool is touched until its owner signs in.
