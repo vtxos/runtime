@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795529021998,
+  "lastUpdate": 1795851692221,
   "repoUrl": "https://github.com/vtxos/runtime",
   "entries": {
     "Benchmark": [
@@ -533,6 +533,48 @@ window.BENCHMARK_DATA = {
             "name": "guest/dispatch/committing",
             "value": 1425166,
             "range": "± 1055874",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "joshuaaruokhaitech@gmail.com",
+            "name": "Aruokhai Joshua",
+            "username": "aruokhai"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a3f778118f42a9f5f64168c4803b68f344d594d8",
+          "message": "Merge pull request #14 from vtxos/retention-default-one-week\n\nstore: anchors and registry records are locked for a week by default",
+          "timestamp": "2026-11-28T09:33:53+02:00",
+          "tree_id": "25fe984f0d7f37a361671c10ac125b9219040aa1",
+          "url": "https://github.com/vtxos/runtime/commit/a3f778118f42a9f5f64168c4803b68f344d594d8"
+        },
+        "date": 1795851691791,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "guest/instantiate",
+            "value": 29190,
+            "range": "± 2638",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/trivial",
+            "value": 198237,
+            "range": "± 15520",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "guest/dispatch/committing",
+            "value": 1482030,
+            "range": "± 920333",
             "unit": "ns/iter"
           }
         ]
