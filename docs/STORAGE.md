@@ -135,7 +135,7 @@ No guest can reach `runtime` or another tenant (a different pool, a different en
 | `failmode` | `panic` | A pool that lost its disk stops the enclave; the next boot decides |
 | `zfs_txg_timeout` | 3600 s | No txg on a timer; syncs come from anchors |
 | `zfs_arc_max`, `zfs_dirty_data_max` | 256 MiB | Enclave memory is fixed |
-| Anchor retention | 10 years (`ENCLAVE_ROOT_RETENTION_SECS`) | COMPLIANCE: nobody can shorten it |
+| Anchor retention | 1 week by default (`ENCLAVE_ROOT_RETENTION_SECS`) | COMPLIANCE: nobody can shorten it |
 
 ### Cost
 

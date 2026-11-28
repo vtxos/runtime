@@ -54,8 +54,9 @@
   # How long each root record is locked against deletion, in seconds (Object
   # Lock, COMPLIANCE: nobody can shorten it, AWS support included). It is the
   # horizon of the rollback guarantee, and how long the roots bucket outlives
-  # the deployment. Ten years for anything that holds real value; a test
-  # deployment says a day, the least the runtime accepts, and can be retired.
+  # the deployment. The runtime's default is a week; a deployment that holds
+  # real value sets longer, and a test deployment says a day, the least the
+  # runtime accepts, so it can be retired.
   rootRetentionSecs = 86400;
 
   # Guest stdout and stderr to CloudWatch as well as the console, in the

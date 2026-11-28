@@ -11,9 +11,9 @@ use std::time::Duration;
 use crate::store::backend::{AwsS3Backend, AwsS3BackendConfig, Backend};
 use anyhow::{Context, Result};
 
-/// How long each anchor and registry record is locked by default: ten years,
-/// per the deployment contract.
-pub const DEFAULT_ROOT_RETENTION: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+/// How long each anchor and registry record is locked by default: one week. A
+/// deployment that holds real value sets its own, longer, in its image.
+pub const DEFAULT_ROOT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Everything needed to reach the store.
 #[derive(Debug, Clone)]

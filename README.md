@@ -385,7 +385,7 @@ Every setting is baked into the image and measured into PCR0, so changing one me
 | `ENCLAVE_ID` | The filesystem id, which salts every key |
 | `ENCLAVE_ACCOUNT_ID` | The AWS account, which the task queue's URL and the scheduler role's ARN carry; needed only with `ENCLAVE_TASKS` |
 | `ENCLAVE_RELEASE` | This runtime release's number, written into every anchor; a pool last written by a higher one is refused |
-| `ENCLAVE_ROOT_RETENTION_SECS` | How long anchors and registry records are locked (ten years by default) |
+| `ENCLAVE_ROOT_RETENTION_SECS` | How long anchors and registry records are locked (one week by default) |
 | `ENCLAVE_PUSH_APP_ID` | An AWS End User Messaging Push application, or empty for none |
 | `ENCLAVE_GUEST_LOGS` | Guest output to the deployment's log group as well as the console |
 | `ENCLAVE_TASKS` | Background tasks through the deployment's task resources; off, none |

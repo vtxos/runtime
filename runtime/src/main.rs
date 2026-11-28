@@ -261,8 +261,8 @@ struct Settings {
     /// How long each anchor and boot record is locked against deletion, in seconds.
     ///
     /// COMPLIANCE retention: nobody can shorten it, so the rollback guarantee
-    /// lasts this long and so does the roots bucket. Ten years unless the image
-    /// says otherwise; a test deployment says a day, so it can be retired.
+    /// lasts this long and so does the roots bucket. A week unless the image
+    /// says otherwise; a test deployment may say a day, so it can be retired.
     /// PCR0 therefore tells a client which kind it is talking to. Under a day
     /// is refused: it protects nothing worth the name.
     root_retention_secs: u64,
@@ -1396,10 +1396,14 @@ mod tests {
         assert_eq!(defaults.random_source, production.random_source);
     }
 
-    /// Ten years unless the image says otherwise, what it says reaches the
-    /// mount, and under a day is refused.
+    /// A week unless the image says otherwise, what it says reaches the mount,
+    /// and under a day is refused.
     #[test]
-    fn root_retention_is_ten_years_unless_the_image_says_otherwise() {
+    fn root_retention_is_a_week_unless_the_image_says_otherwise() {
+        assert_eq!(
+            enclave_runtime::DEFAULT_ROOT_RETENTION,
+            Duration::from_secs(604_800)
+        );
         assert_eq!(
             settings_from(&[])
                 .mount_config()
