@@ -333,11 +333,11 @@
           AWS_EC2_METADATA_SERVICE_ENDPOINT = "http://192.168.127.253";
 
           # The deployment's name, which names every AWS resource it uses, by
-          # one rule its infrastructure follows: the `<name>-roots` bucket, each
-          # release's KMS key under `alias/<name>/`, its sealed master secret
-          # and the operator's master under `/<name>/` in SSM, the log group,
-          # the metrics namespace and the task resources. Attested, so the host
-          # cannot point the image at another store or another key.
+          # one rule its infrastructure follows: the `<name>-roots` bucket, the
+          # `enclave-name` tag on each release's KMS key, its sealed master
+          # secret and the operator's master under `/<name>/` in SSM, the log
+          # group, the metrics namespace and the task resources. Attested, so
+          # the host cannot point the image at another store.
           ENCLAVE_NAME = deployment.name;
           ENCLAVE_BUCKET_PREFIX = deployment.bucketPrefix or "";
           ENCLAVE_ID = deployment.fsId;

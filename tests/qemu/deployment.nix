@@ -19,9 +19,11 @@
   #
   #   <name>-roots                    the Object-Locked roots bucket, made
   #                                   before the deployment and kept after it
-  #   alias/<name>/<release id>       each release's KMS key, the release id
-  #                                   being sha256(pcr0 ‖ pcr16)
-  #   /<name>/master-key/…            each release's sealed master secret (SSM)
+  #   KMS keys tagged enclave-name    each release's key, which the enclave
+  #                                   creates at its first boot; the role may
+  #                                   create keys with that tag
+  #   /<name>/master-key/…            each release's sealed master secret (SSM),
+  #                                   under its id, sha256(pcr0 ‖ pcr16)
   #   /<name>/operator-master         the operator's master (SSM SecureString)
   #   /<name>/guest                   the guest output log group
   #   <name>                          the guest metrics namespace

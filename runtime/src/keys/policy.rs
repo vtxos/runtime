@@ -1,6 +1,11 @@
 //! What the runtime insists on before it lets KMS near its master secret: a key
 //! whose policy nobody can change, which releases the secret to this enclave's
-//! measurements and to nothing else.
+//! role and measurements and to nothing else.
+//!
+//! The enclave writes that policy itself ([`release_policy`]), in the
+//! `CreateKey` call that makes a release's key, so the key is never editable,
+//! not even for a moment. It still checks the policy before every use: the
+//! check is what holds for a key it did not create, such as one a pointer names.
 //!
 //! ## Why the enclave checks
 //!
@@ -19,7 +24,10 @@
 //! - **A policy that grants nothing it does not need.** Reading the key, listing
 //!   its grants, and deleting it — on purpose: deletion destroys the secret, it
 //!   cannot reveal it, and a deployment must be able to end. `Decrypt` and
-//!   `GenerateDataKey` only on this enclave's PCR0 and PCR16. Anything else —
+//!   `GenerateDataKey` only to this enclave's role, on its PCR0 and PCR16. The
+//!   image is reproducible, so anyone can run it, measurements and all, in an
+//!   account of their own; the role is what keeps the secret to this
+//!   deployment. Anything else —
 //!   `PutKeyPolicy`, `CreateGrant`, `ReEncrypt*`, a wildcard — is refused, and
 //!   with it every way to edit the policy: the policy also bounds what any IAM
 //!   policy in the account can grant on this key.
@@ -37,8 +45,9 @@
 //! ## What it costs
 //!
 //! A policy that can never change names one PCR0 and one PCR16 forever, so a new
-//! runtime or a new guest cannot open a store made by the old one. Upgrades need
-//! a hand-over this runtime does not have yet.
+//! runtime or a new guest cannot open what an old release kept. It does not need
+//! to: each release's genesis creates its own key and mints its own secret, and
+//! is given its secrets afresh.
 
 use anyhow::{bail, Context, Result};
 use aws_sdk_kms::types::{KeyManagerType, KeyMetadata, KeySpec, KeyUsageType, OriginType};
@@ -57,11 +66,63 @@ const UNCONDITIONED: &[&str] = &[
     "kms:cancelkeydeletion",
 ];
 
-/// Actions that release the secret: only on this enclave's measurements.
+/// Actions that release the secret: only to this enclave's role, on its measurements.
 const RELEASING: &[&str] = &["kms:decrypt", "kms:generatedatakey"];
 
-const PCR0: &str = "kms:recipientattestation:pcr0";
-const PCR16: &str = "kms:recipientattestation:pcr16";
+const PCR0: &str = "kms:RecipientAttestation:PCR0";
+const PCR16: &str = "kms:RecipientAttestation:PCR16";
+const PRINCIPAL: &str = "aws:PrincipalArn";
+
+/// The policy a release's key is created with: the account may read and delete it, and the
+/// enclave's `role` may read it and, on these measurements, use it. Nobody may change it.
+///
+/// The role is a condition on `"*"` rather than the principal itself: KMS stores a named role as
+/// its internal id, so a role deleted and made again under the same name would lose its key.
+pub fn release_policy(role: &str, pcr0: &[u8; 48], pcr16: &[u8; 48]) -> String {
+    // `arn:aws:iam::<account>:role/<name>` → `arn:aws:iam::<account>:root`.
+    let account = role.rsplit_once(':').map_or(role, |(account, _)| account);
+    serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "ReadAndDelete",
+                "Effect": "Allow",
+                "Principal": { "AWS": format!("{account}:root") },
+                "Action": [
+                    "kms:DescribeKey", "kms:GetKeyPolicy", "kms:GetKeyRotationStatus",
+                    "kms:ListGrants", "kms:ListKeyPolicies", "kms:ListResourceTags",
+                    "kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion"
+                ],
+                "Resource": "*"
+            },
+            {
+                "Sid": "TheEnclaveReadsItsKey",
+                "Effect": "Allow",
+                "Principal": { "AWS": "*" },
+                "Action": [
+                    "kms:DescribeKey", "kms:GetKeyPolicy", "kms:ListKeyPolicies", "kms:ListGrants"
+                ],
+                "Resource": "*",
+                "Condition": { "ArnEquals": { PRINCIPAL: role } }
+            },
+            {
+                "Sid": "ReleaseToTheEnclave",
+                "Effect": "Allow",
+                "Principal": { "AWS": "*" },
+                "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+                "Resource": "*",
+                "Condition": {
+                    "ArnEquals": { PRINCIPAL: role },
+                    "StringEqualsIgnoreCase": {
+                        PCR0: hex::encode(pcr0),
+                        PCR16: hex::encode(pcr16)
+                    }
+                }
+            }
+        ]
+    })
+    .to_string()
+}
 
 /// The key itself: material that never left KMS, one copy of it, ours to govern.
 pub fn check_key(meta: &KeyMetadata) -> Result<()> {
@@ -94,8 +155,8 @@ pub fn check_key(meta: &KeyMetadata) -> Result<()> {
 }
 
 /// The key's policy: nothing that could change it, and the secret for this
-/// enclave's `pcr0` and `pcr16` alone.
-pub fn check_policy(policy: &str, pcr0: &[u8; 48], pcr16: &[u8; 48]) -> Result<()> {
+/// enclave's `role`, `pcr0` and `pcr16` alone.
+pub fn check_policy(policy: &str, role: &str, pcr0: &[u8; 48], pcr16: &[u8; 48]) -> Result<()> {
     let doc: Value = serde_json::from_str(policy).context("the key policy is not JSON")?;
     let doc = doc
         .as_object()
@@ -111,15 +172,16 @@ pub fn check_policy(policy: &str, pcr0: &[u8; 48], pcr16: &[u8; 48]) -> Result<(
         _ => bail!("the key policy has no statements"),
     };
     let (pcr0, pcr16) = (hex::encode(pcr0), hex::encode(pcr16));
+    let pins = [(PRINCIPAL, role), (PCR0, &pcr0), (PCR16, &pcr16)];
     for (i, statement) in statements.into_iter().enumerate() {
         let sid = statement.get("Sid").and_then(Value::as_str).unwrap_or("");
-        check_statement(statement, &pcr0, &pcr16)
+        check_statement(statement, &pins)
             .with_context(|| format!("key policy statement {i} {sid:?}"))?;
     }
     Ok(())
 }
 
-fn check_statement(statement: &Value, pcr0: &str, pcr16: &str) -> Result<()> {
+fn check_statement(statement: &Value, pins: &[(&str, &str)]) -> Result<()> {
     let statement = statement.as_object().context("is not an object")?;
     only_fields(
         statement,
@@ -159,24 +221,27 @@ fn check_statement(statement: &Value, pcr0: &str, pcr16: &str) -> Result<()> {
         }
     }
     if releases {
-        pinned_to(statement.get("Condition"), pcr0, pcr16)?;
+        pinned_to(statement.get("Condition"), pins)?;
     }
     Ok(())
 }
 
-/// A releasing statement must pin both registers, to these values, with an
+/// A releasing statement must pin the caller's role and both registers, to these values, with an
 /// exact operator. Any other condition beside them only narrows it further.
-fn pinned_to(condition: Option<&Value>, pcr0: &str, pcr16: &str) -> Result<()> {
+fn pinned_to(condition: Option<&Value>, pins: &[(&str, &str)]) -> Result<()> {
     let condition = condition
         .and_then(Value::as_object)
         .context("releases the secret with no condition")?;
-    let (mut has_pcr0, mut has_pcr16) = (false, false);
+    let mut found = vec![false; pins.len()];
     for (operator, keys) in condition {
         // Exact operators only. An `IfExists` variant passes a request that
         // carries no attestation at all, and a `ForAnyValue`/`ForAllValues`
-        // qualifier changes what matching means.
-        if !operator.eq_ignore_ascii_case("StringEquals")
-            && !operator.eq_ignore_ascii_case("StringEqualsIgnoreCase")
+        // qualifier changes what matching means. `ArnEquals` takes wildcards,
+        // but a value has to equal this enclave's to count, and a role's name
+        // cannot contain one.
+        if !["StringEquals", "StringEqualsIgnoreCase", "ArnEquals"]
+            .iter()
+            .any(|exact| operator.eq_ignore_ascii_case(exact))
         {
             continue;
         }
@@ -184,25 +249,27 @@ fn pinned_to(condition: Option<&Value>, pcr0: &str, pcr16: &str) -> Result<()> {
             .as_object()
             .with_context(|| format!("has a malformed {operator} condition"))?;
         for (key, values) in keys {
-            let lower = key.to_ascii_lowercase();
-            let (want, found) = match lower.as_str() {
-                PCR0 => (pcr0, &mut has_pcr0),
-                PCR16 => (pcr16, &mut has_pcr16),
-                _ => continue,
+            let Some(i) = pins.iter().position(|(k, _)| key.eq_ignore_ascii_case(k)) else {
+                continue;
             };
+            let want = pins[i].1;
             let values = strings(values)?;
-            // Every value, because a list admits any one of them.
+            // Every value, because a list admits any one of them. Ignoring case
+            // is safe for the role too: IAM names are unique regardless of it.
             if values.is_empty() || values.iter().any(|v| !v.eq_ignore_ascii_case(want)) {
                 bail!(
                     "releases the secret on {key} {values:?}, and this enclave's is {want}. A key \
                      that releases to another enclave too is not one this enclave can trust."
                 );
             }
-            *found = true;
+            found[i] = true;
         }
     }
-    if !(has_pcr0 && has_pcr16) {
-        bail!("releases the secret without pinning both PCR0 and PCR16 to this enclave's");
+    if let Some(i) = found.iter().position(|f| !f) {
+        bail!(
+            "releases the secret without pinning {} to this enclave's",
+            pins[i].0
+        );
     }
     Ok(())
 }
@@ -233,41 +300,15 @@ mod tests {
 
     const P0: [u8; 48] = [0xa0; 48];
     const P16: [u8; 48] = [0x16; 48];
+    const ROLE: &str = "arn:aws:iam::111122223333:role/parent";
 
-    /// The policy merlin-infra sets: the account may read and delete the key,
-    /// the enclave's role may read it and, on its measurements, use it.
+    /// What an enclave creates its key with. Statement 2 releases the secret.
     fn locked() -> Value {
-        json!({
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Sid": "ReadAndDelete",
-                    "Effect": "Allow",
-                    "Principal": { "AWS": "arn:aws:iam::111122223333:root" },
-                    "Action": [
-                        "kms:DescribeKey", "kms:GetKeyPolicy", "kms:GetKeyRotationStatus",
-                        "kms:ListGrants", "kms:ListResourceTags", "kms:ScheduleKeyDeletion",
-                        "kms:CancelKeyDeletion"
-                    ],
-                    "Resource": "*"
-                },
-                {
-                    "Sid": "Release",
-                    "Effect": "Allow",
-                    "Principal": { "AWS": "arn:aws:iam::111122223333:role/parent" },
-                    "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
-                    "Resource": "*",
-                    "Condition": { "StringEqualsIgnoreCase": {
-                        "kms:RecipientAttestation:PCR0": hex::encode(P0),
-                        "kms:RecipientAttestation:PCR16": hex::encode(P16)
-                    }}
-                }
-            ]
-        })
+        serde_json::from_str(&release_policy(ROLE, &P0, &P16)).unwrap()
     }
 
     fn check(policy: &Value) -> Result<()> {
-        check_policy(&policy.to_string(), &P0, &P16)
+        check_policy(&policy.to_string(), ROLE, &P0, &P16)
     }
 
     fn refused(policy: &Value, why: &str) {
@@ -276,8 +317,21 @@ mod tests {
     }
 
     #[test]
-    fn the_locked_policy_is_accepted() {
+    fn the_policy_an_enclave_writes_is_accepted() {
         check(&locked()).unwrap();
+        assert_eq!(
+            locked()["Statement"][0]["Principal"]["AWS"],
+            "arn:aws:iam::111122223333:root"
+        );
+        // By another enclave, it is not.
+        let err = check_policy(
+            &release_policy(ROLE, &P0, &P16),
+            "arn:aws:iam::444455556666:role/parent",
+            &P0,
+            &P16,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("aws:PrincipalArn"), "{err:#}");
     }
 
     #[test]
@@ -309,45 +363,79 @@ mod tests {
     #[test]
     fn releasing_without_the_measurements_is_refused() {
         let mut policy = locked();
-        policy["Statement"][1]
+        policy["Statement"][2]
             .as_object_mut()
             .unwrap()
             .remove("Condition");
         refused(&policy, "no condition");
 
         let mut policy = locked();
-        policy["Statement"][1]["Condition"]["StringEqualsIgnoreCase"]
+        policy["Statement"][2]["Condition"]["StringEqualsIgnoreCase"]
             .as_object_mut()
             .unwrap()
-            .remove("kms:RecipientAttestation:PCR16");
-        refused(&policy, "without pinning both");
+            .remove(PCR16);
+        refused(&policy, "without pinning kms:RecipientAttestation:PCR16");
     }
 
     #[test]
     fn releasing_to_another_enclave_is_refused() {
         let mut policy = locked();
-        policy["Statement"][1]["Condition"]["StringEqualsIgnoreCase"]
-            ["kms:RecipientAttestation:PCR16"] = json!(hex::encode([0x17; 48]));
+        policy["Statement"][2]["Condition"]["StringEqualsIgnoreCase"][PCR16] =
+            json!(hex::encode([0x17; 48]));
         refused(&policy, "this enclave's is");
 
         // A list admits any one of its values.
         let mut policy = locked();
-        policy["Statement"][1]["Condition"]["StringEqualsIgnoreCase"]
-            ["kms:RecipientAttestation:PCR0"] = json!([hex::encode(P0), hex::encode([0x01; 48])]);
+        policy["Statement"][2]["Condition"]["StringEqualsIgnoreCase"][PCR0] =
+            json!([hex::encode(P0), hex::encode([0x01; 48])]);
         refused(&policy, "this enclave's is");
+    }
+
+    /// The same image, run by anyone else, has the same measurements: without
+    /// the role, the secret goes to whoever runs it.
+    #[test]
+    fn releasing_to_anyone_but_this_role_is_refused() {
+        let mut policy = locked();
+        policy["Statement"][2]["Condition"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ArnEquals");
+        refused(&policy, "without pinning aws:PrincipalArn");
+
+        for other in [
+            json!("arn:aws:iam::111122223333:role/other"),
+            json!("arn:aws:iam::444455556666:role/parent"),
+            json!("arn:aws:iam::111122223333:role/*"),
+            json!("arn:aws:iam::*:role/parent"),
+            json!([ROLE, "arn:aws:iam::111122223333:role/other"]),
+        ] {
+            let mut policy = locked();
+            policy["Statement"][2]["Condition"]["ArnEquals"][PRINCIPAL] = other;
+            refused(&policy, "this enclave's is");
+        }
+
+        // `ArnLike` is not an exact operator, so it pins nothing.
+        let mut policy = locked();
+        let pin = policy["Statement"][2]["Condition"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ArnEquals")
+            .unwrap();
+        policy["Statement"][2]["Condition"]["ArnLike"] = pin;
+        refused(&policy, "without pinning aws:PrincipalArn");
     }
 
     /// `IfExists` passes a request with no attestation at all.
     #[test]
     fn an_if_exists_pin_does_not_count() {
         let mut policy = locked();
-        let pins = policy["Statement"][1]["Condition"]
+        let pins = policy["Statement"][2]["Condition"]
             .as_object_mut()
             .unwrap()
             .remove("StringEqualsIgnoreCase")
             .unwrap();
-        policy["Statement"][1]["Condition"]["StringEqualsIgnoreCaseIfExists"] = pins;
-        refused(&policy, "without pinning both");
+        policy["Statement"][2]["Condition"]["StringEqualsIgnoreCaseIfExists"] = pins;
+        refused(&policy, "without pinning kms:RecipientAttestation:PCR0");
     }
 
     /// The same release, unconditioned, in a second statement.
@@ -360,7 +448,7 @@ mod tests {
             "Action": "kms:Decrypt",
             "Resource": "*"
         }));
-        refused(&policy, "statement 2");
+        refused(&policy, "statement 3");
     }
 
     #[test]
@@ -381,14 +469,14 @@ mod tests {
             "NotAction": "kms:*",
             "Resource": "*"
         }));
-        policy["Statement"][1]["Condition"]["StringEquals"] =
+        policy["Statement"][2]["Condition"]["StringEquals"] =
             json!({ "kms:EncryptionContext:environment": "production" });
         // Upper-case hex, a single statement object, odd action case: all one policy.
-        policy["Statement"][1]["Condition"]["StringEqualsIgnoreCase"]
-            ["kms:RecipientAttestation:PCR0"] = json!(hex::encode(P0).to_uppercase());
-        policy["Statement"][1]["Action"] = json!(["KMS:Decrypt", "kms:generatedatakey"]);
+        policy["Statement"][2]["Condition"]["StringEqualsIgnoreCase"][PCR0] =
+            json!(hex::encode(P0).to_uppercase());
+        policy["Statement"][2]["Action"] = json!(["KMS:Decrypt", "kms:generatedatakey"]);
         check(&policy).unwrap();
-        check(&json!({ "Version": "2012-10-17", "Statement": locked()["Statement"][1] })).unwrap();
+        check(&json!({ "Version": "2012-10-17", "Statement": locked()["Statement"][2] })).unwrap();
     }
 
     #[test]
@@ -400,7 +488,7 @@ mod tests {
         let mut policy = locked();
         policy["Statement"][0]["Unknown"] = json!(1);
         refused(&policy, "\"Unknown\"");
-        assert!(check_policy("not json", &P0, &P16).is_err());
+        assert!(check_policy("not json", ROLE, &P0, &P16).is_err());
     }
 
     fn metadata() -> aws_sdk_kms::types::builders::KeyMetadataBuilder {

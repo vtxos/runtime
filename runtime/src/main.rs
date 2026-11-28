@@ -234,7 +234,7 @@ impl Env<'_> {
 /// by one rule its infrastructure follows, so a setting cannot point one somewhere else.
 struct Settings {
     /// The deployment's name, which names every AWS resource it uses: the Object-Locked
-    /// `<name>-roots` bucket, the KMS keys under `alias/<name>/`, the SSM parameters under
+    /// `<name>-roots` bucket, the KMS keys tagged `enclave-name = <name>`, the SSM parameters under
     /// `/<name>/`, the `/<name>/guest` log group, the `<name>` metrics namespace, and the
     /// `<name>-tasks` table, queue and schedule group with the `<name>-scheduler` role. Required:
     /// 1-50 lowercase letters, digits and hyphens, which every one of those names accepts.
@@ -513,13 +513,6 @@ impl Settings {
         format!("{}-roots", self.name)
     }
 
-    /// The prefix each release's KMS key alias is under, `<prefix>/<sha256(pcr0 ‖ pcr16)>`. Read
-    /// at a release's first boot only: the key's own ARN goes into the release's pointer, and
-    /// every boot after uses that.
-    fn kms_key_alias(&self) -> String {
-        format!("alias/{}", self.name)
-    }
-
     /// The base of the SSM parameters holding each release's KMS ciphertext,
     /// `<base>/<sha256(pcr0 ‖ pcr16)>/<the ciphertext's digest>`.
     fn master_key_parameter(&self) -> String {
@@ -647,9 +640,9 @@ impl Settings {
         Ok(enclave_runtime::MasterKeyConfig {
             kind: self.testing.master_key_source,
             master_key: self.testing.master_key.clone(),
-            // Only a KMS source looks for a key and a parameter: a testing build's static key
-            // has neither to find.
-            kms_key_alias: kms.then(|| self.kms_key_alias()),
+            name: self.name.clone(),
+            // Only a KMS source keeps its sealed secret in a parameter: a testing build's static
+            // key has none.
             parameter: kms.then(|| self.master_key_parameter()),
             environment: KMS_ENVIRONMENT.to_string(),
             fs_id: enclave_runtime::parse_fs_id(&self.id)?,
@@ -1340,7 +1333,6 @@ mod tests {
             ("ENCLAVE_METRICS", "1"),
         ]);
         assert_eq!(settings.roots_bucket(), "mm-vault-mutinynet-roots");
-        assert_eq!(settings.kms_key_alias(), "alias/mm-vault-mutinynet");
         assert_eq!(
             settings.master_key_parameter(),
             "/mm-vault-mutinynet/master-key"
@@ -1526,12 +1518,12 @@ mod tests {
         assert!(err.contains("refused"), "unexpected error: {err}");
     }
 
-    /// KMS finds its key and its parameter by the deployment's name; a static key has neither
-    /// to find, so the two can never be configured together.
+    /// KMS keeps its sealed secret under the deployment's name; a static key has no parameter,
+    /// so the two can never be configured together.
     #[test]
-    fn only_kms_looks_for_a_key_by_name() {
+    fn only_kms_has_a_parameter() {
         let kms = settings_from(&[]).master_key_config().expect("config");
-        assert_eq!(kms.kms_key_alias.as_deref(), Some("alias/test"));
+        assert_eq!(kms.name, "test");
         assert_eq!(kms.parameter.as_deref(), Some("/test/master-key"));
         let fixed = settings_from(&[
             ("ENCLAVE_MASTER_KEY_SOURCE", "static"),
@@ -1539,7 +1531,7 @@ mod tests {
         ])
         .master_key_config()
         .expect("config");
-        assert!(fixed.kms_key_alias.is_none() && fixed.parameter.is_none());
+        assert!(fixed.parameter.is_none());
     }
 
     #[test]

@@ -164,8 +164,8 @@ pub struct MasterKeyConfig {
     pub kind: MasterKeySourceKind,
     /// Hex secret. `static` only, and **refused** under `kms`.
     pub master_key: Option<String>,
-    /// The alias prefix each release's KMS key is found under.
-    pub kms_key_alias: Option<String>,
+    /// The deployment's name, which each release's KMS key is created under.
+    pub name: String,
     /// The base of each release's SSM parameter.
     pub parameter: Option<String>,
     /// Part of the encryption context, so a staging enclave cannot open a
@@ -203,7 +203,7 @@ pub fn open_key_source(
     match config.kind {
         #[cfg(any(test, feature = "testing"))]
         MasterKeySourceKind::Static => {
-            if config.kms_key_alias.is_some() || config.parameter.is_some() {
+            if config.parameter.is_some() {
                 bail!(
                     "ENCLAVE_MASTER_KEY_SOURCE=static was given alongside KMS settings. One of the \
                      two is not what was meant, and guessing which would mean an enclave \
@@ -224,10 +224,6 @@ pub fn open_key_source(
                      KMS release exists to prevent — so this is refused, not ignored."
                 );
             }
-            let key_alias = config
-                .kms_key_alias
-                .as_deref()
-                .context("KMS release needs the deployment's key alias")?;
             let parameter = config
                 .parameter
                 .as_deref()
@@ -237,8 +233,9 @@ pub fn open_key_source(
                 nsm,
                 kms_client(config),
                 ssm_client(config),
+                sts_client(config),
                 KmsKeyConfig {
-                    key_alias: key_alias.to_string(),
+                    name: config.name.clone(),
                     parameter: parameter.to_string(),
                     environment: config.environment.clone(),
                     fs_id: config.fs_id,
@@ -325,6 +322,18 @@ fn ssm_client(config: &MasterKeyConfig) -> aws_sdk_ssm::Client {
     aws_sdk_ssm::Client::from_conf(builder.build())
 }
 
+/// And for STS, which only says who the other two sign as.
+fn sts_client(config: &MasterKeyConfig) -> aws_sdk_sts::Client {
+    use aws_sdk_sts::config::{BehaviorVersion, Region};
+    aws_sdk_sts::Client::from_conf(
+        aws_sdk_sts::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new(config.region.clone()))
+            .credentials_provider(credentials(config))
+            .build(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,7 +342,7 @@ mod tests {
         MasterKeyConfig {
             kind: MasterKeySourceKind::Kms,
             master_key: None,
-            kms_key_alias: Some("alias/key".into()),
+            name: "test".into(),
             parameter: Some("/parameter".into()),
             environment: "test".into(),
             fs_id: [0; 16],
